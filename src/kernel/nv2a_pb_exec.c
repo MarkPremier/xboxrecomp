@@ -91,6 +91,29 @@ static int lazy_flip(void)
     return on;
 }
 
+/* Resolve once: these are read per draw / per method, and Wine's msvcrt
+ * getenv scans the whole (Proton-injected, large) environment on every call. */
+static int pb_verbose_trace(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    return on;
+}
+
+static int pb_be_trace(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_BE_TRACE") != NULL;
+    return on;
+}
+
+static int pb_surf_trace(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_PB_SURF_TRACE") != NULL;
+    return on;
+}
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
@@ -1861,7 +1884,7 @@ static void present_pvideo_overlay(uint32_t destination)
                     | ((argb >> 5) & 0x07E0) | ((argb >> 3) & 0x001F));
         }
     }
-    if (getenv("RECOMP_PB_SURF_TRACE"))
+    if (pb_surf_trace())
         fprintf(stderr, "  [GPU] PVIDEO overlay 0x%08X %ux%u -> %ux%u at %u,%u\n",
                 source, width, height, out_width, out_height, out_x, out_y);
 }
@@ -2564,6 +2587,15 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
     }
     if ((s_gpu.transform_execution_mode & 3u) == 2u ||
         ((s_gpu.transform_execution_mode & 3u) == 0u && s_gpu.composite_valid == 0xFFFFu)) {
+        /* Attribute layouts are constant for the whole primitive. Derive the
+         * colour/texcoord slots and the fetch mask once instead of rescanning
+         * s_gpu.attr for every vertex (16-attribute scans + a re-read of the
+         * same slots ~11 times a vertex). */
+        int program = (s_gpu.transform_execution_mode & 3u) == 2u;
+        const VertexAttr *cattr = color_attr();
+        const VertexAttr *tattr0 = texcoord_attr();
+        uint32_t fetch_mask = program ? (gpu_attribute_mask & 0xFFFFu) : 0u;
+
         for (vertex = 0; vertex < vertex_count; vertex++) {
             uint32_t index = indices[vertex];
             uint32_t slot = index & 65535u;
@@ -2577,40 +2609,46 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
             gpu_indices[gpu_index_count++] = *count;
             destination = &gpu_vertices[(*count)++];
             s_gpu.gpu_unique_vertices++;
-            if ((s_gpu.transform_execution_mode & 3u) == 2u) {
-                memset(destination, 0, sizeof *destination);
-                s_gpu.gpu_memset_bytes += sizeof *destination;
+            if (program) {
+                /* Clear only the attributes the program does not read; the ones
+                 * it does are overwritten by the fetch below. The named fields
+                 * (diffuse/specular/texture/...) are unused on this path, so a
+                 * whole-struct memset is pure waste. */
                 for (stage = 0; stage < 16; stage++) {
-                    if (gpu_attribute_mask & (1u << stage)) {
-                        fetch_attr(&s_gpu.attr[stage], indices[vertex], destination->attributes[stage]);
+                    if (fetch_mask & (1u << stage)) {
+                        fetch_attr(&s_gpu.attr[stage], index, destination->attributes[stage]);
                         s_gpu.gpu_attribute_fetches++;
-                    } else s_gpu.gpu_attribute_skips++;
+                    } else {
+                        memset(destination->attributes[stage], 0, sizeof destination->attributes[stage]);
+                        s_gpu.gpu_memset_bytes += sizeof destination->attributes[stage];
+                        s_gpu.gpu_attribute_skips++;
+                    }
                 }
                 memcpy(destination->position, destination->attributes[0], sizeof destination->position);
             } else {
                 memset(destination, 0, offsetof(Nv2aGpuVertex, attributes));
                 s_gpu.gpu_zero_bytes_saved += sizeof destination->attributes;
-                fetch_attr(&s_gpu.attr[0], indices[vertex], destination->position);
-                if (!fetch_attr(color_attr(), indices[vertex], destination->diffuse))
+                fetch_attr(&s_gpu.attr[0], index, destination->position);
+                if (!fetch_attr(cattr, index, destination->diffuse))
                     nv_cpu_unpack_argb(0xFFFFFFFFu, destination->diffuse);
-                fetch_attr(&s_gpu.attr[4], indices[vertex], destination->specular);
+                fetch_attr(&s_gpu.attr[4], index, destination->specular);
                 float fog_attribute[4] = {0,0,0,1};
-                fetch_attr(&s_gpu.attr[5], indices[vertex], fog_attribute);
+                fetch_attr(&s_gpu.attr[5], index, fog_attribute);
                 destination->fog_coordinate = fog_attribute[0];
-                fetch_attr(&s_gpu.attr[2], indices[vertex], destination->normal);
-                fetch_attr(&s_gpu.attr[1], indices[vertex], destination->weights);
+                fetch_attr(&s_gpu.attr[2], index, destination->normal);
+                fetch_attr(&s_gpu.attr[1], index, destination->weights);
                 for (stage = 0; stage < 4; stage++) {
-                    const VertexAttr *ta = stage ? &s_gpu.attr[9 + stage] : texcoord_attr();
-                    fetch_attr(ta, indices[vertex], destination->texture[stage]);
+                    const VertexAttr *ta = stage ? &s_gpu.attr[9 + stage] : tattr0;
+                    fetch_attr(ta, index, destination->texture[stage]);
                     if (stage < 2 && (!nv_cpu_finite(destination->texture[stage][0]) || !nv_cpu_finite(destination->texture[stage][1]))) {
                         static uint32_t texnan_shown;
                         if (texnan_shown++ < 16) {
-                            uint64_t at = (uint64_t)ta->offset + (uint64_t)indices[vertex] * ta->stride;
+                            uint64_t at = (uint64_t)ta->offset + (uint64_t)index * ta->stride;
                             const uint8_t *pr = s_gpu.inline_active
                                 ? (const uint8_t *)s_gpu.inline_buf + (size_t)at
                                 : (const uint8_t *)xbox_GetMemoryOffset() + (size_t)at;
                             fprintf(stderr, "[TEXNAN] stage %u vtx %u slot %u type %u size %u off %08X stride %u inline %d val %.3f %.3f bytes %08X %08X\n",
-                                    stage, indices[vertex], (unsigned)(ta - s_gpu.attr), ta->type, ta->size,
+                                    stage, index, (unsigned)(ta - s_gpu.attr), ta->type, ta->size,
                                     ta->offset, ta->stride, s_gpu.inline_active,
                                     destination->texture[stage][0], destination->texture[stage][1],
                                     *(const uint32_t *)pr, *(const uint32_t *)(pr + 4));
@@ -3042,7 +3080,7 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0 && getenv("RECOMP_PB_EXEC_VERBOSE"))
+    if ((s_gpu.draws % 200) == 0 && pb_verbose_trace())
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 
@@ -3068,7 +3106,7 @@ static void draw_primitive(void)
         s_gpu.raster_seconds += (double)(clock() - started) / CLOCKS_PER_SEC;
     }
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (pb_verbose_trace()) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -3479,7 +3517,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     static int verbose;
     if (!inited) {
         inited = 1;
-        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+        verbose = pb_verbose_trace();
         s_gpu.blend_equation = 0x8006;
         s_gpu.color_mask = 0x01010101u;
         s_gpu.min_x = s_gpu.min_y = 1e30f;
@@ -4008,7 +4046,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.depth_pitch = param >> 16;
         break;
     case NV097_SET_SURFACE_COLOR_OFFSET:
-        if (getenv("RECOMP_PB_SURF_TRACE")
+        if (pb_surf_trace()
                 && s_gpu.color_offset != param) {
             fprintf(stderr, "  [GPU] surface transition 0x%08X -> 0x%08X "
                             "after %u draws/%u clears\n",
@@ -4034,7 +4072,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     case NV097_SET_BEGIN_END:
-        if (getenv("RECOMP_BE_TRACE")) {
+        if (pb_be_trace()) {
             extern uint32_t g_pb_current_va;
             static unsigned be_n;
             if (be_n++ < 600)
@@ -4104,7 +4142,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* A texture offset is a DMA-object offset, exactly like a surface or a
          * vertex array offset -- physical, and reachable only through the
          * contiguous window when it names contiguous memory. */
-        if (getenv("RECOMP_PB_SURF_TRACE")
+        if (pb_surf_trace()
             && s_gpu.tex.raw_offset != param) {
             fprintf(stderr, "  [GPU] texture transition 0x%08X -> 0x%08X "
                     "while surface 0x%08X after %u draws/%u clears\n",
@@ -4178,7 +4216,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         } else {
             nv2a_pb_exec_flush();
         }
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        if (pb_verbose_trace()) {
             static unsigned n;
             if (n++ < 8) {
                 fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
