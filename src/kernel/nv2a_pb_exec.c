@@ -4219,16 +4219,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
                                                : s_gpu.color_offset;
             if (done) {
+                uint32_t show = done;
                 if (lazy_flip()) {
                     uint8_t *base = (uint8_t *)xbox_GetMemoryOffset() + dma_resolve(done);
                     uint32_t h = s_gpu.clip_y + s_gpu.clip_h;
-                    nv2a_gpu_flip(base, (size_t)s_gpu.pitch * (h ? h : 1u));
+                    /* With RECOMP_ASYNC_FLIP the call returns the previous
+                     * frame's buffer (published without a GPU wait); the window
+                     * shows that, one frame behind. */
+                    show = nv2a_gpu_flip(base, (size_t)s_gpu.pitch * (h ? h : 1u),
+                                         done, s_gpu.pitch);
+                    if (!show) show = done;
                 } else {
                     nv2a_pb_exec_flush();
                 }
-                present_pvideo_overlay(done);
-                xbox_FramebufferWindowSet(dma_resolve(done), s_gpu.pitch);
-                xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);
+                present_pvideo_overlay(show);
+                xbox_FramebufferWindowSet(dma_resolve(show), s_gpu.pitch);
+                xbox_FramebufferWindowPresent(dma_resolve(show), s_gpu.pitch);
             } else {
                 nv2a_pb_exec_flush();
             }
