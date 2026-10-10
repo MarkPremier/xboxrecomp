@@ -679,6 +679,21 @@ static int tex_size_from_format(uint32_t fmt)
     return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
 }
 
+/* The backend stores every surface and texture *linearly*: a row is
+ * width * bytes_per_pixel. The guest, however, programs NV2A with the
+ * tile-aligned pitch D3D::CalcTilePitch computes -- a 1920-wide surface is
+ * 1920*4 = 7680, padded up to 8192. Anywhere the guest pitch is used as a
+ * byte stride it must be normalised back to the linear one, or the reader
+ * walks off by the pad each row and the image streaks. This is the one place
+ * that rule lives; every ingress below funnels through it rather than each
+ * site inventing its own fix. 7680 is the only tile pitch that differs for the
+ * resolutions this title uses (1280-wide 5120 is already linear). */
+static uint32_t nv2a_linear_pitch(uint32_t p)
+{
+    if (p == 8192) return 7680;
+    return p;
+}
+
 static void record_tex_reg(uint32_t method, uint32_t param)
 {
     s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
@@ -857,8 +872,8 @@ static void surfaces2d_method(uint32_t method, uint32_t param)
     case 0x0188: s_surf2d.dma_image_dest   = param; break;       /* DMA_DESTIN */
     case 0x0300: s_surf2d.color_format     = param; break;       /* COLOR_FORMAT */
     case 0x0304:                                                 /* SET_PITCH */
-        s_surf2d.source_pitch = param & 0xFFFFu;
-        s_surf2d.dest_pitch   = param >> 16;
+        s_surf2d.source_pitch = nv2a_linear_pitch(param & 0xFFFFu);
+        s_surf2d.dest_pitch   = nv2a_linear_pitch(param >> 16);
         break;
     case 0x0308: s_surf2d.source_offset = param & 0x07FFFFFFu; break;
     case 0x030C: s_surf2d.dest_offset   = param & 0x07FFFFFFu; break;
@@ -1838,7 +1853,7 @@ static void present_pvideo_overlay(uint32_t destination)
     if (!(buffer & 0x11u) || (regs[0x704 / 4] & 1u)
             || ((format >> 16) & 3u) != 1u || (bpp != 2 && bpp != 4))
         return;
-    pitch = format & 0x1FFFu;
+    pitch = nv2a_linear_pitch(format & 0x1FFFu);
     width = size_in & 0x7FFu;
     height = (size_in >> 16) & 0x7FFu;
     out_x = point_out & 0xFFFu;
@@ -3897,7 +3912,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             break;
         case 0x08: texture->addr_u = param & 15u; texture->addr_v = (param >> 8) & 15u; texture->addr_w = (param >> 16) & 15u; break;
         case 0x0C: texture->control0 = param; texture->control0_valid = 1; break;
-        case 0x10: texture->pitch = param >> 16; break;
+        case 0x10: texture->pitch = nv2a_linear_pitch(param >> 16); break;
         case 0x14: texture->filter = param; break;
         case 0x1C: texture->width = param >> 16; texture->height = param & 65535u; break;
         case 0x24: texture->border_color = param; break;
@@ -4042,7 +4057,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.format = param;
         break;
     case NV097_SET_SURFACE_PITCH:
-        s_gpu.pitch = param & 0xFFFF;      /* colour pitch; zeta is the top half */
+        /* Colour pitch in the low half, zeta in the high half. The colour
+         * pitch is normalised to the linear stride the backend stores at; the
+         * depth pitch is left alone -- the depth surface is stored and
+         * addressed at its own pitch consistently, so it needs no conversion. */
+        s_gpu.pitch = nv2a_linear_pitch(param & 0xFFFF);
         s_gpu.depth_pitch = param >> 16;
         break;
     case NV097_SET_SURFACE_COLOR_OFFSET:
@@ -4267,7 +4286,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_TEXTURE_CONTROL1:
         /* Pitch lives in the top half. Only meaningful for a linear format; a
          * swizzled texture has no pitch because it has no rows. */
-        s_gpu.tex.pitch = param >> 16;
+        s_gpu.tex.pitch = nv2a_linear_pitch(param >> 16);
         record_tex_reg(method, param);
         break;
 
