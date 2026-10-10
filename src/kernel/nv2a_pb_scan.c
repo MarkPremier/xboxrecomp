@@ -352,10 +352,13 @@ void nv2a_pb_run(uint32_t put_va)
     /* Last 16 JUMP/CALLs taken this kick (diagnostic for walks that loop). */
     struct { uint32_t from, w; } jtrace[16];
     unsigned jtrace_n = 0;
-    /* Return PCs for out-of-line forward JUMPs (see the JUMP handling below).
+    /* Frames for out-of-line forward JUMPs (see the JUMP handling below).
      * One level like DMA_SUBROUTINE, but per kick: a shared draw buffer is
-     * entered and left inside a single submission. */
-    uint32_t ret_u[4];
+     * entered and left inside a single submission. `exit_va` is the address of
+     * the buffer's exit word when the caller left a fixup block, so the return
+     * is recognised precisely; 0 means the caller did not (fall back to the
+     * cross-page heuristic). */
+    struct pb_ret_frame { uint32_t pc, exit_va; } ret_u[4];
     unsigned ret_u_n = 0;
 
     while (va != put_va && budget && !desync) {
@@ -434,11 +437,64 @@ void nv2a_pb_run(uint32_t put_va)
             uint32_t tgt = win_lo | off;
             if ((w & 3u) != 2u) {                    /* a real CALL sets ret above */
                 if (tgt > src && (tgt >> 16) != (src >> 16)) {
-                    if (ret_u_n < 4u)
-                        ret_u[ret_u_n++] = va;       /* src + 4 */
-                } else if (tgt < src && ret_u_n
-                        && (tgt >> 16) != (src >> 16)) {
-                    off = ret_u[--ret_u_n] & 0x0FFFFFFFu;
+                    /* Out-of-line forward JUMP into the shared geometry buffer.
+                     * D3D8 leaves a 5-word fixup block right after the JUMP:
+                     * f[0] is this caller's return offset (== src+0x18, the real
+                     * continuation), f[2] is the buffer's exit-word address. The
+                     * hardware never runs the block. Returning to src+4 (the old
+                     * rule) landed inside it, where its data words decode as a
+                     * bogus method and run off into data -> "reserved command"
+                     * desync. Use the block when present. */
+                    uint32_t pc = va, exit_va = 0;
+                    if (va + 24u <= win_hi) {
+                        const uint32_t *f = (const uint32_t *)(mem + va);
+                        /* Word 0 of a D3D8 fixup block is this caller's return
+                         * offset: it names src+0x18, the real continuation (the
+                         * 5-word block itself is never executed). When present,
+                         * that IS the return address, so trust it. Word 2 may
+                         * name the buffer's exit word; use it to recognise the
+                         * return precisely, else fall back to the cross-page
+                         * rule. */
+                        int ok = ((win_lo | f[0]) == src + 0x18u)
+                                && ((f[0] & 3u) == 0u);
+                        if (ok) {
+                            pc = src + 0x18u;
+                            if (f[2] >= tgt && f[2] - tgt < 0x10000u
+                                    && (f[2] & 3u) == 0u)
+                                exit_va = f[2];
+                        }
+                        {
+                            static int dbg = -1;
+                            static unsigned dn;
+                            if (dbg < 0)
+                                dbg = getenv("RECOMP_PB_BLOCK_DBG") ? 1 : 0;
+                            if (dbg && dn < 400 && ok) {
+                                fprintf(stderr, "[PBBLK] src=%08X tgt=%08X "
+                                        "f0=%08X f1=%08X f2=%08X f3=%08X "
+                                        "f4=%08X f5=%08X ok=%d ev=%08X\n",
+                                        src, tgt, f[0], f[1], f[2], f[3],
+                                        f[4], f[5], ok, exit_va);
+                                dn++;
+                            }
+                        }
+                    }
+                    if (ret_u_n < 4u) {
+                        ret_u[ret_u_n].pc = pc;
+                        ret_u[ret_u_n].exit_va = exit_va;
+                        ret_u_n++;
+                    }
+                } else if (ret_u_n) {
+                    struct pb_ret_frame *top = &ret_u[ret_u_n - 1u];
+                    /* With a known exit word, return only at that exact word:
+                     * an unrelated backward cross-page JUMP inside the buffer
+                     * must not be mistaken for the exit. Without one, keep the
+                     * cross-page heuristic (the src+4 layout). */
+                    int is_return = top->exit_va ? (src == top->exit_va)
+                                                 : (tgt < src && (tgt >> 16) != (src >> 16));
+                    if (is_return) {
+                        off = top->pc & 0x0FFFFFFFu;
+                        ret_u_n--;
+                    }
                 }
             }
         }
