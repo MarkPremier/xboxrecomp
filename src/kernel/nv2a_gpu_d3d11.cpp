@@ -2455,7 +2455,13 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         return reject("surface scissor extent");
     if (state->fixed_transform) {
         if (state->vertex_program) return reject("conflicting vertex pipelines");
-        if (state->skin_mode > 6) return reject("fixed-function skin mode");
+        if (state->skin_mode > 6) {
+            static int skin_shown;
+            if (skin_shown++ < 8)
+                std::fprintf(stderr, "[GPU-D3D11] skin_mode=%u (0x%08X)\n",
+                             state->skin_mode, state->skin_mode);
+            return reject("fixed-function skin mode");
+        }
         if (state->texgen_view_model > 1) return reject("texgen view model");
         for (uint32_t stage = 0; stage < 4; stage++) {
             for (uint32_t component = 0; component < 4; component++) {
