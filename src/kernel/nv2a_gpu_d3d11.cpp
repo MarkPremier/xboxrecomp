@@ -77,6 +77,7 @@ static struct {
     uint64_t compatible_target_views, partial_target_clears, target_layout_syncs;
     uint64_t memcmp_bytes, scan_fallbacks, scan_steps;
     uint64_t texture_calls, surface_scan_iters, surface_count, depth_surface_count;
+    uint64_t async_resolved_flip, async_resolved_publish, async_resolved_sync, async_flip_syncs;
 } gpu_timing;
 
 struct GpuTimer {
@@ -153,6 +154,11 @@ extern "C" void nv2a_gpu_report(void)
                  gpu_timing.sync_event_wait, (unsigned long long)gpu_timing.completion_waits,
                  (unsigned long long)gpu_timing.color_masked_draws, (unsigned long long)gpu_timing.color_readbacks,
                  (unsigned long long)gpu_timing.depth_readbacks);
+    std::fprintf(stderr, "[GPU-D3D11] async flip: staged frame resolved by flip %llu, targeted publish %llu, full sync %llu; synchronous flips %llu\n",
+                 (unsigned long long)gpu_timing.async_resolved_flip,
+                 (unsigned long long)gpu_timing.async_resolved_publish,
+                 (unsigned long long)gpu_timing.async_resolved_sync,
+                 (unsigned long long)gpu_timing.async_flip_syncs);
     std::fprintf(stderr, "[GPU-D3D11] constants: %llu uploads, %llu unchanged reuses, %.3fs\n",
                  (unsigned long long)gpu_timing.constant_uploads,
                  (unsigned long long)gpu_timing.constant_reuses, gpu_timing.constants);
@@ -1430,12 +1436,13 @@ static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_
 }
 
 static uint32_t resolve_pending_flip();
+static bool pending_flip_overlaps(const void *addr, size_t bytes);
 static bool cloak_debug();
 
 /* Full sync: publish every dirty surface to guest RAM (flips, invalidate). */
 extern "C" void nv2a_gpu_sync(void)
 {
-    resolve_pending_flip();
+    if (resolve_pending_flip()) gpu_timing.async_resolved_sync++;
     gpu_sync_impl(true);
 }
 
@@ -1444,10 +1451,13 @@ extern "C" void nv2a_gpu_sync(void)
  * renderer may still hold the surface in a D3D11 texture (publish normally only
  * happens on flip), so a mid-frame CopyRects -- the loading-screen back-buffer
  * capture -- read a stale/black image. No texture-serial bump: not a frame
- * boundary. */
+ * boundary. The staged flip only has to land first when it covers these bytes;
+ * resolving it for every unrelated publish (the per-frame post-process alias
+ * reads) forced a synchronous flip nearly every frame. */
 extern "C" void nv2a_gpu_surface_publish(const void *addr, size_t bytes)
 {
-    resolve_pending_flip();
+    if (pending_flip_overlaps(addr, bytes) && resolve_pending_flip())
+        gpu_timing.async_resolved_publish++;
     gpu_sync_impl(true, addr, bytes);
 }
 
@@ -1509,6 +1519,13 @@ struct PendingFlip {
     bool valid = false;
 };
 static PendingFlip s_pending_flip;
+
+static bool pending_flip_overlaps(const void *addr, size_t bytes)
+{
+    if (!s_pending_flip.valid) return false;
+    uintptr_t begin = (uintptr_t)addr, target = (uintptr_t)s_pending_flip.target;
+    return begin < target + s_pending_flip.bytes && begin + bytes > target;
+}
 
 static bool async_flip_enabled()
 {
@@ -1675,7 +1692,9 @@ extern "C" uint32_t nv2a_gpu_flip(const void *presented, size_t bytes, uint32_t 
     uint32_t show = va;
     if (async_flip_enabled()) {
         show = resolve_pending_flip();
-        if (!show) {
+        if (show) gpu_timing.async_resolved_flip++;
+        else {
+            gpu_timing.async_flip_syncs++;
             /* Nothing staged to show: the first frame, or a mid-frame guest
              * readback (cloak refraction blit) already consumed the staged
              * frame and has since published a half-drawn frame into guest RAM.
