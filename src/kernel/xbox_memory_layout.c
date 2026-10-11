@@ -1011,10 +1011,21 @@ static void event_signals_tick(void)
          * earned, so its BlockOnTime wait returned before the fence retired
          * and the guest overwrote ring the walker had not read ([PB] desync).
          * The real signal is the software method that runs KeSetEvent on this
-         * event, which the guest resets itself (SignalState) before waiting. */
-        if (g_event_signals[i].adopted != dev) {
-            xbox_KeObjectAdopt(dev + g_event_signals[i].event_off);
-            g_event_signals[i].adopted = dev;
+         * event, which the guest resets itself (SignalState) before waiting.
+         * RECOMP_EVENT_ADOPT=0 restores the blanket signal for A/B (it blacks
+         * the screen here). */
+        static int adopt = -1;
+        if (adopt < 0) {
+            const char *e = getenv("RECOMP_EVENT_ADOPT");
+            adopt = !(e && *e == '0');
+        }
+        if (adopt) {
+            if (g_event_signals[i].adopted != dev) {
+                xbox_KeObjectAdopt(dev + g_event_signals[i].event_off);
+                g_event_signals[i].adopted = dev;
+            }
+        } else {
+            xbox_KeObjectSignal(dev + g_event_signals[i].event_off);
         }
     }
 }

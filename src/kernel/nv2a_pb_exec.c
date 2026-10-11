@@ -841,6 +841,34 @@ typedef struct {
 static Nv2aSurfaces2D s_surf2d;
 static Nv2aImageBlit s_blit;
 static unsigned s_blit_shown;
+static uint64_t s_blit_runs, s_blit_big;   /* total / >=1920-wide (back-buffer refraction) */
+
+/* Cloak ability marker. nv2a_gpu_d3d11.cpp calls xbox_CloakMarker() when a
+ * cloak*.xvu/.xpu shader is loaded (only happens when the ability engages).
+ * Edge-latched so a test can wait for "[CLOAK] active" after triggering it;
+ * "[CLOAK] idle" follows a couple of flips later (shaders load once, so idle
+ * does not mean the effect ended). Purely diagnostic. */
+static int s_cloak_active;
+static uint64_t s_cloak_last_flip;
+
+void xbox_CloakMarker(const char *what)
+{
+    if (!s_cloak_active) {
+        fprintf(stderr, "[CLOAK] active (%s) flip=%u\n", what, s_gpu.flips);
+        fflush(stderr);
+        s_cloak_active = 1;
+    }
+    s_cloak_last_flip = s_gpu.flips;
+}
+
+static void cloak_marker_idle(void)
+{
+    if (s_cloak_active && (uint64_t)s_gpu.flips > s_cloak_last_flip + 2u) {
+        fprintf(stderr, "[CLOAK] idle flip=%u\n", s_gpu.flips);
+        fflush(stderr);
+        s_cloak_active = 0;
+    }
+}
 
 /* Resolve a context-DMA handle (RAMHT handle or RAMIN offset) to a guest
  * physical base and length, exactly as the semaphore/report paths do. */
@@ -980,6 +1008,8 @@ static void image_blit_run(void)
     }
     /* The destination is guest RAM: refresh any cached surface it mirrors. */
     nv2a_gpu_surface_modified(dst, (size_t)s_blit.height * s_surf2d.dest_pitch);
+    s_blit_runs++;
+    if (s_blit.width >= 1920u) s_blit_big++;
 }
 
 static void image_blit_method(uint32_t method, uint32_t param)
@@ -3675,22 +3705,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (xbox_Nv2aNativeFencesEnabled()) {
             s_gpu.flush_fence++;
             /* Deferred: the routine can wait on the GPU (this thread), so the
-             * synchronous form deadlocks -- see kernel_bridge. But never drop
-             * it: a dropped call left the pusher's fixup unapplied and the
-             * walker looping on a stale tail JUMP. Re-issue until queued (the
-             * pusher stalls, as on hardware). */
-            while (!xbox_Nv2aSoftwareMethodDeferred(param, s_gpu.depth_clear,
-                                                    s_gpu.clear_color)) {
-                xbox_Nv2aAcknowledgeHandshakes();
-                SwitchToThread();
+             * synchronous form deadlocks -- see kernel_bridge. Never dropping it
+             * (re-issue until queued, stall on the 0xC-0xE pushbuffer fixups) is
+             * what the freeze fix does, but those types rewrite a push buffer the
+             * stream is about to run, so make the drop-vs-keep choice selectable:
+             * RECOMP_SW_METHOD_DROP=1 restores the old single-shot drop. */
+            static int keep = -1;
+            if (keep < 0) {
+                const char *e = getenv("RECOMP_SW_METHOD_DROP");
+                keep = !(e && *e == '1');
             }
-            /* Types 0xC-0xE rewrite a push buffer the stream is about to run:
-             * PGRAPH stalls on the trap until the handler has finished. */
-            if ((param & 0x1Fu) >= 12u && (param & 0x1Fu) <= 14u)
-                while (xbox_Nv2aSoftwareMethodPending()) {
+            if (keep) {
+                while (!xbox_Nv2aSoftwareMethodDeferred(param, s_gpu.depth_clear,
+                                                        s_gpu.clear_color)) {
                     xbox_Nv2aAcknowledgeHandshakes();
                     SwitchToThread();
                 }
+                if ((param & 0x1Fu) >= 12u && (param & 0x1Fu) <= 14u)
+                    while (xbox_Nv2aSoftwareMethodPending()) {
+                        xbox_Nv2aAcknowledgeHandshakes();
+                        SwitchToThread();
+                    }
+            } else {
+                xbox_Nv2aSoftwareMethodDeferred(param, s_gpu.depth_clear,
+                                                s_gpu.clear_color);
+            }
             return;
         }
         note_unhandled(subch, method, param);
@@ -4215,6 +4254,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_FLIP_STALL:
         s_gpu.flush_flip++;
+        cloak_marker_idle();
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now. */
         s_gpu.flip_read = s_gpu.flip_write;
@@ -4613,6 +4653,8 @@ void nv2a_pb_exec_report(void)
                     " x %.1f..%.1f  y %.1f..%.1f\n",
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
+    fprintf(stderr, "[GPU] image blits: %llu total, %llu wide(>=1920) back-buffer\n",
+            (unsigned long long)s_blit_runs, (unsigned long long)s_blit_big);
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed
      * a vertex program we do not run" look identical on screen, and only one
      * of them means the rasteriser is broken. */

@@ -27,6 +27,21 @@ using Microsoft::WRL::ComPtr;
  * hold up the guest's next kick. Register write only, so any thread may call. */
 extern "C" void xbox_Nv2aAcknowledgeHandshakes(void);
 
+/* Cloak ability marker. The cloak vertex/pixel shaders are only ever loaded
+ * when the effect engages, so their load is a definitive "the cloak is on".
+ * kernel_path.c invokes g_xbox_path_hook for every opened Xbox path; install a
+ * hook that edge-latches a "[CLOAK] active" log line a test can wait for. */
+extern "C" void xbox_CloakMarker(const char *what);
+extern void (*g_xbox_path_hook)(const char *xbox_path);
+
+static void nv2a_cloak_path_hook(const char *xbox_path)
+{
+    if (!xbox_path) return;
+    if (!std::strstr(xbox_path, "cloak") && !std::strstr(xbox_path, "Cloak")) return;
+    if (!std::strstr(xbox_path, ".xvu") && !std::strstr(xbox_path, ".xpu")) return;
+    xbox_CloakMarker(xbox_path);
+}
+
 static struct {
     double draw, texture, hash, upload, sync, state;
     double sync_copy, sync_wait, sync_publish, sync_unmap;
@@ -1415,6 +1430,7 @@ static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_
 }
 
 static uint32_t resolve_pending_flip();
+static bool cloak_debug();
 
 /* Full sync: publish every dirty surface to guest RAM (flips, invalidate). */
 extern "C" void nv2a_gpu_sync(void)
@@ -1470,15 +1486,25 @@ extern "C" void nv2a_gpu_flush(void)
  * the Map never waits. The window shows one frame behind, exactly what a real
  * double-buffered swapchain does.
  *
- * Off unless RECOMP_ASYNC_FLIP=0. Correctness: the surface is left dirty until
- * its deferred publish lands, so refresh_surface's guard still holds. Any other
- * sync that could touch a pending surface (targeted blit publish, full sync,
- * invalidate) flushes the pending flip first. Measured +19% (31.6 -> 37.5 FPS
- * median at 1080p gameplay). */
+ * The staged copy's coverage and content_serial are frozen at stage time: the
+ * title keeps rendering into the surface (the cloak refraction draws, then
+ * blits the back buffer mid-frame) before the deferred publish runs, so the
+ * publish must not clear dirty for -- or let the flip refresh-from-RAM over --
+ * content written after the stage. Measured +19% (31.6 -> 37.5 FPS median at
+ * 1080p gameplay). RECOMP_ASYNC_FLIP=0 disables it. */
+/* Coverage of the staged copy, frozen at stage time: the live surface keeps
+ * accumulating writes for the next frame before the deferred publish runs. */
+struct StagedCoverage {
+    D3D11_BOX written_region = {};
+    std::vector<uint64_t> written_mask;
+    uint32_t width = 0;
+};
 struct PendingFlip {
     const void *target = nullptr;
     size_t bytes = 0;
     uint32_t va = 0, pitch = 0;
+    uint64_t content_serial = 0;
+    StagedCoverage coverage;
     ComPtr<ID3D11Query> event;
     bool valid = false;
 };
@@ -1500,21 +1526,64 @@ static Surface *surface_for_memory(const void *memory)
     return nullptr;
 }
 
-/* Publish one colour surface from its staging texture into guest RAM. Mirrors
- * the bulk branch of gpu_sync_impl's publish loop. */
-static void publish_staged_color(Surface &surface, ID3D11Texture2D *staging)
+/* The presented (front) surface is never CPU-diffed: the guest only reads it
+ * back through a lock/fence, which takes the full-upload path. Maintaining its
+ * source_snapshot in publish_staged_color therefore costs a second full-surface
+ * memcpy every flip (staging -> snapshot -> guest RAM). RECOMP_PRESENT_SNAPSHOT=0
+ * skips it, so the publish is one staging -> guest copy; a refresh, if one ever
+ * happens, falls back to the full upload. Default on: a cloak/effect that
+ * samples the front buffer regressed with it off, so keep the snapshot. */
+static bool present_snapshot()
+{
+    static const bool enabled = []() {
+        const char *value = std::getenv("RECOMP_PRESENT_SNAPSHOT");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+/* Diagnostic: name the large textures that take the memcmp validation path, so
+ * the hashing traffic can be attributed. RECOMP_HASHDBG=1. */
+static bool hash_debug()
+{
+    static const bool enabled = []() {
+        const char *value = std::getenv("RECOMP_HASHDBG");
+        return value && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+/* Diagnostic: name which path a scene-sized texture binding takes in get_texture
+ * (render-target feedback / zero-copy surface view / guest-RAM fallback), for
+ * the render-target-as-texture cases. RECOMP_CLOAKDBG=1. */
+static bool cloak_debug()
+{
+    static const bool enabled = []() {
+        const char *value = std::getenv("RECOMP_CLOAKDBG");
+        return value && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+/* Publish one colour surface from its staging texture into guest RAM, over the
+ * coverage that was staged. Mirrors gpu_sync_impl's publish loop. Clears dirty
+ * only when nothing was rendered into the surface after staging (`current`):
+ * otherwise the GPU texture is newer than guest RAM and the live content must
+ * still be published (and must not be refreshed from RAM). */
+static void publish_staged_color(Surface &surface, ID3D11Texture2D *staging,
+                                 const StagedCoverage &coverage, bool current)
 {
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) return;
     GpuTimer publish_timer(gpu_timing.sync_publish);
     GpuTimer color_timer(gpu_timing.color_publish);
-    bool snapshot = prepare_surface_snapshot(surface, 4);
+    bool snapshot = present_snapshot() && prepare_surface_snapshot(surface, 4);
     bool initialize_snapshot = snapshot && !surface.snapshot_valid;
-    const auto &region = surface.written_region;
+    const auto &region = coverage.written_region;
     size_t row_bytes = (size_t)surface.width * 4;
     uint32_t first_row = initialize_snapshot ? 0 : region.top;
     uint32_t last_row = initialize_snapshot ? surface.height : region.bottom;
-    if (surface.written_mask.empty() && region.left == 0 && region.right == surface.width &&
+    if (coverage.written_mask.empty() && region.left == 0 && region.right == surface.width &&
         mapped.RowPitch == row_bytes && surface.pitch == row_bytes) {
         const uint8_t *source = (const uint8_t *)mapped.pData;
         size_t offset = (size_t)region.top * row_bytes;
@@ -1533,7 +1602,7 @@ static void publish_staged_color(Surface &surface, ID3D11Texture2D *staging)
         const uint8_t *source = (const uint8_t *)mapped.pData + (size_t)row * mapped.RowPitch;
         uint8_t *cached = snapshot ? surface.source_snapshot.data() + (size_t)row * row_bytes : nullptr;
         if (initialize_snapshot) std::memcpy(cached, source, row_bytes);
-        for_each_written_span(surface, row, [&](uint32_t first, uint32_t end) {
+        for_each_written_span(coverage, row, [&](uint32_t first, uint32_t end) {
             size_t bytes = (size_t)(end - first) * 4;
             if (cached && !initialize_snapshot) std::memcpy(cached + first * 4, source + first * 4, bytes);
             std::memcpy(surface.memory + (size_t)row * surface.pitch + first * 4,
@@ -1544,7 +1613,7 @@ static void publish_staged_color(Surface &surface, ID3D11Texture2D *staging)
     surface.snapshot_valid = snapshot;
     context->Unmap(staging, 0);
     mark_target_aliases(&surface, surface.memory, (size_t)surface.pitch * surface.height);
-    surface.dirty = false;
+    if (current) surface.dirty = false;
 }
 
 /* Finish the deferred publish from the previous flip and return the guest VA
@@ -1561,7 +1630,8 @@ static uint32_t resolve_pending_flip()
             xbox_Nv2aAcknowledgeHandshakes();
             SwitchToThread();
         }
-        publish_staged_color(*surface, surface->staging.Get());
+        publish_staged_color(*surface, surface->staging.Get(), s_pending_flip.coverage,
+                             surface->content_serial == s_pending_flip.content_serial);
     }
     s_pending_flip.valid = false;
     return va;
@@ -1588,6 +1658,10 @@ static bool stage_flip(const void *presented, size_t bytes, uint32_t va, uint32_
     s_pending_flip.bytes = bytes;
     s_pending_flip.va = va;
     s_pending_flip.pitch = pitch;
+    s_pending_flip.content_serial = surface->content_serial;
+    s_pending_flip.coverage.written_region = surface->written_region;
+    s_pending_flip.coverage.written_mask = surface->written_mask;
+    s_pending_flip.coverage.width = surface->width;
     s_pending_flip.valid = true;
     return true;
 }
@@ -1601,12 +1675,16 @@ extern "C" uint32_t nv2a_gpu_flip(const void *presented, size_t bytes, uint32_t 
     uint32_t show = va;
     if (async_flip_enabled()) {
         show = resolve_pending_flip();
-        if (!stage_flip(presented, bytes, va, pitch)) {
+        if (!show) {
+            /* Nothing staged to show: the first frame, or a mid-frame guest
+             * readback (cloak refraction blit) already consumed the staged
+             * frame and has since published a half-drawn frame into guest RAM.
+             * Publish this frame synchronously so the window never shows the
+             * mid-frame state; the stage below resumes the pipeline. */
             gpu_sync_impl(true, presented, bytes);
             show = va;
-        } else if (!show) {
-            show = va;              /* first frame: nothing to show yet */
         }
+        stage_flip(presented, bytes, va, pitch);
     } else {
         gpu_sync_impl(true, presented, bytes);
     }
@@ -1981,7 +2059,19 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
          * full-target case maps cleanly onto the scratch texture. */
         if (binding.width == destination.width && binding.height == destination.height &&
                 binding.linear && (binding.format == 0x12 || binding.format == 0x1E))
+        {
+            if (cloak_debug())
+                std::fprintf(stderr, "[CLOAKDBG] feedback src=%p %ux%u fmt=%X linear=%u pitch=%u; dst %ux%u pitch=%u dirty=%u\n",
+                             (const void *)binding.source, binding.width, binding.height,
+                             binding.format, binding.linear, binding.pitch,
+                             destination.width, destination.height, destination.pitch,
+                             (unsigned)destination.dirty);
             return get_feedback_texture(destination);
+        }
+        if (cloak_debug())
+            std::fprintf(stderr, "[CLOAKDBG] target-alias-NULL src=%p %ux%u fmt=%X linear=%u; dst %ux%u\n",
+                         (const void *)binding.source, binding.width, binding.height,
+                         binding.format, binding.linear, destination.width, destination.height);
         std::fprintf(stderr, "[GPU-D3D11] texture target alias: source %p bytes %llu size %ux%u pitch %u format %X linear %u; target %p size %ux%u pitch %u\n",
                      (const void *)binding.source, (unsigned long long)binding.source_bytes,
                      binding.width, binding.height, binding.pitch, binding.format, binding.linear,
@@ -2070,6 +2160,13 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
     }
     if (direct) {
         direct->last_used = ++surface_use_serial;
+        if (cloak_debug())
+            std::fprintf(stderr, "[CLOAKDBG] direct src=%p %ux%u fmt=%X linear=%u pitch=%u; surf %ux%u pitch=%u dirty=%u needs_refresh=%u snapshot_valid=%u\n",
+                         (const void *)binding.source, binding.width, binding.height,
+                         binding.format, binding.linear, binding.pitch,
+                         direct->width, direct->height, direct->pitch,
+                         (unsigned)direct->dirty, (unsigned)direct->needs_refresh,
+                         (unsigned)direct->snapshot_valid);
         /* A surface marked dirty holds GPU content newer than guest RAM (it has
          * been drawn into but not published). Re-uploading the snapshot would
          * overwrite that with the previous publish, so sample the GPU texture
@@ -2081,6 +2178,10 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         return direct->view.Get();
     }
     CachedTexture *refresh = nullptr;
+    if (cloak_debug() && binding.source_bytes >= 1048576u)
+        std::fprintf(stderr, "[CLOAKDBG] fallback src=%p %ux%u fmt=%X linear=%u pitch=%u (guest-RAM upload)\n",
+                     (const void *)binding.source, binding.width, binding.height,
+                     binding.format, binding.linear, binding.pitch);
     {
         GpuTimer hash_timer(gpu_timing.hash);
         gpu_timing.hash_bytes += binding.source_bytes;
@@ -2099,6 +2200,24 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                     texture.validated_serial == s_texture_validate_serial)
                 return texture.view.Get();
             gpu_timing.memcmp_bytes += binding.source_bytes;
+            if (hash_debug() && binding.source_bytes >= 262144u) {
+                static std::vector<uintptr_t> seen;
+                if (seen.size() < 64 && std::find(seen.begin(), seen.end(), (uintptr_t)binding.source) == seen.end()) {
+                    seen.push_back((uintptr_t)binding.source);
+                    const Surface *match = nullptr;
+                    for (const auto &surface : surfaces)
+                        if (surface.memory == binding.source) { match = &surface; break; }
+                    std::fprintf(stderr, "[HASHDBG] src=0x%08llX bytes=%llu %ux%u fmt=%X linear=%u pitch=%u; surface=%s",
+                                 (unsigned long long)(uintptr_t)binding.source,
+                                 (unsigned long long)binding.source_bytes,
+                                 binding.width, binding.height, binding.format, binding.linear, binding.pitch,
+                                 match ? "yes" : "no");
+                    if (match)
+                        std::fprintf(stderr, " (w%u h%u pitch%u dirty%u)",
+                                     match->width, match->height, match->pitch, (unsigned)match->dirty);
+                    std::fprintf(stderr, "\n");
+                }
+            }
             if (std::memcmp(texture.source_snapshot.data(), binding.source, binding.source_bytes) == 0) {
                 texture.validated_serial = s_texture_validate_serial;
                 texture.force_validate = false;
@@ -3149,6 +3268,7 @@ extern "C" int nv2a_gpu_available(void)
         }
         std::fprintf(stderr, "[GPU-D3D11] constant buffer offsetting: %s\n",
                      context1 ? "supported" : "unavailable, using per-draw Map");
+        g_xbox_path_hook = nv2a_cloak_path_hook;
     }
     return device != nullptr;
 }
