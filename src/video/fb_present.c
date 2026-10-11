@@ -392,9 +392,14 @@ static void rep_load(void)
     fclose(f);
     s_rep_start = GetTickCount();
     s_rep_state = 1;
-    /* The pad stand-in only reads keys/mouse while the cursor is captured. */
-    if (getenv("RECOMP_KBM"))
-        xbox_FramebufferMouseCapture(1);
+    /* Replayed deltas feed s_mouse_* directly; the grab only matters for a
+     * window the user sees. An automated (RECOMP_NO_FOCUS) run must not clip
+     * and recentre the user's real cursor. */
+    {
+        const char *nf = getenv("RECOMP_NO_FOCUS");
+        if (getenv("RECOMP_KBM") && !(nf && *nf && *nf != '0'))
+            xbox_FramebufferMouseCapture(1);
+    }
     fprintf(stderr, "[REP] replaying %d events from %s\n", s_rep_n, path);
 }
 

@@ -2655,23 +2655,30 @@ static void kernel_nv2a_software_tick(void)
         *depth = g_nv2a_software.depth_clear;
         *color = g_nv2a_software.color_clear;
     }
-    /* The routine is D3D code running on this (timer) thread, so it is not the
-     * ack thread that advances GET; deferring already breaks the old
-     * self-deadlock (see xbox_Nv2aSoftwareMethodDeferred). Publishing GET = PUT
-     * here was a false "the whole ring is consumed" that let the guest overwrite
-     * un-walked commands ([PB] desync). GET is advanced only by the walker. */
-    {
-        volatile uint32_t *put = xbox_Nv2aRegisterPointer(0x800040, 4);
-        volatile uint32_t *get = xbox_Nv2aRegisterPointer(0x800044, 4);
-        if (put && get)
-            *get = *put;
-    }
+    /* GET is advanced only by the walker. This tick used to publish GET = PUT
+     * (current register PUT, possibly past the kick still being walked): during
+     * level load the guest fills > half the ring per kick, trusted the false
+     * GET, wrapped and overwrote un-walked words -> [PB] desync. None of the
+     * routine's cases read GET; the audio wedge that once needed it no longer
+     * reproduces (make test-replay-audio SESSION=ghost-collision-5). */
     stack = g_esp;
     g_ecx = g_nv2a_software.context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = g_nv2a_software.parameter;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     old_irql = xbox_IrqlEnterInterrupt(2);  /* DISPATCH_LEVEL */
-    g_nv2a_software.routine();
+    {
+        /* A routine that blocks wedges the shared timer thread (DPCs, audio). */
+        static unsigned slow_n;
+        long long t0 = kernel_counter(), dt;
+        g_nv2a_software.routine();
+        dt = kernel_counter() - t0;
+        if (dt * 100 > g_nv2a_software.frequency && slow_n < 32) {  /* > 10 ms */
+            slow_n++;
+            fprintf(stderr, "  [NV2A] slow software method 0x%08X: %.1f ms\n",
+                    g_nv2a_software.parameter,
+                    dt * 1000.0 / g_nv2a_software.frequency);
+        }
+    }
     xbox_IrqlLeaveInterrupt(old_irql);
     if (g_esp != stack) {
         fprintf(stderr, "  [NV2A] Software method 0x%08X corrupted callback "
