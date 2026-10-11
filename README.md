@@ -22,7 +22,7 @@ on, or find out what people are stuck on before you duplicate the effort.
 
 ### Recent Changes
 
-**Current version: v0.13.0 — _"Given Back"_ (October 2026).**
+**Current version: v0.13.1 — _"Cut Short"_ (October 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
 ---
@@ -425,7 +425,7 @@ definitions — they are the real proof for the shift, flag and x87 work, and
 each is paired with a negative control that feeds the harness the pre-fix
 expression and requires it to fail. They need a C compiler on `PATH`, and
 **skip rather than fail without one**, so check the skip count: a clean run is
-630 passed / 0 skipped. If clang is installed but not on `PATH`:
+641 passed / 0 skipped. If clang is installed but not on `PATH`:
 
 ```bash
 export PATH="/c/Program Files/LLVM/bin:$PATH"   # Git Bash
@@ -538,6 +538,41 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### v0.13.1 — *"Cut Short"* (October 2026)
+
+*Three fixes from one contributor, all about where a function ends. A CRT*
+`memcpy` *ended at its own jump table, leaving the arms after it with no owner.
+A run of alias entries in a gap each claimed the whole gap. A wrapped body's
+rename carried every call with it, past the wrapper meant to intercept them.
+Each one compiles, links and runs; the first two lift the wrong bytes, and the
+third runs the right bytes without the code the project wrote to go around them.*
+
+- **Arms that follow their inline jump table** are lifted inside the function:
+  it is extended over its tables when every path stays in range, instead of
+  dispatching to an address with no body —
+  *[@NoRain211](https://github.com/NoRain211)* (#173)
+- **Gap aliases stay inside their gap**: each ends after its own body, within
+  its section's file-backed bytes, rather than at the next start measured before
+  the other aliases existed. On DOA3 that is 1.58M → 1.28M lines of C —
+  *[@NoRain211](https://github.com/NoRain211)* (#174)
+- **Calls reach a wrapped function's wrapper**: direct calls, tail jumps and the
+  dispatch table go to `recomp_manual.c`'s `sub_X`, and the `sub_X_gen` body it
+  calls is always emitted —
+  *[@NoRain211](https://github.com/NoRain211)* (#175)
+
+**Held:** #176 (static callback recovery) accepts plain constants that land
+mid-function in unlisted code as function entries; on Wreckless one of them is
+data lifted as code. #162 (the pushbuffer executor, rebased) has a walk that
+can run past `PUT` and an unbounded 32-bit vertex index. Both are back with
+their authors.
+
+Checked on Wreckless (DSTEAL_JP): regenerated with 0 failures, the only change
+to the function set is four jump-table arms now lifted as labels, and the boot
+reaches the same point as on v0.13.0.
+
+A clean run is now **641 passed / 0 skipped**, up from 630, plus 5,843
+conformance vectors with no mismatches.
 
 ### v0.13.0 — *"Given Back"* (October 2026)
 

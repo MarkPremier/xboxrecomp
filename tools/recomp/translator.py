@@ -977,7 +977,11 @@ class FunctionTranslator:
                     addr for addr in weak_starts[weak_index:]
                     if addr < upper and addr in cfg_targets
                 }
-                if not owned:
+                # Every path into a hand-written entry must reach it, so an
+                # owner whose CFG branches or falls through to one stays split.
+                falls_into = {insn.end_address for insn in instructions
+                              if not insn.is_terminator}
+                if not owned or (owned | falls_into) & self.protected_function_starts:
                     continue
 
                 self.owned_function_starts.update(owned)
@@ -1000,6 +1004,7 @@ class FunctionTranslator:
 
         Run after discover_cfg_ownership, which settles translated bounds.
         """
+        self._extend_over_trailing_tables()
         sites = []
         for start, info in self.func_db.items():
             if start in self.owned_function_starts:
@@ -1008,18 +1013,22 @@ class FunctionTranslator:
             if recovered:
                 end = recovered["end"]
                 instructions = recovered["instructions"]
+                known = recovered["jump_tables"]
             else:
                 end = info.get("end", start)
                 raw_bytes = self._read_func_bytes(start, end)
                 instructions = (
                     self.disasm.disassemble_function(raw_bytes, start, end)
                     if raw_bytes else [])
+                known = {}
             for insn in instructions:
                 if (insn.mnemonic != "jmp" or insn.jump_target
                         or not insn.operands
                         or insn.operands[0].type != "mem"):
                     continue
                 operand = insn.operands[0]
+                if operand.mem_disp in known:
+                    continue  # recovered as an in-function switch
                 if operand.mem_index and not operand.mem_base:
                     sites.append((start, end, operand.mem_disp))
 
@@ -1075,6 +1084,61 @@ class FunctionTranslator:
             self.jump_table_entry_starts.add(target)
 
         return self.jump_table_entry_starts
+
+    def _extend_over_trailing_tables(self):
+        """Extend a function cut at its own inline jump tables.
+
+        Hand-written CRT routines (MSVC's memcpy) interleave dword tables with
+        the arms they index, tables first. The function list ends such a
+        function where decoding meets its first table, leaving the arms in an
+        unowned gap. The arms branch back into the body, so they cannot run as
+        functions of their own. Recover the CFG through the gap, up to the next
+        function start, and keep it when every path stays inside it.
+
+        A tail_jump_alias entry is a second entry into another body, so it
+        does not bound the gap.
+        """
+        bounds = sorted(
+            addr for addr, info in self.func_db.items()
+            if info.get("detection_method") != "tail_jump_alias")
+        for start in bounds:
+            info = self.func_db[start]
+            if (start in self.owned_function_starts
+                    or start in self._recovered_cfg):
+                continue
+            end = info.get("end", start)
+            following = bisect.bisect_right(bounds, start)
+            if following >= len(bounds) or bounds[following] <= end:
+                continue
+            upper = bounds[following]
+            raw_bytes = self._read_func_bytes(start, end)
+            if not raw_bytes or not any(
+                    insn.mnemonic == "jmp" and insn.jump_target is None
+                    and insn.operands and insn.operands[0].type == "mem"
+                    and insn.operands[0].mem_index
+                    and not insn.operands[0].mem_base
+                    and start <= insn.operands[0].mem_disp < upper
+                    for insn in self.disasm.disassemble_function(
+                        raw_bytes, start, end)):
+                continue
+            recovered = self._recover_cfg(start, upper, set(), set())
+            if recovered is None or not recovered[1]:
+                continue
+            instructions, jump_tables, _ = recovered
+            new_end = max(insn.end_address for insn in instructions)
+            if new_end <= end or not self._arm_is_whole(start, instructions):
+                continue
+            info["end"] = new_end
+            info["size"] = new_end - start
+            info["num_instructions"] = len(instructions)
+            self._recovered_cfg[start] = {
+                "end": new_end,
+                "instructions": instructions,
+                "jump_tables": jump_tables,
+            }
+            print(f"Extended 0x{start:08X} from 0x{end:08X} to "
+                  f"0x{new_end:08X} over its inline jump tables",
+                  file=sys.stderr)
 
     def _arm_is_whole(self, target, instructions):
         """Return whether a recovered arm can run as a function of its own.
@@ -2965,6 +3029,13 @@ class BatchTranslator:
                 translations.append((addr, name, stub))
                 stats["failed"] += 1
 
+        # A wrapped function's body is sub_X_gen; the hand-written sub_X is
+        # what callers and indirect dispatch must reach, so declare it like
+        # any hand-written function.
+        for addr, func_info in func_list:
+            if func_info.get("wrapper_name"):
+                manual_decls[addr] = func_info["wrapper_name"]
+
         # Any address called but never defined needs a stub, or the link fails.
         # These are almost all mid-function entry points the function detector
         # did not split out: a call lands a few bytes inside (or just past) a
@@ -3181,8 +3252,8 @@ class BatchTranslator:
         # Sorted by address: recomp_lookup binary-searches this array, so an
         # appended entry would silently break every lookup past it.
         dispatch_entries = sorted(
-            list(translations) + [(addr, name, None)
-                                  for addr, name in manual_decls.items()],
+            [entry for entry in translations if entry[0] not in manual_decls]
+            + [(addr, name, None) for addr, name in manual_decls.items()],
             key=lambda e: e[0])
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")
         self._write_dispatch_table(dispatch_entries, dispatch_path, header_name)

@@ -235,6 +235,20 @@ direction.
   recovered code, refused jump tables whose scale is not a dword stride, and
   made `iret` terminal.
 
+*v0.13.1 — a function list cut in the wrong place (#173–#175)*
+- **Arms after their own inline jump table (#173)** — MSVC's hand-written CRT
+  `memcpy` puts each table before the arms it indexes, so the function list
+  ended at the table and the arms, which branch back into the body, had no
+  owner. The function is now extended over its tables when every path stays
+  inside.
+- **Gap aliases spanned the whole gap (#174)** — an alias entry with no
+  enclosing body ran to the next function start measured before the other
+  aliases existed, so DOA3's 25 C++ initialisers each lifted the same ~100 KB,
+  and one ran past its section into data. Each now ends after its own body.
+- **Calls skipped the hand-written wrapper (#175)** — renaming a wrapped body
+  to `sub_X_gen` renamed every reference to it too, so direct calls and the
+  dispatch table bypassed `recomp_manual.c`'s `sub_X`.
+
 ### DarthSidious666 — [@DarthSidious666](https://github.com/DarthSidious666)
 - **Implemented the missing `tools/abi_analysis` (#6)** — the pipeline had a
   hole in it: `tools.recomp` looked for `abi_functions.json`, warned when it

@@ -1440,7 +1440,9 @@ class Lifter:
         that are not known function starts.
         """
         if addr in self.func_db:
-            name = self.func_db[addr].get("name", f"sub_{addr:08X}")
+            info = self.func_db[addr]
+            # A wrapped body is named sub_X_gen; calls go to the wrapper.
+            name = info.get("wrapper_name") or info.get("name", f"sub_{addr:08X}")
         elif addr in self.label_db:
             name = self.label_db[addr]
         else:
