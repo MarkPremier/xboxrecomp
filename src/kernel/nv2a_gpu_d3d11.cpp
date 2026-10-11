@@ -1194,19 +1194,22 @@ static bool publish_depth(void)
  * nothing at all was measured a net loss (the guest races ahead and the flip
  * drains a deep backlog). Keep a small ring of event queries and only wait for
  * the one from RECOMP_SYNC_LAG events ago, so the GPU runs a bounded distance
- * ahead. RECOMP_SYNC_LAG=0 restores the per-event wait. */
+ * ahead. RECOMP_SYNC_LAG=0 restores the per-event wait. The waits are pipeline
+ * latency, not GPU throughput: paired ab-perf at 1080p gameplay measured lag 4
+ * 31.6/32.4, lag 7 35.1/36.1, lag 16 36.5/37.9 FPS with event-wait time
+ * falling ~9 s -> ~3 s -> ~0.4 s per run, so 16 is the default (ring 32). */
 static void wait_ordering_completion(void)
 {
-    static ComPtr<ID3D11Query> ring[8];
+    static ComPtr<ID3D11Query> ring[32];
     static unsigned produced;
     static int lag = -1;
     if (lag < 0) {
         const char *value = std::getenv("RECOMP_SYNC_LAG");
-        lag = value ? std::atoi(value) : 4;
+        lag = value ? std::atoi(value) : 16;
         if (lag < 0) lag = 0;
-        if (lag > 7) lag = 7;
+        if (lag > 31) lag = 31;
     }
-    unsigned slot = produced++ & 7u;
+    unsigned slot = produced++ & 31u;
     if (!ring[slot]) {
         D3D11_QUERY_DESC description = {D3D11_QUERY_EVENT, 0};
         HRESULT created = device->CreateQuery(&description, &ring[slot]);
@@ -1215,7 +1218,7 @@ static void wait_ordering_completion(void)
     context->End(ring[slot].Get());
     context->Flush();
     if (produced > (unsigned)lag) {
-        ID3D11Query *old = ring[(produced - 1 - (unsigned)lag) & 7u].Get();
+        ID3D11Query *old = ring[(produced - 1 - (unsigned)lag) & 31u].Get();
         while (context->GetData(old, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE) {
             xbox_Nv2aAcknowledgeHandshakes();
             SwitchToThread();
@@ -2104,14 +2107,25 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
      * texture (the common render-target-as-texture case, e.g. 0x99753000):
      * the surface view already holds the resolved pixels, so the guest-side
      * swizzle is irrelevant and requiring binding.linear would strand it on a
-     * full GPU sync every frame. */
+     * full GPU sync every frame. 0x06 (A8R8G8B8) is the same with alpha -- the
+     * 512x512 in-mission effect target samples it that way every frame. A
+     * swizzled binding has no pitch (binding.pitch is whatever the last linear
+     * texture set), so match it against a tightly packed surface instead.
+     * RECOMP_SWIZZLED_SURFACE_VIEW=0 restores the old 0x07/pitch-matched rule. */
+    static const bool swizzled_views = []() {
+        const char *value = std::getenv("RECOMP_SWIZZLED_SURFACE_VIEW");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    bool swizzled_view = swizzled_views ? (binding.format == 0x06 || binding.format == 0x07)
+                                        : binding.format == 0x07;
     bool surface_viewable = (binding.format == 0x12 || binding.format == 0x1E)
-                                ? binding.linear : binding.format == 0x07;
+                                ? binding.linear : swizzled_view;
+    uint32_t want_pitch = swizzled_view && swizzled_views ? binding.width * 4 : binding.pitch;
     if (levels == 1 && !binding.cube && !binding.depth && surface_viewable)
         for (auto &surface : surfaces) {
             gpu_timing.surface_scan_iters++;
             if (surface.memory == binding.source && surface.width == binding.width &&
-                surface.height == binding.height && surface.pitch == binding.pitch) {
+                surface.height == binding.height && surface.pitch == want_pitch) {
                 direct = &surface;
                 break;
             }
@@ -2171,6 +2185,23 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         } else gpu_timing.alias_copy_reuses++;
     } else if (dirty_alias) {
         gpu_timing.texture_alias_syncs++;
+        if (cloak_debug()) {
+            std::fprintf(stderr, "[ALIASSYNC] src=%p bytes=%llu %ux%u fmt=%X linear=%u pitch=%u depth=%u levels=%u direct=%p\n",
+                         (const void *)binding.source, (unsigned long long)binding.source_bytes,
+                         binding.width, binding.height, binding.format, binding.linear, binding.pitch,
+                         (unsigned)binding.depth, (unsigned)levels, (void *)direct);
+            for (const auto &surface : surfaces)
+                if (surface.dirty && (uintptr_t)surface.memory < end &&
+                    (uintptr_t)surface.memory + (size_t)surface.pitch * surface.height > begin)
+                    std::fprintf(stderr, "[ALIASSYNC]   dirty color %p %ux%u pitch=%u\n",
+                                 (const void *)surface.memory, surface.width, surface.height, surface.pitch);
+            for (const auto &surface : depth_surfaces)
+                if (surface.dirty && (uintptr_t)surface.memory < end &&
+                    (uintptr_t)surface.memory + (size_t)surface.pitch * surface.height > begin)
+                    std::fprintf(stderr, "[ALIASSYNC]   dirty depth %p %ux%u pitch=%u fmt=%u\n",
+                                 (const void *)surface.memory, surface.width, surface.height, surface.pitch,
+                                 (unsigned)surface.format);
+        }
         /* Pull just this texture's source bytes back to guest RAM. A full sync
          * here republished every dirty surface once per frame, which alone made
          * the lazy flip worthless: the surface it was about to publish had
