@@ -975,6 +975,7 @@ static void fence_mirrors_tick(void)
 static struct {
     uint32_t device_ptr_va;
     uint32_t event_off;
+    uint32_t adopted;      /* device VA once adopted as a guest-state event */
 } g_event_signals[XBOX_MAX_EVENT_SIGNALS];
 static int g_event_signal_count = 0;
 static int g_event_signal_disabled = 0;
@@ -1005,7 +1006,16 @@ static void event_signals_tick(void)
                                      + g_memory_offset);
         if (!fence_readable(dev + g_event_signals[i].event_off, 4))
             continue;
-        xbox_KeObjectSignal(dev + g_event_signals[i].event_off);
+        /* Adopt the event as a guest-state event instead of signalling it on
+         * every pass. The blanket signal handed D3D a completion it had not
+         * earned, so its BlockOnTime wait returned before the fence retired
+         * and the guest overwrote ring the walker had not read ([PB] desync).
+         * The real signal is the software method that runs KeSetEvent on this
+         * event, which the guest resets itself (SignalState) before waiting. */
+        if (g_event_signals[i].adopted != dev) {
+            xbox_KeObjectAdopt(dev + g_event_signals[i].event_off);
+            g_event_signals[i].adopted = dev;
+        }
     }
 }
 
@@ -1888,19 +1898,16 @@ void xbox_PeekSample(const char *label)
     fflush(stderr);
 }
 
-static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
+static void watchdog_sample(const char *tag)
 {
     const uint8_t *mem;
     uint32_t esp, i;
 
-    (void)unused;
-    Sleep(s_watchdog_secs * 1000u);
-
     mem = (const uint8_t *)g_memory_offset;
     esp = s_watchdog_esp ? *s_watchdog_esp : 0;
-    fprintf(stderr, "[WATCHDOG] no exit after %us; guest esp=0x%08X\n"
+    fprintf(stderr, "[%s] guest esp=0x%08X\n"
             "  regs: eax=%08X ecx=%08X edx=%08X ebx=%08X esi=%08X edi=%08X\n",
-            s_watchdog_secs, esp,
+            tag, esp,
             s_watchdog_regs[0] ? *s_watchdog_regs[0] : 0,
             s_watchdog_regs[1] ? *s_watchdog_regs[1] : 0,
             s_watchdog_regs[2] ? *s_watchdog_regs[2] : 0,
@@ -1964,28 +1971,80 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
                 *(const uint32_t *)(mem + a));
     }
     fflush(stderr);
+}
+
+static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
+{
+    (void)unused;
+    Sleep(s_watchdog_secs * 1000u);
+    watchdog_sample("WATCHDOG");
     _exit(3);
+    return 0;
+}
+
+/* Flip-stall sampler.
+ *
+ * The timed watchdog fires once and exits, which is fine for a title that
+ * hangs during load but useless for a stall that comes and goes: the one
+ * sample lands wherever the clock happens to be, and the exit kills the run
+ * before a human can watch. This one watches the completed-present counter
+ * instead and dumps the guest thread's stack the moment frames stop advancing
+ * for a few seconds, without exiting -- once per stall episode, so a long
+ * freeze is not buried under a dump per second. RECOMP_STALL_DUMP turns it on.
+ */
+extern volatile uint32_t g_present_flips;
+static DWORD WINAPI xbox_stalldump_thread(LPVOID unused)
+{
+    uint32_t last = 0;
+    unsigned still = 0;
+    unsigned seq = 0;
+
+    (void)unused;
+    for (;;) {
+        Sleep(1000);
+        if (g_present_flips == last) {
+            if (++still >= 3) {
+                fprintf(stderr, "[STALLDUMP] seq=%u no present for %us; g_present_flips=%u\n",
+                        ++seq, still, g_present_flips);
+                watchdog_sample("STALLDUMP");
+            }
+        } else {
+            if (still >= 3)
+                fprintf(stderr, "[STALLDUMP] frames resumed at g_present_flips=%u\n",
+                        g_present_flips);
+            last = g_present_flips;
+            still = 0;
+            seq = 0;
+        }
+    }
     return 0;
 }
 
 void xbox_WatchdogStart(void)
 {
     const char *secs = getenv("RECOMP_WATCHDOG_SECS");
+    const char *stall = getenv("RECOMP_STALL_DUMP");
     HANDLE h;
+
+    /* Taken on the guest thread: g_esp is thread-local, so every sampler has
+     * to be handed the address of the one that matters rather than reading
+     * its own, which is always zero. */
+    s_watchdog_esp = &g_esp;
+    s_watchdog_regs[0] = &g_eax; s_watchdog_regs[1] = &g_ecx;
+    s_watchdog_regs[2] = &g_edx; s_watchdog_regs[3] = &g_ebx;
+    s_watchdog_regs[4] = &g_esi; s_watchdog_regs[5] = &g_edi;
+
+    if (stall && *stall) {
+        h = CreateThread(NULL, 0, xbox_stalldump_thread, NULL, 0, NULL);
+        if (h)
+            CloseHandle(h);
+    }
 
     if (!secs || !*secs)
         return;
     s_watchdog_secs = (unsigned)atoi(secs);
     if (!s_watchdog_secs)
         return;
-
-    /* Taken on the guest thread: g_esp is thread-local, so the watchdog has to
-     * be handed the address of the one that matters rather than reading its
-     * own, which is always zero. */
-    s_watchdog_esp = &g_esp;
-    s_watchdog_regs[0] = &g_eax; s_watchdog_regs[1] = &g_ecx;
-    s_watchdog_regs[2] = &g_edx; s_watchdog_regs[3] = &g_ebx;
-    s_watchdog_regs[4] = &g_esi; s_watchdog_regs[5] = &g_edi;
     h = CreateThread(NULL, 0, xbox_watchdog_thread, NULL, 0, NULL);
     if (h)
         CloseHandle(h);

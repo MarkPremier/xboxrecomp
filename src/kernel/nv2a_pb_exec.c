@@ -522,6 +522,10 @@ static struct {
     Texture  tex;
 } s_gpu = {.cull_face = 0x405, .front_face = 0x900, .polygon_front = 0x1B02, .polygon_back = 0x1B02, .point_size = 8, .specular_power = 1.0f};
 
+/* Mirrored for the flip-stall sampler in xbox_memory_layout.c: that sampler
+ * watches for a completed present, which is exactly what s_gpu.flips counts. */
+volatile uint32_t g_present_flips;
+
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
  * them in. */
@@ -3664,14 +3668,29 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     if (method == 0x0100) {
         extern int xbox_Nv2aSoftwareMethodDeferred(uint32_t, uint32_t, uint32_t);
+        extern int xbox_Nv2aSoftwareMethodPending(void);
+        extern void xbox_Nv2aAcknowledgeHandshakes(void);
         if (!param)
             return;
         if (xbox_Nv2aNativeFencesEnabled()) {
             s_gpu.flush_fence++;
             /* Deferred: the routine can wait on the GPU (this thread), so the
-             * synchronous form deadlocks -- see kernel_bridge. */
-            xbox_Nv2aSoftwareMethodDeferred(param, s_gpu.depth_clear,
-                                            s_gpu.clear_color);
+             * synchronous form deadlocks -- see kernel_bridge. But never drop
+             * it: a dropped call left the pusher's fixup unapplied and the
+             * walker looping on a stale tail JUMP. Re-issue until queued (the
+             * pusher stalls, as on hardware). */
+            while (!xbox_Nv2aSoftwareMethodDeferred(param, s_gpu.depth_clear,
+                                                    s_gpu.clear_color)) {
+                xbox_Nv2aAcknowledgeHandshakes();
+                SwitchToThread();
+            }
+            /* Types 0xC-0xE rewrite a push buffer the stream is about to run:
+             * PGRAPH stalls on the trap until the handler has finished. */
+            if ((param & 0x1Fu) >= 12u && (param & 0x1Fu) <= 14u)
+                while (xbox_Nv2aSoftwareMethodPending()) {
+                    xbox_Nv2aAcknowledgeHandshakes();
+                    SwitchToThread();
+                }
             return;
         }
         note_unhandled(subch, method, param);
@@ -4191,6 +4210,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
+        g_present_flips = s_gpu.flips;
         return;
 
     case NV097_FLIP_STALL:

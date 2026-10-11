@@ -34,6 +34,8 @@
 #endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern volatile uint32_t *xbox_Nv2aRegisterPointer(uint32_t offset, uint32_t bytes);
+extern void xbox_Nv2aAcknowledgeHandshakes(void);
 
 #define PB_MAX_METHODS 4096
 
@@ -387,6 +389,23 @@ void nv2a_pb_run(uint32_t put_va)
         }
 
         uint32_t off;
+        /* Publish DMA_GET at every top-level packet boundary: everything
+         * before this header has executed. D3D uses GET to decide a push
+         * buffer is idle, so leaving it at the old value for the whole walk
+         * made KickOff (0x100410 WC-flush handshake) wait out a full walk.
+         * Do NOT publish inside a CALL or an out-of-line jump frame -- GET
+         * must stay on the ring (a forward jump must not move it). */
+        if (!ret && !ret_u_n) {
+            static volatile uint32_t *s_dma_get;
+            if (!s_dma_get)
+                s_dma_get = xbox_Nv2aRegisterPointer(0x800044u, 4);
+            if (s_dma_get)
+                *s_dma_get = (va - 4u) & 0x0FFFFFFFu;
+            /* Unblock the guest's KickOff spin (0x100410 WC-flush handshake):
+             * at every packet boundary the WC flush has drained, so clear it
+             * now instead of waiting for the top of the next ack-loop pass. */
+            xbox_Nv2aAcknowledgeHandshakes();
+        }
         if ((w & 0xE0000003u) == 0x20000000u) {                     /* old JUMP */
             off = w & 0x1FFFFFFCu;
         } else if ((w & 3u) == 1u) {                                /* JUMP */

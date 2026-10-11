@@ -280,27 +280,39 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
  */
 VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
-    KIRQL old = irql_swap(NewIrql);
+    KIRQL requested = NewIrql;
+    KIRQL cur = irql_now();
 
-    if (NewIrql > old) {
-        /* A lower that sets a higher level than the processor is at. That is
-         * still a calling-convention mismatch upstream, but with the level
-         * model it can no longer wedge the interrupt gate: the next genuine
-         * lower sets the level back down. Kept loud so the caller can still
-         * be found. */
-        static volatile LONG n;
-        if (InterlockedIncrement(&n) <= 20) {
-            fprintf(stderr, "  [IRQLWARN] tid %lu KfLowerIrql(%d) while at %d\n",
-                    (unsigned long)GetCurrentThreadId(),
-                    (int)NewIrql, (int)old);
-            fflush(stderr);
+    /* A lower must never raise. The guest IRQL is a single shared level while
+     * guest threads run concurrently on different host cores, so a thread
+     * whose own lowering arrives late can set a level *above* the current one
+     * (its saved "old" was another thread's raise). That wedges the shared
+     * value at DISPATCH_LEVEL: xbox_IrqlBlocksInterrupts() then holds off the
+     * APU interrupt forever and DirectSound's lock stops protecting its voice
+     * lists, so one-shot effects/voices disappear. Clamp instead.
+     * ponytail: clamp is a patch; a per-thread guest IRQL is the real fix. */
+    if (NewIrql > cur)
+        NewIrql = cur;
+
+    {
+        KIRQL old = irql_swap(NewIrql);
+
+        if (requested > old) {
+            static volatile LONG n;
+            if (InterlockedIncrement(&n) <= 20) {
+                fprintf(stderr, "  [IRQLWARN] tid %lu KfLowerIrql(%d) while at %d"
+                        " (clamped to %d)\n",
+                        (unsigned long)GetCurrentThreadId(),
+                        (int)requested, (int)old, (int)NewIrql);
+                fflush(stderr);
+            }
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
+                "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
+                old, requested);
         }
-        xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
-            "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
-            old, NewIrql);
-    }
 
-    irql_track(old, NewIrql, IRQL_CALLER());
+        irql_track(old, NewIrql, IRQL_CALLER());
+    }
     irql_publish();
 }
 

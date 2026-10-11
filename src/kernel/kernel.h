@@ -769,6 +769,12 @@ NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(ULONG Count, PVOID Objects[], U
  * NV2A ack thread to release a title's GPU-completion wait. */
 int xbox_KeObjectSignal(uint32_t guest_va);
 
+/* Treat the KEVENT at guest_va as a title-built guest-state event (see
+ * ke_guest_event) even when RECOMP_TITLE_KEVENTS is off. Used for a title's
+ * D3D GPU-completion event so its own KeSetEvent/KeWaitForSingleObject drive
+ * it, instead of the runtime signalling it blindly every ack-loop pass. */
+void xbox_KeObjectAdopt(uint32_t guest_va);
+
 BOOLEAN  __stdcall xbox_KeCancelTimer(PXBOX_KTIMER Timer);
 BOOLEAN  __stdcall xbox_KeSetTimer(PXBOX_KTIMER Timer, LARGE_INTEGER DueTime, PXBOX_KDPC Dpc);
 BOOLEAN  __stdcall xbox_KeSetTimerEx(PXBOX_KTIMER Timer, LARGE_INTEGER DueTime, LONG Period, PXBOX_KDPC Dpc);

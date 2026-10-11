@@ -2655,12 +2655,11 @@ static void kernel_nv2a_software_tick(void)
         *depth = g_nv2a_software.depth_clear;
         *color = g_nv2a_software.color_clear;
     }
-    /* The routine is D3D code running on this thread; it can submit its own
-     * pushbuffer commands and then wait for DMA_GET to catch up. The ack
-     * thread that advances GET is the one blocked waiting for this routine to
-     * finish, so without a window of space here the two deadlock and the
-     * guest spins in D3DDevice_MakeSpace forever. Give it everything the
-     * title has submitted so far. */
+    /* The routine is D3D code running on this (timer) thread, so it is not the
+     * ack thread that advances GET; deferring already breaks the old
+     * self-deadlock (see xbox_Nv2aSoftwareMethodDeferred). Publishing GET = PUT
+     * here was a false "the whole ring is consumed" that let the guest overwrite
+     * un-walked commands ([PB] desync). GET is advanced only by the walker. */
     {
         volatile uint32_t *put = xbox_Nv2aRegisterPointer(0x800040, 4);
         volatile uint32_t *get = xbox_Nv2aRegisterPointer(0x800044, 4);
@@ -6513,6 +6512,13 @@ static void ke_shadow_remove(uint32_t guest_va)
  * once now blocks until the event is set, and on a title whose setter the
  * runtime does not model yet (a GPU interrupt, say) that turns a spin into a
  * hang. Turn it on for a title that waits on events it built itself. */
+static uint32_t s_adopted_va;
+
+void xbox_KeObjectAdopt(uint32_t guest_va)
+{
+    s_adopted_va = guest_va;
+}
+
 static HANDLE ke_guest_event(uint32_t guest_va, int *type)
 {
     static int enabled = -1;
@@ -6523,7 +6529,7 @@ static HANDLE ke_guest_event(uint32_t guest_va, int *type)
         const char *e = getenv("RECOMP_TITLE_KEVENTS");
         enabled = e && *e == '1';
     }
-    if (!enabled)
+    if (!enabled && guest_va != s_adopted_va)
         return NULL;
     if (guest_va < 0x10000u || (guest_va & 3u))
         return NULL;

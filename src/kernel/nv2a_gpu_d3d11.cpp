@@ -22,6 +22,11 @@
 
 using Microsoft::WRL::ComPtr;
 
+/* Clear the NV2A WC-flush/idle handshake bits the guest spins on (KickOff).
+ * Called from the GPU-wait spins so a long wait inside one packet does not
+ * hold up the guest's next kick. Register write only, so any thread may call. */
+extern "C" void xbox_Nv2aAcknowledgeHandshakes(void);
+
 static struct {
     double draw, texture, hash, upload, sync, state;
     double sync_copy, sync_wait, sync_publish, sync_unmap;
@@ -1190,8 +1195,10 @@ static void wait_ordering_completion(void)
     context->Flush();
     if (produced > (unsigned)lag) {
         ID3D11Query *old = ring[(produced - 1 - (unsigned)lag) & 7u].Get();
-        while (context->GetData(old, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE)
+        while (context->GetData(old, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE) {
+            xbox_Nv2aAcknowledgeHandshakes();
             SwitchToThread();
+        }
     }
 }
 
@@ -1273,8 +1280,10 @@ static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_
         context->End(completion_event.Get());
         context->Flush();
         HRESULT result;
-        while ((result = context->GetData(completion_event.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
+        while ((result = context->GetData(completion_event.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE) {
+            xbox_Nv2aAcknowledgeHandshakes();
             SwitchToThread();
+        }
         if (FAILED(result)) readback_failed("completion event", result, "wait");
     }
     for (auto &surface : surfaces) {
@@ -1548,8 +1557,10 @@ static uint32_t resolve_pending_flip()
     if (surface && s_pending_flip.event) {
         HRESULT result;
         while ((result = context->GetData(s_pending_flip.event.Get(), nullptr, 0,
-                                          D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
+                                          D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE) {
+            xbox_Nv2aAcknowledgeHandshakes();
             SwitchToThread();
+        }
         publish_staged_color(*surface, surface->staging.Get());
     }
     s_pending_flip.valid = false;
