@@ -228,6 +228,16 @@ class FunctionDetector:
             if not (self.engine.probes_as_prologue(nxt)
                     or self.engine.probes_as_constant_stub(nxt)):
                 continue
+            # A lone `mov edi,edi` hot-patch pad sits in front of an out-of-line
+            # jump table just as often as in front of a function. If a measured
+            # table starts inside the candidate's prologue window the bytes are
+            # padding and the "prologue" is the alignment nop, not a function
+            # head (Ghost's 0x0007D456 is 2 bytes of `mov edi,edi` before the
+            # switch tables at 0x0007D458; registering it swallowed the
+            # GunCrouchStart entry at 0x0007D4B0).
+            if any(nxt <= tbl < nxt + 16
+                   for tbl in self.engine.jump_tables):
+                continue
             self._add_candidate(nxt, config.CONFIDENCE_CC_BOUNDARY,
                                 "gap_prologue")
             added = True
@@ -574,7 +584,15 @@ class FunctionDetector:
             # address and passed around as values, so an immediate is exactly
             # how they show up.
             if not (self.engine.probes_as_returning_body(target)
-                    or self.engine.probes_as_vcall_thunk(target)):
+                    or self.engine.probes_as_vcall_thunk(target)
+                    # A handler reached only through a table immediate may end
+                    # in `jmp <other handler>` rather than a ret, so the
+                    # ret-only rule dropped it. Accept such a body only with a
+                    # recognised prologue as corroboration, which keeps a
+                    # data word that merely decodes to a stray jmp out.
+                    # Ghost's GunCrouchStart (0x0007D4B0) is exactly this.
+                    or (self.engine.probes_as_prologue(target)
+                        and self.engine.probes_as_function_body(target))):
                 continue
             if target not in self.engine.instructions:
                 if not self.engine.decode_at(target):
@@ -697,6 +715,13 @@ class FunctionDetector:
         # nowhere else. Excluding them left those constructors with no body at
         # all, and _initterm silently skipped every one.
         targets = set()
+        # A code pointer with another code pointer immediately beside it is a
+        # table slot -- a vtable, a dispatch table -- not a lone constant that
+        # happens to land in the code range. Only those slots get the long-body
+        # probe below; a bare constant keeps the short cap, because a value like
+        # 0x00080000 decodes happily and would otherwise alias hundreds of
+        # kilobytes of unrelated code.
+        table_slots = set()
         for sec in self.image.sections:
             if sec.name in code_names:
                 continue                    # scan data, not code
@@ -705,8 +730,16 @@ class FunctionDetector:
                 continue
             for off in range(0, len(data) - 3, 4):
                 value = int.from_bytes(data[off:off + 4], "little")
-                if in_code_section(value):
-                    targets.add(value)
+                if not in_code_section(value):
+                    continue
+                targets.add(value)
+                for noff in (off - 4, off + 4):
+                    if noff < 0 or noff + 4 > len(data):
+                        continue
+                    if in_code_section(
+                            int.from_bytes(data[noff:noff + 4], "little")):
+                        table_slots.add(value)
+                        break
 
         # Alias entries, not candidates.
         #
@@ -763,13 +796,25 @@ class FunctionDetector:
                 first = self.engine.instructions[target]
                 if first.mnemonic.lower() in ("int3", "nop"):
                     continue
+                # A table slot can name a long method -- Ghost's
+                # cCloakShader::RenderSetup is 341 instructions -- which the
+                # short cap rejected. Only slots flanked by another code
+                # pointer may spend the long walk; a bare constant keeps 64.
+                cap = 8192 if target in table_slots else 64
                 if not self.engine.probes_as_function_body(target,
-                                                           max_insns=64):
+                                                           max_insns=cap):
                     continue
                 i = bisect.bisect_right(starts, target)
                 sec = self.image.get_section_at_va(target)
                 end = starts[i] if i < len(starts) else section_end.get(
                     sec.name if sec else "", target + 4)
+                # A table slot whose next detected start is thousands of
+                # instructions away is a table in a section the sweep barely
+                # covered, not a method: the alias would translate a region no
+                # boundary vouches for. Ghost's cloak shader method is 1,248
+                # bytes; the WMADEC pointer tables wanted 13,000.
+                if target in table_slots and end - target > 2048:
+                    continue
             if end <= target:
                 continue
             self._alias_entries[target] = end
@@ -878,14 +923,38 @@ class FunctionDetector:
         shared tail, which costs a little code size and makes the entry point
         callable. The alternative -- a stub that returns immediately -- silently
         skips the epilogue and leaks the caller's frame.
+
+        An alias in a gap has no enclosing body; its end was "the next known
+        function start", measured before the other aliases existed. A run of
+        gap aliases -- DOA3's C++ dynamic initialisers -- then each spanned the
+        whole run, ~100 KB lifted 25 times, and one alias ran past its section
+        end into data. Measure each one as its own body, then run on to the
+        next function or alias start past that, within its section. Measuring
+        alone stops short at an inline jump table it does not recognise (the
+        CRT's backward memmove); cutting at the very next alias start splits a
+        real gap function at a data-table hit inside it, turning its own
+        branches into calls to stubs.
         """
+        bodies = sorted((f.start, f.end) for f in self.functions.values())
+        body_starts = [b[0] for b in bodies]
+        starts = sorted(set(body_starts) | set(self._alias_entries))
         for addr, end in sorted(self._alias_entries.items()):
             if addr in self.functions:
                 continue
+            section = self.image.get_section_at_va(addr)
+            i = bisect.bisect_right(body_starts, addr) - 1
+            if not (i >= 0 and addr < bodies[i][1]) and section is not None:
+                # Only the backed bytes are code; a virtual tail past them
+                # is zero-filled, and reading on reaches the next section.
+                end = min(end, section.virtual_addr
+                          + min(section.virtual_size, section.raw_size))
+                body_end = self._find_function_end(addr, end, end)
+                k = bisect.bisect_left(starts, max(body_end, addr + 1))
+                if k < len(starts):
+                    end = min(end, starts[k])
             insns = self.engine.get_instructions_in_range(addr, end)
             if not insns:
                 continue
-            section = self.image.get_section_at_va(addr)
             sec_name = section.name if section else ""
             label = self.labels.get(addr)
             name = label.name if label else f"sub_{addr:08X}"

@@ -26,18 +26,42 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef XBOX_CONTIG_BASE
+#define XBOX_CONTIG_BASE 0x80000000u   /* physical P is at this + P */
+#endif
+#ifndef XBOX_CONTIG_SIZE
+#define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
+#endif
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern volatile uint32_t *xbox_Nv2aRegisterPointer(uint32_t offset, uint32_t bytes);
+extern void xbox_Nv2aAcknowledgeHandshakes(void);
 
 #define PB_MAX_METHODS 4096
 
 static struct { uint32_t method, subch, count; } s_seen[PB_MAX_METHODS];
 static int s_seen_count;
+/* Direct index into s_seen: note() runs once per pushbuffer method word on the
+ * executor thread, so a linear scan of up to PB_MAX_METHODS was a real cost on
+ * every parameter word. Method is (w & 0x1FFC) -> 2048 slots, subchannel 3
+ * bits -> 8, so an [8][2048] table (int16 slots, 32 KB) makes it O(1) while
+ * leaving s_seen and the report untouched. */
+static int16_t s_seen_index[8][2048];
+static int s_seen_index_ready;
 
 /* Parse health. An inventory is only worth reading if the walk stayed in step
  * with the command stream: a decoder that desynchronises produces plausible
  * looking method numbers out of parameter data, and the counts then describe
  * nothing. Unrecognised words are the tell. */
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
+static uint32_t s_tot_calls;
+/* Target of the last ring JUMP (not a CALL's) seen by pb_walk: the true start
+ * of the pushbuffer ring. xbox_memory_layout uses it to find the seam on a
+ * wrap instead of guessing the bounds from the PUT range. */
+static uint32_t s_last_jump;
+/* Address of the parameter word most recently handed to the executor: lets a
+ * handler that rejects an out-of-batch command dump the surrounding stream. */
+uint32_t g_pb_current_va;
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
@@ -47,11 +71,17 @@ static int s_exec_enabled = -1;
 
 static void note(uint32_t subch, uint32_t method)
 {
-    for (int i = 0; i < s_seen_count; i++) {
-        if (s_seen[i].method == method && s_seen[i].subch == subch) {
-            s_seen[i].count++;
-            return;
-        }
+    uint32_t sub, m;
+    int16_t slot;
+    if (!s_seen_index_ready) {
+        memset(s_seen_index, 0xFF, sizeof s_seen_index);
+        s_seen_index_ready = 1;
+    }
+    sub = subch & 7u; m = (method >> 2) & 0x7FFu;
+    slot = s_seen_index[sub][m];
+    if (slot >= 0) {
+        s_seen[slot].count++;
+        return;
     }
     if (s_seen_count >= PB_MAX_METHODS) {
         /* Silently dropping past the cap is how a truncated inventory reads as
@@ -63,13 +93,13 @@ static void note(uint32_t subch, uint32_t method)
             fprintf(stderr, "[PB] method table full at %d -- inventory is"
                             " truncated\n", PB_MAX_METHODS);
         }
+        return;
     }
-    if (s_seen_count < PB_MAX_METHODS) {
-        s_seen[s_seen_count].method = method;
-        s_seen[s_seen_count].subch  = subch;
-        s_seen[s_seen_count].count  = 1;
-        s_seen_count++;
-    }
+    s_seen_index[sub][m] = (int16_t)s_seen_count;
+    s_seen[s_seen_count].method = method;
+    s_seen[s_seen_count].subch  = subch;
+    s_seen[s_seen_count].count  = 1;
+    s_seen_count++;
 }
 
 /* NV097 (Kelvin 3D class) methods worth naming. The point of the survey is to
@@ -105,8 +135,9 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x1760, "SET_VERTEX_DATA_ARRAY_FORMAT" },
     { 0x17FC, "SET_BEGIN_END" },
     { 0x1800, "ARRAY_ELEMENT16" },
-    { 0x1808, "INLINE_ARRAY" },
+    { 0x1808, "ARRAY_ELEMENT32" },
     { 0x1810, "DRAW_ARRAYS" },
+    { 0x1818, "INLINE_ARRAY" },
     { 0x1B00, "SET_TEXTURE_OFFSET" },
     { 0x1B04, "SET_TEXTURE_FORMAT" },
     { 0x1B08, "SET_TEXTURE_ADDRESS" },
@@ -129,14 +160,17 @@ void nv2a_pb_scan_report(void)
 {
     int i;
 
-    if (s_exec_enabled > 0)
+    if (s_exec_enabled > 0) {
         nv2a_pb_exec_report();
+        fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
+    }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
-    fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u unrecognised"
-                    " -- %d distinct (subchannel, method) pairs\n",
-            s_tot_segments, s_tot_words, s_tot_jumps, s_tot_unknown,
-            s_seen_count);
+    fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u calls,"
+                    " %u unrecognised -- %d distinct (subchannel, method)"
+                    " pairs\n",
+            s_tot_segments, s_tot_words, s_tot_jumps, s_tot_calls,
+            s_tot_unknown, s_seen_count);
     for (i = 0; i < s_seen_count; i++)
         fprintf(stderr, "  [PB]   subch %u  method 0x%04X  x%-6u %s\n",
                 s_seen[i].subch, s_seen[i].method, s_seen[i].count,
@@ -144,18 +178,22 @@ void nv2a_pb_scan_report(void)
     fflush(stderr);
 }
 
-void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+/* Walk commands from va to end_va. Returns the words consumed.
+ *
+ * A CALL runs a subroutine -- a pushbuffer somewhere else in memory -- up to
+ * its RETURN, then carries on after the CALL. This used to skip CALLs, which
+ * was invisible until a title used them for real: RenderWare on the Xbox
+ * compiles static geometry into pushbuffers and draws it with a CALL, so the
+ * whole race track went missing from Burnout 3's main view while the
+ * geometry it submits inline (environment maps, the HUD) drew fine.
+ * The NV2A has one level of subroutine, so a CALL inside a call is not
+ * followed. Addresses are physical, like PUT's, and reach guest memory the
+ * same way: through the contiguous window. */
+static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+                        uint32_t *jumps, uint32_t *unknown)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t va = start_va;
-    uint32_t words = 0, jumps = 0, unknown = 0;
-
-    if (s_exec_enabled < 0)
-        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(getenv("RECOMP_PB_SCAN") || s_exec_enabled) || end_va <= start_va)
-        return;
-    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
-        end_va = start_va + 0x400000u;
+    uint32_t words = 0;
 
     while (va < end_va && words < 0x100000u) {
         uint32_t w = *(const uint32_t *)(mem + va);
@@ -163,11 +201,35 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         words++;
 
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
-            jumps++;
-            break;                            /* a jump ends this segment */
-        }
-        if ((w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u)
+            uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                             : (w & 0x1FFFFFFCu);
+            uint32_t tgt = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
+            (*jumps)++;
+            if (!in_call) {
+                /* Record only a backward jump as the ring wrap; a forward
+                 * jump is a mid-ring skip and must not be mistaken for the
+                 * end of the lap (it would poison the wrap handler). */
+                if (tgt <= va)
+                    s_last_jump = tgt;
+                break;                        /* the ring: a jump ends it */
+            }
+            va = tgt;
+            end_va = va + 0x400000u;
             continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u) {  /* RETURN */
+            if (in_call)
+                break;
+            continue;
+        }
+        if ((w & 3u) == 2u) {                    /* CALL */
+            if (!in_call) {
+                uint32_t sub = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+                s_tot_calls++;
+                words += pb_walk(sub, sub + 0x400000u, 1, jumps, unknown);
+            }
+            continue;
+        }
         if ((w & 0x00030003u) == 0u) {
             uint32_t count  = (w >> 18) & 0x7FFu;
             uint32_t subch  = (w >> 13) & 7u;
@@ -180,19 +242,351 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
-                if (s_exec_enabled)
+                if (s_exec_enabled) {
+                    g_pb_current_va = va;
                     nv2a_pb_exec_method(subch, m,
                                         *(const uint32_t *)(mem + va));
+                }
                 va += 4;
                 words++;
             }
             continue;
         }
-        unknown++;
+        { static unsigned n; if (n++ < 32)
+            fprintf(stderr, "[PB-UNK] va %08X word %08X (end %08X)\n", (unsigned)(va - 4u), w, end_va); }
+        (*unknown)++;
     }
+    return words;
+}
+
+void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+{
+    uint32_t words, jumps = 0, unknown = 0;
+
+    if (s_exec_enabled < 0)
+        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+    static int scan = -1;
+    if (scan < 0)
+        scan = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!(scan || s_exec_enabled) || end_va <= start_va)
+        return;
+    if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
+        end_va = start_va + 0x400000u;
+
+    s_last_jump = 0;
+    words = pb_walk(start_va, end_va, 0, &jumps, &unknown);
 
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
+}
+
+uint32_t nv2a_pb_last_jump(void)
+{
+    return s_last_jump;
+}
+
+/* Walk from the GPU's GET to the title's PUT the way the hardware does:
+ * follow every JUMP (into or out of the ring) and CALL (one return level),
+ * RETURN restores the saved PC, and stop exactly when GET reaches PUT.
+ *
+ * `s_get` persists across kicks so a jump into a secondary command buffer
+ * (D3D8 submits the real BEGIN/vertex-array/indices there) and back is
+ * stitched correctly instead of walking a fixed address range. The ring wrap
+ * is just another jump, so the PUT-bracket guesswork and s_last_jump are not
+ * needed here. PUT only advances on command boundaries, so a packet is never
+ * split and the method loop may consume all of its parameters. */
+void nv2a_pb_run(uint32_t put_va)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    static uint32_t s_get;
+    /* The CALL return PC persists across kicks: on hardware it lives in
+     * DMA_SUBROUTINE (0x324C), and D3D can split a submission so that a kick
+     * ends inside a called buffer and the matching RETURN arrives on the next
+     * one. A local here lost it, and the RETURN then went nowhere (or worse,
+     * took the stale s_get). */
+    static uint32_t ret;
+    uint32_t va;
+    uint32_t budget = 0x200000u;
+    const uint32_t win_lo = XBOX_CONTIG_BASE;
+    const uint32_t win_hi = XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;   /* exclusive */
+
+    /* The first kick only establishes where the ring starts; the command
+     * there is executed on the next kick, exactly as the old
+     * scan(last_put, put) did (it set last_put on the first change). Without
+     * this the ring's first submission -- the GPU bootstrap -- was skipped
+     * and the guest hung waiting for it. */
+    if (!s_get) {
+        s_get = put_va;
+        return;
+    }
+    va = s_get;
+
+    if (s_exec_enabled < 0)
+        s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+
+    /* Any walk that leaves the 64 MB contiguous window means we lost sync with
+     * PUT: the stream was misparsed, a CALL/RETURN was unbalanced, or the ring
+     * wrapped unannounced. Every read and every jump/call target is validated
+     * against the window; the first violation aborts the walk and resyncs to
+     * PUT, so a desync degrades to one dropped kick instead of a crash. */
+    int desync = 0;
+    const char *why = "?";
+
+    /* PFIFO DMA_STATE. The hardware keeps the in-flight method packet across
+     * kicks, so a packet whose payload crosses PUT (a GET->PUT kick boundary
+     * landing in the middle of a header's parameters) is resumed on the next
+     * kick. Dropping it -- the old `if (va == put_va) break;` -- left the
+     * walker to re-read a payload word as a header, which executed garbage and
+     * was the source of the `index command rejected (prim 0)` storm. */
+    static struct { uint32_t method, subch, count; int noninc; } st;
+
+    /* Keep the last top-level words the walk read, so the first time it lands
+     * on an undecodable word (or a jump/call out of the window) we can show
+     * what packets led there. A misparse -- one word read as a method/jump
+     * header -- is otherwise invisible until it has already run off the end. */
+    static struct { uint32_t va, w; } recent[64];
+    static unsigned recent_n;
+    static struct { uint32_t va, w; } kickwords[16384];
+    static unsigned kick_n2;
+    kick_n2 = 0;
+    /* Last 16 JUMP/CALLs taken this kick (diagnostic for walks that loop). */
+    struct { uint32_t from, w; } jtrace[16];
+    unsigned jtrace_n = 0;
+    /* Frames for out-of-line forward JUMPs (see the JUMP handling below).
+     * One level like DMA_SUBROUTINE, but per kick: a shared draw buffer is
+     * entered and left inside a single submission. `exit_va` is the address of
+     * the buffer's exit word when the caller left a fixup block, so the return
+     * is recognised precisely; 0 means the caller did not (fall back to the
+     * cross-page heuristic). */
+    struct pb_ret_frame { uint32_t pc, exit_va; } ret_u[4];
+    unsigned ret_u_n = 0;
+
+    while (va != put_va && budget && !desync) {
+        if (va < win_lo || va + 4u > win_hi || (va & 3u)) {
+            why = "read out of contiguous window";
+            desync = 1;
+            break;
+        }
+        uint32_t w = *(const uint32_t *)(mem + va);
+        unsigned slot = recent_n++ & 63u;
+        recent[slot].va = va;
+        recent[slot].w = w;
+        if (kick_n2 < 16384) { kickwords[kick_n2].va = va; kickwords[kick_n2].w = w; kick_n2++; }
+        va += 4;
+        budget--;
+
+        if (st.count) {                                             /* payload */
+            note(st.subch, st.method);
+            if (s_exec_enabled) {
+                g_pb_current_va = va - 4u;
+                nv2a_pb_exec_method(st.subch, st.method, w);
+            }
+            if (!st.noninc) st.method += 4;
+            st.count--;
+            continue;
+        }
+
+        uint32_t off;
+        /* Publish DMA_GET at every top-level packet boundary: everything
+         * before this header has executed. D3D uses GET to decide a push
+         * buffer is idle, so leaving it at the old value for the whole walk
+         * made KickOff (0x100410 WC-flush handshake) wait out a full walk.
+         * Do NOT publish inside a CALL or an out-of-line jump frame -- GET
+         * must stay on the ring (a forward jump must not move it). */
+        if (!ret && !ret_u_n) {
+            static volatile uint32_t *s_dma_get;
+            if (!s_dma_get)
+                s_dma_get = xbox_Nv2aRegisterPointer(0x800044u, 4);
+            if (s_dma_get)
+                *s_dma_get = (va - 4u) & 0x0FFFFFFFu;
+            /* Unblock the guest's KickOff spin (0x100410 WC-flush handshake):
+             * at every packet boundary the WC flush has drained, so clear it
+             * now instead of waiting for the top of the next ack-loop pass. */
+            xbox_Nv2aAcknowledgeHandshakes();
+        }
+        if ((w & 0xE0000003u) == 0x20000000u) {                     /* old JUMP */
+            off = w & 0x1FFFFFFCu;
+        } else if ((w & 3u) == 1u) {                                /* JUMP */
+            off = w & 0x0FFFFFFCu;
+        } else if ((w & 3u) == 2u) {                                /* CALL */
+            ret = va;                                               /* after CALL */
+            off = w & 0x0FFFFFFCu;
+        } else if (w == 0x00020000u) {                              /* RETURN */
+            /* A RETURN with no pending CALL is a no-op; taking it to address 0
+             * walked the fake TIB and executed garbage, hanging at boot. */
+            if (ret) { va = ret; ret = 0; }
+            continue;
+        } else if ((w & 0xE0030003u) == 0u
+                || (w & 0xE0030003u) == 0x40000000u) {              /* method */
+            /* The method, subchannel, remaining count and non-increment bit
+             * were what the old loop held in locals and dropped at PUT. Count
+             * 0 (including a 0x00000000 word) is a no-op. */
+            st.method = w & 0x1FFCu;
+            st.subch  = (w >> 13) & 7u;
+            st.count  = (w >> 18) & 0x7FFu;
+            st.noninc = (w >> 30) & 1u;
+            continue;
+        } else {
+            why = "reserved command";
+            desync = 1;
+            break;
+        }
+        off &= 0x0FFFFFFFu;
+        if (off + 4u > XBOX_CONTIG_SIZE) {
+            why = "jump/call target out of window";
+            desync = 1;
+            break;
+        }
+        jtrace[jtrace_n & 15u].from = va - 4u;
+        jtrace[jtrace_n & 15u].w = w;
+        jtrace_n++;
+        /* D3D8 draws compiled geometry by JUMPing into a shared buffer that
+         * ends in a JUMP back to the caller. The title rewrites that exit word
+         * with the current return address before each use (nothing on the GPU
+         * reads it stale), but this GET->PUT batch walk only sees one value:
+         * the first caller's. A plain JUMP saves no return, so the walk loops
+         * from every other caller back to the first forever. Model an
+         * out-of-line forward JUMP as a call and a backward JUMP as its
+         * return, so the buffer comes back to the site that entered it. A
+         * backward JUMP with nothing pending is an ordinary ring wrap. */
+        {
+            uint32_t src = va - 4u;
+            uint32_t tgt = win_lo | off;
+            if ((w & 3u) != 2u) {                    /* a real CALL sets ret above */
+                if (tgt > src && (tgt >> 16) != (src >> 16)) {
+                    /* Out-of-line forward JUMP into the shared geometry buffer.
+                     * D3D8 leaves a 5-word fixup block right after the JUMP:
+                     * f[0] is this caller's return offset (== src+0x18, the real
+                     * continuation), f[2] is the buffer's exit-word address. The
+                     * hardware never runs the block. Returning to src+4 (the old
+                     * rule) landed inside it, where its data words decode as a
+                     * bogus method and run off into data -> "reserved command"
+                     * desync. Use the block when present. */
+                    uint32_t pc = va, exit_va = 0;
+                    if (va + 24u <= win_hi) {
+                        const uint32_t *f = (const uint32_t *)(mem + va);
+                        /* Word 0 of a D3D8 fixup block is this caller's return
+                         * offset: it names src+0x18, the real continuation (the
+                         * 5-word block itself is never executed). When present,
+                         * that IS the return address, so trust it. Word 2 may
+                         * name the buffer's exit word; use it to recognise the
+                         * return precisely, else fall back to the cross-page
+                         * rule. */
+                        int ok = ((win_lo | f[0]) == src + 0x18u)
+                                && ((f[0] & 3u) == 0u);
+                        if (ok) {
+                            pc = src + 0x18u;
+                            if (f[2] >= tgt && f[2] - tgt < 0x10000u
+                                    && (f[2] & 3u) == 0u)
+                                exit_va = f[2];
+                        }
+                        {
+                            static int dbg = -1;
+                            static unsigned dn;
+                            if (dbg < 0)
+                                dbg = getenv("RECOMP_PB_BLOCK_DBG") ? 1 : 0;
+                            if (dbg && dn < 400 && ok) {
+                                fprintf(stderr, "[PBBLK] src=%08X tgt=%08X "
+                                        "f0=%08X f1=%08X f2=%08X f3=%08X "
+                                        "f4=%08X f5=%08X ok=%d ev=%08X\n",
+                                        src, tgt, f[0], f[1], f[2], f[3],
+                                        f[4], f[5], ok, exit_va);
+                                dn++;
+                            }
+                        }
+                    }
+                    if (ret_u_n < 4u) {
+                        ret_u[ret_u_n].pc = pc;
+                        ret_u[ret_u_n].exit_va = exit_va;
+                        ret_u_n++;
+                    }
+                } else if (ret_u_n) {
+                    struct pb_ret_frame *top = &ret_u[ret_u_n - 1u];
+                    /* With a known exit word, return only at that exact word:
+                     * an unrelated backward cross-page JUMP inside the buffer
+                     * must not be mistaken for the exit. Without one, keep the
+                     * cross-page heuristic (the src+4 layout). */
+                    int is_return = top->exit_va ? (src == top->exit_va)
+                                                 : (tgt < src && (tgt >> 16) != (src >> 16));
+                    if (is_return) {
+                        off = top->pc & 0x0FFFFFFFu;
+                        ret_u_n--;
+                    }
+                }
+            }
+        }
+        va = win_lo | off;
+    }
+    if (desync) {
+        static unsigned n;
+        if (n < 8) {
+            fprintf(stderr, "  [PB] desync at %08X (get %08X put %08X ret %08X): %s; resync to PUT\n",
+                    va, s_get, put_va, ret, why);
+            if (n == 0) {
+                fprintf(stderr, "  [PB] FULL KICK words %u:\n", kick_n2);
+                for (unsigned k = 0; k < kick_n2; k++) {
+                    uint32_t rw = kickwords[k].w;
+                    const char *kind = (rw & 3u) == 2u ? "CALL" :
+                                       ((rw & 3u) == 1u || (rw & 0xE0000003u) == 0x20000000u) ? "JUMP" :
+                                       rw == 0x00020000u ? "RET " :
+                                       (rw & 0xE0030003u) == 0u ? "METH" : "    ";
+                    fprintf(stderr, "    K %08X %08X %s\n", kickwords[k].va, rw, kind);
+                }
+            }
+            for (int k = 63; k >= 0; k--) {
+                unsigned idx = (recent_n - 1u - (unsigned)k) & 63u;
+                uint32_t rw = recent[idx].w;
+                const char *kind = (rw & 3u) == 2u ? "CALL" :
+                                   ((rw & 3u) == 1u || (rw & 0xE0000003u) == 0x20000000u) ? "JUMP" :
+                                   rw == 0x00020000u ? "RET " :
+                                   (rw & 0xE0030003u) == 0u ? "METH" : "    ";
+                fprintf(stderr, "    %08X %08X %s\n", recent[idx].va, rw, kind);
+            }
+        }
+        n++;
+    } else if (!budget) {
+        static unsigned nb;
+        fprintf(stderr, "  [PB] walk budget exhausted at %08X, resync to PUT %08X\n", va, put_va);
+        if (nb++ < 4) {
+            fprintf(stderr, "  [PB] %u jumps/calls taken; last ones (from word):\n", jtrace_n);
+            for (unsigned k = jtrace_n > 16u ? jtrace_n - 16u : 0u; k < jtrace_n; k++)
+                fprintf(stderr, "    J %08X %08X\n", jtrace[k & 15u].from, jtrace[k & 15u].w);
+            /* The whole head of the walk, so the first misparse is visible: a
+             * runaway walk only repeats a small cycle, so the words before the
+             * first entry into it are the ones that matter. */
+            fprintf(stderr, "  [PB] FULL KICK words %u:\n", kick_n2);
+            for (unsigned k = 0; k < kick_n2; k++) {
+                uint32_t rw = kickwords[k].w;
+                const char *kind = (rw & 3u) == 2u ? "CALL" :
+                                   ((rw & 3u) == 1u || (rw & 0xE0000003u) == 0x20000000u) ? "JUMP" :
+                                   rw == 0x00020000u ? "RET " :
+                                   (rw & 0xE0030003u) == 0u ? "METH" : "    ";
+                fprintf(stderr, "    K %08X %08X %s\n", kickwords[k].va, rw, kind);
+            }
+            /* Raw guest words around each of the last four jump sites: a jump
+             * read out of a method payload shows up as a plausible-looking
+             * neighbour sequence, which is how the first misparse is told from a
+             * real command. */
+            for (unsigned k = (jtrace_n > 4u ? jtrace_n - 4u : 0u); k < jtrace_n; k++) {
+                uint32_t from = jtrace[k & 15u].from;
+                if (from < win_lo + 32u || from + 32u > win_hi)
+                    continue;
+                fprintf(stderr, "  [PB] around %08X:\n", from);
+                for (int d = -8; d <= 8; d++) {
+                    uint32_t a = from + (uint32_t)(d * 4);
+                    fprintf(stderr, "      %s %08X %08X\n",
+                            d == 0 ? "->" : "  ", a,
+                            *(const uint32_t *)(mem + a));
+                }
+            }
+        }
+    }
+    /* A kick that did not stop cleanly at PUT leaves no packet to resume. */
+    if (desync || !budget) {
+        st.count = 0;
+        ret = 0;
+    }
+    s_get = put_va;
 }

@@ -47,10 +47,14 @@ extern "C" {
 #define XBOX_TOTAL_RAM          (64 * 1024 * 1024)  /* 64 MB (default) */
 #define XBOX_DEVKIT_RAM         (128 * 1024 * 1024) /* 128 MB (debug kit) */
 #define XBOX_GPU_RESERVED       (4 * 1024 * 1024)   /* ~4 MB for GPU */
+#define XBOX_MCPX_BASE          0xFE800000u
+#define XBOX_MCPX_APU_MMIO_END  0xFE830000u
+#define XBOX_MCPX_APU_MMIO_SIZE (XBOX_MCPX_APU_MMIO_END - XBOX_MCPX_BASE)
 
-/* Actual mapped RAM for this run. Defaults to XBOX_TOTAL_RAM; a title with a
- * devkit build calls xbox_SetTotalRam(XBOX_DEVKIT_RAM) before init. Heap top and
- * mirror stride derive from this, not from the compile-time constant. */
+/* Actual mapped RAM for this run. Defaults to XBOX_DEVKIT_RAM (128 MB) for this
+ * project's Debug build; call xbox_SetTotalRam() before init (or set
+ * RECOMP_TOTAL_RAM_MB) to change it. Heap top and mirror stride derive from
+ * this, not from the compile-time constant. */
 extern size_t g_xbox_total_ram;
 
 /* How much guest address space to map, when that must exceed RAM.
@@ -100,6 +104,11 @@ extern uint32_t g_xbox_image_hi;
 extern uint32_t g_xbox_code_lo;
 extern uint32_t g_xbox_code_hi;
 void xbox_SetTotalRam(size_t bytes);
+
+/* Self-check for the heap's reuse-and-split path; run from the title's entry
+ * point when RECOMP_HEAP_SELFTEST is set. Prints PASS/FAIL and frees what it
+ * allocates. Requires xbox_MemoryLayoutInit to have run. */
+void xbox_HeapSelfTest(void);
 
 /* NOTE: Section addresses (.text, .rdata, .data, etc.) are NOT hardcoded.
  * They are parsed from the XBE header at runtime in xbox_MemoryLayoutInit().
@@ -178,19 +187,57 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
  * pushbuffer executor on FLIP_STALL; while these arrive the 60 Hz fallback
  * stands down, so the count follows what was actually drawn. */
 void xbox_Nv2aFrameCounterFlip(void);
+/* Print the flip-interval histogram (RECOMP_FLIP_PACING) for the window just
+ * ended and clear it: used to tell a real 30 FPS vblank cap from slowness. */
+void xbox_Nv2aFlipPacingReport(void);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
 /* Read it back: 0 until the title sets a mode. Pitch is optional. */
 uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 
-/* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
- * below 256 MB, or 0 when the arena is exhausted. */
+/* Allocate zeroed pages in the contiguous physical mirror, or return 0. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
+uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t low, uint32_t high,
+                               uint32_t alignment);
+int xbox_ContiguousFree(uint32_t guest_va);
+uint32_t xbox_ContiguousBlockSize(uint32_t guest_va);
+int xbox_ContiguousOwnsHead(uint32_t offset);
+void xbox_ContigMarkApuOffset(uint32_t offset);
+int xbox_ContigApuOwned(uint32_t offset);
 uint32_t xbox_ContiguousAllocatedBytes(void);
+void xbox_RecordDmaTranslation(uint32_t guest_va, uint32_t physical);
+uint8_t *xbox_DmaPhysicalPointer(uint64_t physical, uint32_t bytes);
+uint8_t *xbox_ApuPhysicalPointer(uint64_t physical, uint32_t bytes);
+void xbox_ApuHostWrite(uint8_t *host, uint32_t bytes);
+int xbox_ApuContigTouched(uint32_t physical);
+int xbox_PageContiguousOnly(uint32_t physical);
+int xbox_DmaBankOf(uint64_t physical);
+int xbox_ContigOwnsOffset(uint64_t physical);
+volatile uint32_t *xbox_Nv2aRegisterPointer(uint32_t offset, uint32_t bytes);
+void xbox_Nv2aAcknowledgeHandshakes(void);
+int xbox_Nv2aNativeFencesEnabled(void);
+/* Guest software-method dispatcher: ECX=context, one stdcall parameter. */
+int xbox_Nv2aSoftwareMethodHandler(uint32_t routine, uint32_t context);
+int xbox_Nv2aSoftwareMethod(uint32_t parameter, uint32_t depth_clear,
+                            uint32_t color_clear);
+void xbox_Nv2aSoftwareMethodReport(void);
+/* Queue a software method for the timer thread; 0 = busy, re-issue later. */
+int xbox_Nv2aSoftwareMethodDeferred(uint32_t parameter, uint32_t depth_clear,
+                                    uint32_t color_clear);
+int xbox_Nv2aSoftwareMethodPending(void);
+/* Recursive guest audio exclusion; worker callbacks defer with TryEnter. */
+void xbox_GuestAudioGuardEnter(void);
+int xbox_GuestAudioGuardTryEnter(void);
+void xbox_GuestAudioGuardLeave(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
+
+/* Signal the dispatcher-object KEVENT at *(device_ptr_va) + event_off once the
+ * GPU ack thread has caught up, releasing a title's GPU-completion wait (D3D's
+ * BlockOnTime). The waitable counterpart to xbox_Nv2aMirrorFence. */
+int xbox_Nv2aSignalEvent(uint32_t device_ptr_va, uint32_t event_off);
 
 void xbox_MemoryLayoutShutdown(void);
 
@@ -359,6 +406,7 @@ typedef union RecompXmm {
 #define XBOX_TIB_MAIN       0x00004000
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
+#define XBOX_KPCR_IRQL_OFFSET 0x24u
 
 #define XBOX_STACK_BASE     0x00780000
 
@@ -439,7 +487,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
 /**
  * Allocate from the Xbox heap. Returns an Xbox VA, or 0 on failure.
  * Alignment must be a power of 2 (minimum 4).
- * Thread-safe: no (single-threaded recompiled code).
+ * Thread-safe: yes; a lock guards the block table.
  */
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
@@ -455,6 +503,13 @@ void xbox_HeapFree(uint32_t xbox_va);
  * the translated address describes the whole guest mapping.
  */
 uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
+
+/**
+ * True when RECOMP_HEAP_RECLAIM is set: freed heap blocks are split rather than
+ * handed over whole, and NtFreeVirtualMemory returns heap memory to the heap.
+ * Off by default; it changes which address later allocations get.
+ */
+int xbox_HeapReclaimEnabled(void);
 
 /**
  * Get the file mapping handle for the Xbox memory region.

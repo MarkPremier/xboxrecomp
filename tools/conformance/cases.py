@@ -498,3 +498,18 @@ for _op in (
             "MMX preserves the comparison/carry consumed afterward",
             ["pxor mm0, mm0", "pxor mm1, mm1", "xorps xmm0, xmm0"]
             + _before + [_op] + _after + ["emms"], [(0, 7), (1, 7)]))
+
+CASES.append(Case("pushad_popad", "POPAD restores registers and skips saved ESP",
+    ["pushad", "mov eax, 0", "mov ecx, 0", "popad", "add eax, ecx"], _PAIRS))
+
+# Exercise ordinary-RAM REP semantics against the real CPU. MMIO side effects
+# are covered by the access-counting fixture, since host RAM is not a device.
+for _name, _setup, _count, _copy, _result in (
+        ("rep_copy_byte", ["mov esi, eax", "lea edi, [eax+16]"], 4, "rep movsb", "mov eax, [edi-4]"),
+        ("rep_copy_word", ["mov esi, eax", "lea edi, [eax+16]"], 4, "rep movsw", "mov eax, [edi-8]"),
+        ("rep_copy_dword", ["mov esi, eax", "lea edi, [eax+16]"], 4, "rep movsd", "mov eax, [edi-16]"),
+        ("rep_copy_overlap", ["mov esi, eax", "lea edi, [eax+4]"], 3, "rep movsd", "mov eax, [edi-4]"),
+        ("rep_copy_backward", ["lea esi, [eax+12]", "lea edi, [eax+28]", "std"], 4, "rep movsd", "mov eax, [edi+4]"),
+        ("rep_copy_zero", ["mov esi, eax", "lea edi, [eax+16]"], 0, "rep movsd", "mov eax, [edi]")):
+    CASES.append(Case(_name, "REP copy preserves element order, direction and count",
+        ["cld"] + _setup + ["mov ecx, %d" % _count, _copy, "cld", _result], _SSE, "sse"))

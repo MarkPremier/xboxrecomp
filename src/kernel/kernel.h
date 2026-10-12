@@ -106,6 +106,9 @@ enum {
 #ifndef STATUS_NO_MEMORY
 #define STATUS_NO_MEMORY                ((NTSTATUS)0xC0000017L)
 #endif
+#ifndef STATUS_CONFLICTING_ADDRESSES
+#define STATUS_CONFLICTING_ADDRESSES    ((NTSTATUS)0xC0000018L)
+#endif
 #ifndef STATUS_ALREADY_COMMITTED
 #define STATUS_ALREADY_COMMITTED        ((NTSTATUS)0xC0000021L)
 #endif
@@ -556,6 +559,13 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
+/* Optional: a project sets this to see the guest paths the kernel translates
+ * (for example to print who opened a file). NULL by default; called before the
+ * path is translated, on the calling guest thread. Only paths a drive or
+ * device rule matches reach it: partition images and unrecognised paths
+ * do not. */
+extern void (*g_xbox_path_hook)(const char *xbox_path);
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */
@@ -662,6 +672,9 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     PLARGE_INTEGER ByteOffset);
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle);
+#ifdef _WIN32
+void xbox_dir_context_drop(HANDLE FileHandle);
+#endif
 
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes);
 
@@ -750,6 +763,18 @@ LONG     __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait);
 NTSTATUS __stdcall xbox_KeWaitForSingleObject(PVOID Object, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(ULONG Count, PVOID Objects[], ULONG WaitType, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
 
+/* Signal the guest dispatcher object (KEVENT) at guest_va, creating and
+ * registering a host event in the ke shadow if the guest never initialised one
+ * there. Returns 0 on success, -1 if no slot/handle was available. Used by the
+ * NV2A ack thread to release a title's GPU-completion wait. */
+int xbox_KeObjectSignal(uint32_t guest_va);
+
+/* Treat the KEVENT at guest_va as a title-built guest-state event (see
+ * ke_guest_event) even when RECOMP_TITLE_KEVENTS is off. Used for a title's
+ * D3D GPU-completion event so its own KeSetEvent/KeWaitForSingleObject drive
+ * it, instead of the runtime signalling it blindly every ack-loop pass. */
+void xbox_KeObjectAdopt(uint32_t guest_va);
+
 BOOLEAN  __stdcall xbox_KeCancelTimer(PXBOX_KTIMER Timer);
 BOOLEAN  __stdcall xbox_KeSetTimer(PXBOX_KTIMER Timer, LARGE_INTEGER DueTime, PXBOX_KDPC Dpc);
 BOOLEAN  __stdcall xbox_KeSetTimerEx(PXBOX_KTIMER Timer, LARGE_INTEGER DueTime, LONG Period, PXBOX_KDPC Dpc);
@@ -776,16 +801,22 @@ VOID    __stdcall xbox_HalInitiateShutdown(void);
 BOOLEAN __stdcall xbox_HalIsResetOrShutdownPending(void);
 
 KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
-/* Non-zero while any thread holds IRQL at or above DISPATCH_LEVEL.
+KIRQL   __stdcall xbox_KeGetCurrentIrql(void);
+/* Non-zero while the processor is at or above DISPATCH_LEVEL.
  * Device models ask before delivering an interrupt; raising IRQL masks the
  * line for the whole processor on hardware, not just for one thread. */
 int     xbox_IrqlBlocksInterrupts(void);
 int     xbox_IrqlRaisedCount(void);
+int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
+void    xbox_IrqlLeaveInterrupt(int saved);
 
 /* Total crossings of the DISPATCH boundary, and who is holding it up.
  * A depth that is non-zero while this stops moving is stuck, not busy. */
 int     xbox_IrqlTransitions(void);
 void    xbox_IrqlDumpHolders(void);
+void    xbox_IrqlRecord(char op, const char *why, uint32_t caller,
+                        unsigned old_level, unsigned new_level);
+void    xbox_IrqlDumpRing(void);
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
 
@@ -934,6 +965,24 @@ extern PVOID            xbox_IdexChannelObject;
 /* EEPROM / Non-Volatile Settings */
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength);
 NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, PVOID Value, ULONG ValueLength);
+
+/* Desired output resolution, from the runner's --resolution=WxH flag.
+ *
+ * A title chooses its own render mode from the AV/EEPROM settings it reads at
+ * startup, so setting a size means steering those settings rather than a window
+ * size. xbox_VideoDesiredResolution parses RECOMP_RESOLUTION (WIDTHxHEIGHT) and
+ * returns 0 when unset. The kernel side uses it to answer XC_VIDEO with flags
+ * that steer the title to a matching native mode, and calls
+ * xbox_VideoQueryHook() so a title-specific hook can force an exact size by
+ * rewriting the title's own render-options structure at the moment it is built
+ * (register it with xbox_VideoSetQueryHook). */
+int  xbox_VideoDesiredResolution(uint32_t *width, uint32_t *height);
+void xbox_VideoSetQueryHook(void (*hook)(uint32_t value_index, uint32_t *value, int *handled));
+void xbox_VideoQueryHook(uint32_t value_index, uint32_t *value, int *handled);
+/* Lets a title pick the AV-info word its display-mode table is keyed on, so a
+ * requested resolution selects the matching mode row. Called for
+ * AvSendTVEncoderOption(QUERY_AVPACK); the hook rewrites *value. */
+void xbox_VideoSetAvPackHook(void (*hook)(uint32_t *value));
 
 /* ---- AV Pack types (returned by AvSendTVEncoderOption) ---- */
 #define AV_PACK_NONE            0x00

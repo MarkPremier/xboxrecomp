@@ -234,6 +234,7 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
 extern RECOMP_TLS uint32_t g_ebp;
+extern RECOMP_TLS uint32_t g_eflags;
 
 /* EFLAGS.DF, and the signed step the string instructions take because of it.
  *
@@ -257,6 +258,29 @@ extern RECOMP_TLS int g_df;
 extern RECOMP_TLS uint16_t g_fp_control_word;
 extern RECOMP_TLS int g_fp_cmp;
 extern RECOMP_TLS uint16_t g_fp_cc;
+/* x87 precision control (control word bits 8-9). The stack is double-backed,
+ * which matches PC=53 and is close enough for PC=64, but PC=24 -- what the
+ * Xbox runs with -- rounds every arithmetic result to float. A title that
+ * compares a freshly computed value against the same value stored as a float
+ * relies on that: Burnout 3's sorted draw list re-inserts a node by walking
+ * while `v > next` / `v < prev`, and with v left at double precision it sits
+ * between its own stored copy and a neighbour and walks back and forth
+* forever, which froze every race at the start line.
+ *
+ * PC narrows the significand only; the exponent keeps the register's range.
+ * So a plain (float) cast is right only inside float's range -- outside it,
+ * it would turn a large intermediate into inf (and inf*0 into NaN) or flush a
+ * tiny one to 0, where the x87 carries on. Those go the long way. */
+static inline double recomp_fp_round24(double x) {
+    double ax = fabs(x);
+    int e;
+    if ((ax <= 3.4028234663852886e38 && ax >= 1.1754943508222875e-38) || ax == 0.0
+        || x != x || ax == INFINITY)
+        return (double)(float)x;
+    x = frexp(x, &e);                      /* |x| in [0.5, 1): float-exact range */
+    return ldexp((double)(float)x, e);
+}
+#define RECOMP_FP_PC(x) ((g_fp_control_word & 0x300u) ? (double)(x) : recomp_fp_round24(x))
 #define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
 /* Values in the existing double-backed stack are all representable as normal
  * x87 extended values, including binary64 subnormals. Empty stack tags and
@@ -541,6 +565,32 @@ RECOMP_XMM_BITWISE(XMM_CMP_EQ,  (a.f[i] == b.f[i]) ? 0xFFFFFFFFu : 0u)
 RECOMP_XMM_BITWISE(XMM_CMP_LT,  (a.f[i] <  b.f[i]) ? 0xFFFFFFFFu : 0u)
 RECOMP_XMM_BITWISE(XMM_CMP_LE,  (a.f[i] <= b.f[i]) ? 0xFFFFFFFFu : 0u)
 RECOMP_XMM_BITWISE(XMM_CMP_NEQ, (a.f[i] == b.f[i]) ? 0u : 0xFFFFFFFFu)
+
+/* The full SSE compare predicate set, by CMPPS/CMPSS immediate:
+ * 0 EQ, 1 LT, 2 LE, 3 UNORD, 4 NEQ, 5 NLT, 6 NLE, 7 ORD. The N forms are
+ * the negations, so they are true when either side is NaN. */
+static inline int recomp_cmp_pred(float a, float b, int p) {
+    switch (p & 7) {
+    case 0:  return a == b;
+    case 1:  return a < b;
+    case 2:  return a <= b;
+    case 3:  return a != a || b != b;
+    case 4:  return !(a == b);
+    case 5:  return !(a < b);
+    case 6:  return !(a <= b);
+    default: return !(a != a || b != b);
+    }
+}
+static inline RecompXmm XMM_CMP_PRED(RecompXmm a, RecompXmm b, int p) {
+    RecompXmm r; int i;
+    for (i = 0; i < 4; ++i)
+        r.u[i] = recomp_cmp_pred(a.f[i], b.f[i], p) ? 0xFFFFFFFFu : 0u;
+    return r;
+}
+/* Packed unary ops; the first argument is unused, as for the binary forms. */
+RECOMP_XMM_LANEWISE(XMM_SQRT,  sqrtf(b.f[i]))
+RECOMP_XMM_LANEWISE(XMM_RSQRT, 1.0f / sqrtf(b.f[i]))
+RECOMP_XMM_LANEWISE(XMM_RCP,   1.0f / b.f[i])
 
 /** movmskps: the four lane sign bits, packed into the low nibble. */
 static inline uint32_t XMM_MOVEMASK(RecompXmm a) {
@@ -887,6 +937,12 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
         recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
 } while(0)
+#elif defined(RECOMP_CALL_PROFILE)
+/* Opt-in profiling: every direct call reports its target to the project, which
+ * keeps the counts (a project defines recomp_call_profile_hit). Diffing the counts
+ * of two situations shows which functions one of them runs and the other does not. */
+void recomp_call_profile_hit(uint32_t va);
+#define RECOMP_ABI_CALL(va, fn) do { recomp_call_profile_hit(va); (fn)(); } while(0)
 #else
 #define RECOMP_ABI_CALL(va, fn) (fn)()
 #endif
@@ -969,6 +1025,26 @@ extern volatile uint64_t g_icall_guard_misses;
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
 } while(0)
 
+/* Caller cleanup: a failed call pops only its return address. */
+#define RECOMP_ICALL_SAFE_CC(xbox_va, saved_esp) do { \
+    (void)(saved_esp); \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va); \
+        g_esp += 4; eax = 0; break; \
+    } \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
+} while(0)
+
 /**
  * RECOMP_ICALL_SAFE_AT - RECOMP_ICALL_SAFE that also names the call SITE.
  *
@@ -994,6 +1070,27 @@ extern volatile uint64_t g_icall_guard_misses;
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+} while(0)
+
+/* Caller cleanup: a failed call pops only its return address. */
+#define RECOMP_ICALL_SAFE_AT_CC(xbox_va, saved_esp, site) do { \
+    (void)(saved_esp); \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va); \
+        g_esp += 4; eax = 0; break; \
+    } \
+    RECOMP_ICALL_OBSERVE_SITE((site), _va); \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
 } while(0)
 
 /**

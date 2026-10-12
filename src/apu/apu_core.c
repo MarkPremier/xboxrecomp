@@ -23,6 +23,7 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
+#include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
 
 /* ============================================================
  * Globals
@@ -58,6 +59,40 @@ void mcpx_debug_end_frame(void) {}
  * IRQ handling (stubbed - no PCI bus in standalone)
  * ============================================================ */
 
+/* Physical addresses, resolved the way every other bus master here does it
+ * (dma_resolve in nv2a_pb_exec.c, bus_resolve in usb/ohci.c).
+ *
+ * DirectSound builds its voice, SGE and notifier structures in
+ * MmAllocateContiguousMemory and hands the APU their physical addresses.
+ * Physical P and the contiguous window's 0x80000000 + P are the same bytes on
+ * hardware; here the window is separate storage. Reading every address as low
+ * RAM meant the voice processor walked zeroes and wrote each "voice done"
+ * notification into ordinary RAM, where DirectSound never looked -- so a
+ * buffer never reported that it had stopped, and Burnout 3's frontend waits
+ * on exactly that (IDirectSoundBuffer::GetStatus, polled forever). */
+extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
+extern uint32_t xbox_ContiguousAllocatedBytes(void);
+extern size_t g_xbox_total_ram, g_xbox_map_size;
+
+uint8_t *mcpx_apu_phys(uint64_t addr)
+{
+    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    size_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
+    if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
+        return g_apu_ram_ptr + a;
+    if (a < xbox_ContiguousAllocatedBytes())
+        return g_apu_ram_ptr + 0x80000000u + a;
+    /* Heap RAM can sit above 64 MB (RECOMP_HEAP_BASE): no retail wrap there. */
+    if (a < mapped)
+        return g_apu_ram_ptr + a;
+    return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+}
+
+/* The interrupt line, as the frame thread sees it. update_irq used to call
+ * pci_irq_assert, which is an empty stub here, so DirectSound's service
+ * routine never ran and no voice completion ever reached it. */
+static volatile LONG s_irq_line;
+
 static void update_irq(MCPXAPUState *d)
 {
     if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
@@ -67,12 +102,91 @@ static void update_irq(MCPXAPUState *d)
         ((d->regs[NV_PAPU_ISTS] & ~NV_PAPU_ISTS_GINTSTS) &
          d->regs[NV_PAPU_IEN])) {
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
-        /* In standalone mode we don't raise a PCI IRQ; the game's kernel
-         * stub will poll ISTS directly or we'll signal via a flag. */
-        pci_irq_assert(PCI_DEVICE(d));
+        InterlockedExchange(&s_irq_line, 1);
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
-        pci_irq_deassert(PCI_DEVICE(d));
+        InterlockedExchange(&s_irq_line, 0);
+    }
+}
+
+/* ---- delivering it ---------------------------------------------------- */
+
+/* HalGetInterruptVector(5) -- the APU's IRQ -- is what DirectSound connects
+ * its service routine to (0x002F8E81 in Burnout 3). */
+#define APU_VECTOR 5
+
+typedef void (*apu_guest_fn)(void);
+extern apu_guest_fn recomp_lookup(uint32_t xbox_va);
+extern int  xbox_worker_stack_alloc(void);
+extern void xbox_worker_stack_free(int slot);
+extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+extern uint32_t xbox_AllocThreadTib(void);
+extern int xbox_IrqlBlocksInterrupts(void);
+extern int xbox_IrqlEnterInterrupt(int level);
+extern void xbox_IrqlLeaveInterrupt(int saved);
+#if defined(_MSC_VER)
+#  define APU_TLS __declspec(thread)
+#else
+#  define APU_TLS __thread
+#endif
+extern APU_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
+extern APU_TLS uint32_t g_fs_base;
+
+/* Call the connected service routine while the line is up, from the frame
+ * thread, the way the OHCI model delivers USB interrupts (ohci_call_isr):
+ * a worker stack for the call, a TIB of this thread's own, and a hold-off
+ * while a guest thread sits at raised IRQL, which is when the single-CPU
+ * console could not have taken the interrupt. The routine acknowledges by
+ * writing ISTS, which drops the line through update_irq. */
+static void apu_deliver_irq(MCPXAPUState *d)
+{
+    static int tib_ready;
+    static unsigned held_off;
+    uint32_t kint, routine, context;
+    apu_guest_fn fn;
+    int slot;
+
+    if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
+        return;
+    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50)
+        return;
+    held_off = 0;
+    kint = xbox_GetConnectedInterrupt(APU_VECTOR);
+    if (!kint)
+        return;
+    routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
+    context = *(uint32_t *)(g_apu_ram_ptr + kint + 4);
+    fn = routine ? recomp_lookup(routine) : NULL;
+    if (!fn)
+        return;
+    if (!tib_ready) {
+        uint32_t tib = xbox_AllocThreadTib();
+        if (!tib)
+            return;
+        g_fs_base = tib;
+        tib_ready = 1;
+    }
+    slot = xbox_worker_stack_alloc();
+    if (slot < 0)
+        return;
+
+    qemu_mutex_unlock(&d->lock);
+    g_esp = XBOX_WORKER_STACK_TOP(slot);
+    g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
+    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    xbox_worker_stack_free(slot);
+    qemu_mutex_lock(&d->lock);
+
+    {
+        static unsigned n;
+        if (n++ < 3) {
+            fprintf(stderr, "[APU] interrupt delivered to 0x%08X -> %s\n",
+                    routine, (g_eax & 1) ? "claimed" : "declined");
+            fflush(stderr);
+        }
     }
 }
 
@@ -268,43 +382,104 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
             g_waveout.frames_written);
 }
 
+/* Optional raw PCM capture for offline analysis (RECOMP_APU_WAV=<base>):
+ * <base>.emu.raw = EP/DSP mixdown before the software mixer,
+ * <base>.mix.raw = what is actually submitted to the audio backend. */
+static FILE *g_wav_emu, *g_wav_mix;
+static int g_wav_init;
+
+static void apu_wav_capture(const int16_t (*buf)[2], int n, int mix)
+{
+    if (!g_wav_init) {
+        g_wav_init = 1;
+        const char *base = getenv("RECOMP_APU_WAV");
+        if (base) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s.emu.raw", base);
+            g_wav_emu = fopen(path, "wb");
+            snprintf(path, sizeof(path), "%s.mix.raw", base);
+            g_wav_mix = fopen(path, "wb");
+        }
+    }
+    FILE *f = mix ? g_wav_mix : g_wav_emu;
+    if (f) {
+        fwrite(buf, sizeof(int16_t) * 2, n, f);
+    }
+}
+
+/* Declick: a sound that is cut off abruptly makes the mix step from a large
+ * value straight to 0 (or vice versa), which is heard as a loud click/peak.
+ * When a sample jumps farther than any real waveform does in one step, ramps
+ * the jump over a few samples instead of reproducing it. State persists across
+ * monitor windows so a cut landing on a window boundary is still smoothed. */
+#define DECLICK_THRESH 8000
+#define DECLICK_RAMP   32
+static int g_declick_prev[2];
+
+static void apu_declick(int16_t (*buf)[2], int n)
+{
+    for (int ch = 0; ch < 2; ch++) {
+        int prev = g_declick_prev[ch];
+        int i = 0;
+        while (i < n) {
+            int d = buf[i][ch] - prev;
+            if (d > DECLICK_THRESH || d < -DECLICK_THRESH) {
+                int end = i + DECLICK_RAMP;
+                if (end > n) end = n;
+                int target = buf[end - 1][ch];
+                int span = end - i;
+                for (int j = i; j < end; j++) {
+                    buf[j][ch] = (int16_t)(prev +
+                        (int)((long)(target - prev) * (j - i + 1) / span));
+                }
+                prev = buf[end - 1][ch];
+                i = end;
+            } else {
+                prev = buf[i][ch];
+                i++;
+            }
+        }
+        g_declick_prev[ch] = prev;
+    }
+}
+
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
     if ((d->ep_frame_div + 1) % 8) {
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
+    /* XAudio2 path: submit the EP/DSP mixdown already sitting in frame_buf.
+     * Do NOT memset it: the GP/EP output for this window was memcpy'd here by
+     * ep_sink_samples()/dsp_frame_stub(). Wiping it left only the software
+     * mixer audible -- Bink FMV (software buffer) worked while all VP/DSP game
+     * audio was silent. Software voices and the test tone are overdubbed. */
     if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
+        int num_samples = MIXER_FRAME_SAMPLES;  /* one EP/DSP window */
 
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
+        if (g_test_tone.active && !g_audio_muted) {
+            for (int i = 0; i < num_samples; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                d->monitor.frame_buf[i][0] = s;
+                d->monitor.frame_buf[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
             }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
         }
 
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        apu_wav_capture((const int16_t (*)[2])d->monitor.frame_buf,
+                        num_samples, 0);
+
+        if (!g_audio_muted)
+            mixer_render(d->monitor.frame_buf, num_samples);
+
+        apu_declick((int16_t (*)[2])d->monitor.frame_buf, num_samples);
+
+        apu_wav_capture((const int16_t (*)[2])d->monitor.frame_buf,
+                        num_samples, 1);
+
+        xa2_submit_samples((const int16_t *)d->monitor.frame_buf, num_samples);
         return;
     }
 
@@ -451,21 +626,58 @@ static void *mcpx_apu_frame_thread(void *arg)
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         throttle(d);
 
+        /* The doorbell ack stands in for the GP DSP, which on hardware runs
+         * whatever the front end is doing. Tying it to se_frame stopped it
+         * whenever FECTL was trapped or halted, and DirectSound then waits
+         * forever to post its next command: Burnout 3 stalls in
+         * sub_002F805E polling the same doorbell it was acked on at init. */
+        mcpx_apu_dsp_ack_poll(d);
+
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
-        uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
-        bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
 
-        if (apu_active && !g_test_tone.active) {
-            /* Full pipeline: VP voices → DSP → monitor → waveOut */
+        if (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) {
+            /* Full pipeline: VP voices → DSP → monitor → audio out. This runs
+             * even while FECTL is transiently TRAPPED/HALTED (a method is being
+             * written): the GP just processes no new commands, and the GP/EP
+             * cadence stays in lockstep. Ticking ep_frame_div on those frames
+             * WITHOUT running the GP is what let the EP reader overtake the GP
+             * writer -- a 48000/256 = 187.5 Hz comb ("modem" buzz). */
             se_frame(d);
         } else {
-            /* Lightweight: just monitor frame (test tone + software mixer) */
+            /* APU truly disabled (XCNTMODE off): no DSP runs, so it is safe to
+             * advance the frame clock here. Emit a silent window so the XAudio2
+             * queue never drains -- a drained queue used to stop/re-prefill the
+             * source, cutting long samples off and leaving audible gaps. The
+             * software mixer / test tone still overdub in monitor_frame. */
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
+
+        /* What xemu's frame thread does after each frame: turn a pending
+         * notification (set by the voice processor or a trapped method) into
+         * the interrupt line. Nothing here ever did, so the line never rose
+         * even before there was anything to deliver it to. */
+        if (d->set_irq) {
+            update_irq(d);
+            d->set_irq = false;
+        }
+        apu_deliver_irq(d);
+
+        /* Let the guest in once per frame.
+         *
+         * The thread holds d->lock for its whole loop and only drops it inside
+         * throttle()'s wait. Once voices really play, processing can run
+         * behind real time, throttle never waits, and the lock is never
+         * released -- while every VOICE_ON/OFF/RELEASE the title writes needs
+         * it (voice_lock). A critical section is not fair, so the title's
+         * thread starved there indefinitely: Burnout 3 froze on its vehicle
+         * select, blocked in voice_lock at raised IRQL, which in turn held
+         * off every USB interrupt. */
+        qemu_mutex_unlock(&d->lock);
+        SwitchToThread();
+        qemu_mutex_lock(&d->lock);
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -609,13 +821,26 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
             mcpx_apu_vp_write(d, vp_addr, val, size);
         }
         /* VP reads handled by caller if needed */
+    } else if (addr >= 0x30000 && addr < 0x40000) {
+        /* GP region */
+        if (is_write) {
+            qemu_mutex_lock(&d->lock);
+            mcpx_apu_gp_write(d, addr - 0x30000, val, size);
+            qemu_mutex_unlock(&d->lock);
+        }
+    } else if (addr >= 0x50000 && addr < 0x60000) {
+        /* EP region */
+        if (is_write) {
+            qemu_mutex_lock(&d->lock);
+            mcpx_apu_ep_write(d, addr - 0x50000, val, size);
+            qemu_mutex_unlock(&d->lock);
+        }
     } else if (addr < 0x20000) {
         /* Main APU registers */
         if (is_write) {
             mcpx_apu_write(d, addr, val, size);
         }
     }
-    /* GP (0x30000) and EP (0x50000) regions ignored for now */
 }
 
 /* ============================================================
@@ -628,6 +853,10 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
     if (!d) return 0;
     if (addr >= 0x20000 && addr < 0x30000) {
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
+    } else if (addr >= 0x30000 && addr < 0x40000) {
+        return mcpx_apu_gp_read(d, addr - 0x30000, size);
+    } else if (addr >= 0x50000 && addr < 0x60000) {
+        return mcpx_apu_ep_read(d, addr - 0x50000, size);
     } else if (addr < 0x20000) {
         return mcpx_apu_read(d, (hwaddr)addr, size);
     }

@@ -1087,13 +1087,6 @@ static int prot_from_page(DWORD protect)
  * Memory from mach_vm_map is released by munmap like any other, because the
  * BSD and Mach halves of Darwin share one VM map, so VirtualFree is unchanged.
  */
-/* Length registry, defined with the view helpers below. Win32 frees by address
- * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
- * documented to take size 0 -- so the length has to be recoverable here or
- * munmap cannot be called at all. */
-void view_register(void *addr, size_t len);
-size_t view_take(const void *addr);
-
 static void *mach_map_fixed(void *address, size_t size, int prot)
 {
     mach_vm_address_t addr = (mach_vm_address_t)(uintptr_t)address;
@@ -1123,6 +1116,13 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
     return (void *)(uintptr_t)addr;
 }
 #endif
+
+/* Length registry, defined with the view helpers below. Win32 frees by address
+ * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
+ * documented to take size 0 -- so the length has to be recoverable here or
+ * munmap cannot be called at all. */
+void view_register(void *addr, size_t len);
+size_t view_take(const void *addr);
 
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {

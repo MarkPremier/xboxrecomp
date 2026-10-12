@@ -22,7 +22,7 @@ on, or find out what people are stuck on before you duplicate the effort.
 
 ### Recent Changes
 
-**Current version: v0.12.0 — _"Never Taken"_ (September 2026).**
+**Current version: v0.13.1 — _"Cut Short"_ (October 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
 ---
@@ -304,6 +304,7 @@ xboxrecomp/
 
 ### Start Here
 - **[Getting Started Guide](docs/GETTING_STARTED.md)** — End-to-end walkthrough from XBE to running game
+- **[Documentation Index](docs/INDEX.md)** — Every document in one place, and the same pages again by symptom
 - **[Decompilation Guide](docs/DECOMP.md)** — Using this as a function splitter instead: one byte-exact `.s` per function, with signatures and the call graph. You never run the recompiler
 - **[Tools Reference](tools/README.md)** — Detailed usage for every pipeline tool
 - **[Runtime Libraries](src/README.md)** — Architecture, build instructions, integration guide
@@ -384,6 +385,7 @@ See [docs/technical/candidate-games.md](docs/technical/candidate-games.md) for a
 - **[Xbox Dashboard](https://github.com/sp00nznet/xboxdashboard)** — The original Xbox system shell (build 3944); the toolkit on system software rather than a game. Nothing renders yet: the earlier "green orb at 60fps" was the project's own scaffolding drawing a disc, and has been retired along with the fake scene root and hand-rolled asset loader around it. What runs is the dashboard's own code — full init chain, its own D3D8 sizing and allocating its own 640x480 surfaces, its own NV2A pushbuffer, its own `default.xip` read. Its UI is driven by a **VRML97 + JavaScript scene engine** (text→bytecode compiler + stack-machine VM + node-class reflection registry), which is the piece still to come online.
 - **[Wreckless: The Yakuza Missions](https://github.com/sp00nznet/wreckless)** — Xbox launch title (2002). Custom engine, 3,407 functions, boots through CRT init into game main. Debugging early gameplay crash.
 - **[Blood Wake](https://github.com/sp00nznet/bloodwake)** — First-party Microsoft naval combat (2001). Stormfront Studios custom engine. 4,608 functions, 367K lines of C generated (99.1% success). Project scaffolded, working toward first build.
+- **[scghost-recomp](https://github.com/aknavj/scghost-recomp)** — Static recompilation of StarCraft: Ghost for Windows. Uses the `impl-scghost` branch of [aknavj/xboxrecomp](https://github.com/aknavj/xboxrecomp/tree/impl-scghost) for title-specific runtime and recompilation support.
 
 ## How You Can Help
 
@@ -423,7 +425,7 @@ definitions — they are the real proof for the shift, flag and x87 work, and
 each is paired with a negative control that feeds the harness the pre-fix
 expression and requires it to fail. They need a C compiler on `PATH`, and
 **skip rather than fail without one**, so check the skip count: a clean run is
-579 passed / 0 skipped. If clang is installed but not on `PATH`:
+641 passed / 0 skipped. If clang is installed but not on `PATH`:
 
 ```bash
 export PATH="/c/Program Files/LLVM/bin:$PATH"   # Git Bash
@@ -536,6 +538,177 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### v0.13.1 — *"Cut Short"* (October 2026)
+
+*Three fixes from one contributor, all about where a function ends. A CRT*
+`memcpy` *ended at its own jump table, leaving the arms after it with no owner.
+A run of alias entries in a gap each claimed the whole gap. A wrapped body's
+rename carried every call with it, past the wrapper meant to intercept them.
+Each one compiles, links and runs; the first two lift the wrong bytes, and the
+third runs the right bytes without the code the project wrote to go around them.*
+
+- **Arms that follow their inline jump table** are lifted inside the function:
+  it is extended over its tables when every path stays in range, instead of
+  dispatching to an address with no body —
+  *[@NoRain211](https://github.com/NoRain211)* (#173)
+- **Gap aliases stay inside their gap**: each ends after its own body, within
+  its section's file-backed bytes, rather than at the next start measured before
+  the other aliases existed. On DOA3 that is 1.58M → 1.28M lines of C —
+  *[@NoRain211](https://github.com/NoRain211)* (#174)
+- **Calls reach a wrapped function's wrapper**: direct calls, tail jumps and the
+  dispatch table go to `recomp_manual.c`'s `sub_X`, and the `sub_X_gen` body it
+  calls is always emitted —
+  *[@NoRain211](https://github.com/NoRain211)* (#175)
+
+**Held:** #176 (static callback recovery) accepts plain constants that land
+mid-function in unlisted code as function entries; on Wreckless one of them is
+data lifted as code. #162 (the pushbuffer executor, rebased) has a walk that
+can run past `PUT` and an unbounded 32-bit vertex index. Both are back with
+their authors.
+
+Checked on Wreckless (DSTEAL_JP): regenerated with 0 failures, the only change
+to the function set is four jump-table arms now lifted as labels, and the boot
+reaches the same point as on v0.13.0.
+
+A clean run is now **641 passed / 0 skipped**, up from 630, plus 5,843
+conformance vectors with no mismatches.
+
+### v0.13.0 — *"Given Back"* (October 2026)
+
+*Burnout 3: Takedown is playable end to end, and eleven contributed PRs from
+three new contributors land beside it. The batch keeps finding things the runtime took and never
+returned. A heap that handed a whole freed block to the next small request
+and passed guest pointers to the host's* `VirtualFree`*, so nothing came back.
+A directory search abandoned mid-way that kept its host slot after the handle
+closed. A failed indirect call that rewound over its arguments before the
+caller popped them again.* `pushad`*/*`popad` *emitted as TODOs, so the
+registers a routine saved were never restored. None of them fails where it
+happens; each surfaces later, somewhere else.*
+
+**Contributed: lifter and recompiler**
+
+- **`pushad`/`popad` were TODOs**, so a routine that saved every register
+  with them returned with its caller's registers clobbered —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#167)
+- **A failed indirect call to a caller-cleans function popped its arguments
+  twice**: the failure path rewound over them, then the caller's
+  `add esp, N` did too —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#169)
+- **`rep movs` touching the hardware aperture used host `memcpy`**, whose
+  vector loads skip the element-sized accesses trapped device memory needs —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#170)
+- **Two kinds of join read a flag nothing assigns**: swapped-operand float
+  compares, and a result snapshot meeting a compare snapshot. Each edge now
+  computes the join's condition itself —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#159)
+- **Manual entry hooks**: a `sub_XXXXXXXX_enter()` in the manual file runs at
+  the top of the generated function on every call, direct ones included —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#168)
+
+**Contributed: kernel**
+
+- **Opt-in memory reclaim and high reservations.** `RECOMP_HEAP_RECLAIM` splits
+  freed blocks, makes `NtFreeVirtualMemory` and `MmFreeContiguousMemory`
+  actually free, and zeroes decommitted pages; `RECOMP_EXT_VMA` honours a
+  reservation at a fixed address above the RAM mirrors. The heap table also
+  gains a lock —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#158)
+- **Opt-in guest synchronisation.** `RECOMP_TITLE_KEVENTS` gives a KEVENT a
+  title built by writing its header a host event, instead of every wait on it
+  failing at once; `RECOMP_GUEST_LOCK` runs one guest thread at a time —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#160)
+- **Closing a directory mid-search leaked the host search**, and a reused
+  handle value continued the old cursor —
+  *[@vyanhursky](https://github.com/vyanhursky)* (#171)
+- **Kernel small fixes**: NT pseudo-handles sign-extended on x64 (the CRT had
+  retried `NtDuplicateObject` forever), `STATUS_CONFLICTING_ADDRESSES` → 487 so
+  the CRT heap grows elsewhere, a 64-bit kernel call counter that no longer
+  starts logging every call after 2^31, an OHCI short-packet underrun, MinGW
+  thread-locals, two headless Ghidra scripts and a docs index by symptom —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#157)
+- **Diagnostics**: `g_xbox_path_hook`, an `[EXIT]` line when a title ends
+  itself, and an opt-in `RECOMP_CALL_PROFILE` —
+  *[@BearddOddity](https://github.com/BearddOddity)* (#161)
+
+**Contributed: build**
+
+- **The runtime builds with GCC on Linux** —
+  *[@eolandro](https://github.com/eolandro)* (#172)
+
+**Toolkit fixes found on MechAssault, Wreckless and Half-Life 2**
+
+- **A switch arm's resync left misaligned decodes inside it**: MechAssault's
+  CRT `memcpy` ran an `inc esp` lifted from the middle of a real `mov`, and
+  every 28–31 byte copy returned with ESP a byte off — *[@sp00nznet](https://github.com/sp00nznet)* (#135)
+- **Jump tables named by their last slot** were measured as one entry, so
+  `memmove`'s backward tail lost every arm after the table, epilogue included — *[@sp00nznet](https://github.com/sp00nznet)* (#134)
+- **The save directory was relative**, so `SHCreateDirectoryExW` created
+  nothing and a title probing `partition1` at boot quit to the dashboard — *[@sp00nznet](https://github.com/sp00nznet)* (#133)
+- **String-reference labels no longer name code** (#163); **disasm trusts
+  only seeds a run actually reached** (#164); clang-cl builds the NV2A shim
+  (#165) — *[@sp00nznet](https://github.com/sp00nznet)*
+
+**Burnout 3: Takedown, from its entry point to every game mode playable**
+
+*One and two players. Most of what it needed is general: the XDK's USB and
+DirectSound stacks handing the hardware physical addresses, an x87 that
+honours precision control, and enough of the NV2A to draw a 3D game through
+its own D3D8LTCG. All by [@sp00nznet](https://github.com/sp00nznet).*
+
+**Lifter**
+
+- **x87 results ignored precision control.** Under PC=24 (D3D's default) the
+  significand now rounds to 24 bits (#149)
+- **`lahf` lifted; unordered x87/SSE compares set ZF, PF and CF**, not
+  "greater" (#150)
+- **All eight SSE compare predicates**, 4-lane `sqrtps`/`rsqrtps`/`rcpps`,
+  and bare `cmps`/`scas` (#151)
+- **Switch tables whose displacement is not slot 0**: the CRT memcpy's
+  unaligned-byte dispatch no longer silently skips the copy (#140)
+
+**Kernel, memory and interrupts**
+
+- The RAM mirror span no longer leaks 1.8 GB of reservation on Windows (#138)
+- Physical page 0 is kept for the XDK USB stack (#143)
+- ISRs and DPCs run at their IRQL and restore it; `KPCR.Irql` is published
+  (#148)
+- The DPC queue is locked, and `KDPC.Inserted` is honoured (#155)
+
+**Audio**
+
+- GP/EP DSP memory is left untrapped under `RECOMP_AC97_READY` (#139)
+- The DSP doorbell ack runs whatever the front end is doing (#141)
+- The APU resolves physical addresses into the contiguous window and
+  delivers its interrupt (#147)
+
+**USB**
+
+- OHCI resolves physical descriptor and buffer addresses (#142)
+- `RECOMP_PAD_SCRIPT` and `RECOMP_PAD_LIVE` drive a pad headless (#144)
+- Up to four pads (`RECOMP_USB_PADS`), stick steps in pad scripts, and a
+  rumble transfer no longer ends a control request (#154)
+
+**NV2A**
+
+- Vertex programs, register combiners, four texture stages, visibility
+  reports, near-plane clipping, bilinear filtering, and a threaded
+  rasteriser (#152)
+- P8 textures sample through the stage palette (#145)
+- `RECOMP_PB_REPORT_MS` (#146); `RECOMP_FB_DUMP_FLIPS` dumps every flip for
+  recordings (#156)
+- The window title shows the XBE title, FPS and draws (#153)
+
+**Held:** #162, the pushbuffer executor from the X-Men Legends split, is a
+draft and overlaps the executor that landed in #152; #128 is closed as split.
+
+Merge fixups: #134's lifter half reduced to the one shape main's own fix
+missed; #160's `KePulseEvent` block moved out of `KeReleaseSemaphore`, where
+it never ran; #170's fixture renamed off glibc's `index`; #172's declarations
+hoisted out of the macOS block so every POSIX host gets them.
+
+A clean run is now **630 passed / 0 skipped**, up from 579, plus 5,843
+conformance vectors with no mismatches.
 
 ### v0.12.0 — *"Never Taken"* (September 2026)
 

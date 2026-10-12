@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include <stdio.h>
 #include <stdlib.h>
 #if defined(_WIN32)
@@ -32,42 +33,84 @@
  *   APC_LEVEL (1) - APC delivery
  *   DISPATCH_LEVEL (2) - scheduler/DPC level, no page faults allowed
  *
- * On Windows, we simulate IRQL with a thread-local variable. Raising to
- * DISPATCH_LEVEL doesn't actually prevent preemption, but the tracking
- * allows code that checks IRQL to function correctly.
+ * On Windows, we simulate IRQL with a single processor-wide variable. The
+ * console has one processor, so every guest thread shares one IRQL and every
+ * device model reads the same one. A per-thread model lets a guest thread
+ * lower IRQL against a level another thread raised, read its own stale
+ * PASSIVE_LEVEL, and make the lower look like a raise -- the raised-count
+ * that gated every interrupt then climbed and never came back down, so OHCI
+ * held the gamepad interrupt off for seconds at a time and input appeared
+ * dead. A single level, swapped atomically, can be momentarily wrong under a
+ * mismatched pair but can never wedge the gate shut.
  * ============================================================================ */
 
-static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
+static volatile LONG g_cpu_irql = PASSIVE_LEVEL;
 
-/* How many threads are holding IRQL at or above DISPATCH_LEVEL.
- *
- * The level itself is per-thread, which is right for a guest that asks "what
- * is my IRQL". It is wrong for the question a device model has to answer:
- * raising IRQL on hardware masks the interrupt for the whole processor, and
- * the title raises it precisely to keep an ISR out of structures it is in the
- * middle of editing. With the level thread-local, a controller thread sees
- * PASSIVE_LEVEL, calls the ISR anyway, and the two race over exactly the
- * state the guest was protecting -- which surfaces as an intermittent fault
- * on a garbage pointer, far from the code that dropped it.
- *
- * A count rather than a flag, because several threads can be raised at once
- * and the last one out is what re-opens the gate. */
-static volatile LONG g_irql_raised_count = 0;
+/* A host ISR/DPC thread runs the interrupted work at its own device level,
+ * which the guest must never observe: on hardware the dispatcher restores the
+ * interrupted IRQL before that thread runs again, so no guest thread can read
+ * the ISR's level. Here the device threads run concurrently with guest threads,
+ * and swapping the one shared g_cpu_irql let them: a guest KfRaiseIrql(2) that
+ * landed inside an ISR got 16 back and later lowered to 16 "while at 2" (the
+ * gate left shut and 16 written into KPCR), and an IrqlLeaveInterrupt restored
+ * its saved level over a raise the guest made meanwhile. The ISR level is kept
+ * per host thread; the guest's shared level is left alone, which is also why
+ * the shared model below stays. */
+static RECOMP_TLS int t_isr_irql = -1;   /* this ISR/DPC thread's level; -1 = not in one */
+static volatile LONG g_isr_active;       /* host ISRs/DPCs in flight */
 
-/* Non-zero while any thread is at or above DISPATCH_LEVEL. Device models call
- * this before delivering an interrupt; OHCI and the NV2A are level-triggered,
- * so a deferred interrupt is delivered on the next poll rather than lost. */
-int xbox_IrqlBlocksInterrupts(void)
+static KIRQL irql_swap(KIRQL v)
 {
-    return InterlockedCompareExchange(&g_irql_raised_count, 0, 0) != 0;
+    if (t_isr_irql >= 0) { KIRQL o = (KIRQL)t_isr_irql; t_isr_irql = v; return o; }
+    return (KIRQL)InterlockedExchange(&g_cpu_irql, (LONG)v);
 }
 
-/* The raw depth, for callers that want to report it. A count that only ever
- * grows is a leak somewhere in the raise/lower pairs, and the number says so
- * where a yes/no cannot. */
+static KIRQL irql_now(void)
+{
+    return t_isr_irql >= 0 ? (KIRQL)t_isr_irql
+                           : (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0);
+}
+
+/* The current IRQL, where guest code reads it: KPCR.Irql, fs:[0x24].
+ *
+ * The XDK does not always ask the kernel. DirectSound's lock
+ * (sub_002F4175 in Burnout 3) reads fs:[0x24] directly and skips its
+ * critical section at raised IRQL, because a DPC must never block. Nothing
+ * wrote that byte, so it read 0 everywhere: DirectSound's DPC took the
+ * critical section, blocked against the thread that held it, and the title
+ * froze with IRQL raised on the blocked thread. Every change of
+ * g_cpu_irql is published here. */
+extern RECOMP_TLS uint32_t g_fs_base;
+/* The offset lifted code adds to every guest address; host code that reads
+ * guest memory on its behalf uses the same one. */
+extern ptrdiff_t g_xbox_mem_offset;
+
+static void irql_publish(void)
+{
+    if (g_fs_base)
+        *(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + g_fs_base
+                              + 0x24) =
+            (uint8_t)irql_now();
+}
+
+/* Non-zero while the processor is at or above DISPATCH_LEVEL. Device models
+ * call this before delivering an interrupt; OHCI and the NV2A are
+ * level-triggered, so a deferred interrupt is delivered on the next poll
+ * rather than lost. */
+int xbox_IrqlBlocksInterrupts(void)
+{
+    return InterlockedCompareExchange(&g_isr_active, 0, 0) > 0
+        || (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0) >= DISPATCH_LEVEL;
+}
+
+/* The current level, for callers that want to report it. A level that stays
+ * at DISPATCH across a quiet thread is a guest that genuinely raised and
+ * never lowered, not a counter artefact. */
 int xbox_IrqlRaisedCount(void)
 {
-    return (int)InterlockedCompareExchange(&g_irql_raised_count, 0, 0);
+    KIRQL guest = (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0);
+    KIRQL isr = InterlockedCompareExchange(&g_isr_active, 0, 0) > 0 ? 16 : 0;
+    return (int)(guest > isr ? guest : isr);
 }
 
 static int  s_trace = -1;
@@ -96,7 +139,12 @@ int xbox_IrqlTransitions(void)
  * name: these are host addresses inside the recompiled image, so nm resolves
  * them to the generated function, which is the guest function. */
 #define IRQL_HOLDERS 8
-static struct { volatile LONG tid; void *ra; } s_holders[IRQL_HOLDERS];
+static struct {
+    volatile LONG tid;
+    void *ra;
+    uint32_t guest_ra, guest_esp;   /* the host ra only ever names the bridge */
+} s_holders[IRQL_HOLDERS];
+extern RECOMP_TLS uint32_t g_esp;
 
 static void irql_holder_add(void *ra)
 {
@@ -106,6 +154,9 @@ static void irql_holder_add(void *ra)
     for (i = 0; i < IRQL_HOLDERS; i++)
         if (InterlockedCompareExchange(&s_holders[i].tid, me, 0) == 0) {
             s_holders[i].ra = ra;
+            s_holders[i].guest_esp = g_esp;
+            s_holders[i].guest_ra = g_esp
+                ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
             return;
         }
 }
@@ -129,8 +180,10 @@ void xbox_IrqlDumpHolders(void)
     for (i = 0; i < IRQL_HOLDERS; i++) {
         LONG t = InterlockedCompareExchange(&s_holders[i].tid, 0, 0);
         if (t)
-            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p\n",
-                    (unsigned long)t, s_holders[i].ra);
+            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p, "
+                    "guest ret %08X (esp %08X)\n",
+                    (unsigned long)t, s_holders[i].ra,
+                    s_holders[i].guest_ra, s_holders[i].guest_esp);
     }
     fflush(stderr);
 }
@@ -139,13 +192,10 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 {
     int was = (old_level >= DISPATCH_LEVEL);
     int now = (new_level >= DISPATCH_LEVEL);
-    LONG d;
 
     if (now == was)
         return;
 
-    d = now ? InterlockedIncrement(&g_irql_raised_count)
-            : InterlockedDecrement(&g_irql_raised_count);
     InterlockedIncrement(&s_transitions);
     if (now)
         irql_holder_add(ra);
@@ -159,10 +209,49 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     if (s_trace < 0)
         s_trace = getenv("RECOMP_IRQL_TRACE") ? 1 : 0;
     if (s_trace && InterlockedIncrement(&s_traced) <= 20) {
-        fprintf(stderr, "  [IRQL] tid %lu %s %d->%d depth=%ld\n",
+        fprintf(stderr, "  [IRQL] tid %lu %s %d->%d level=%d\n",
                 (unsigned long)GetCurrentThreadId(),
-                now ? "raise" : "lower", old_level, new_level, (long)d);
+                now ? "raise" : "lower", old_level, new_level,
+                (int)new_level);
         fflush(stderr);
+    }
+}
+
+/* Bracket a host-delivered ISR or DPC.
+ *
+ * The kernel's interrupt and DPC dispatchers put the processor back at the
+ * interrupted IRQL when the routine returns, whatever the routine left it at.
+ * The host threads that deliver interrupts and drain DPCs here had no such
+ * epilogue, so a routine that returned at DISPATCH_LEVEL left its thread
+ * there and the global depth at one -- and every later USB interrupt then
+ * sat out the forced-delivery timeout, a pad polled twice a second.
+ *
+ * They also run the routine at the level it expects -- DISPATCH_LEVEL for a
+ * DPC, the device level for an ISR -- and code checks: see irql_publish. */
+int xbox_IrqlEnterInterrupt(int level)
+{
+    int saved = t_isr_irql;
+    KIRQL old;
+    if (saved < 0)
+        InterlockedIncrement(&g_isr_active);
+    old = saved < 0 ? PASSIVE_LEVEL : (KIRQL)saved;
+    t_isr_irql = level;
+    if (old != (KIRQL)level) {
+        irql_track(old, (KIRQL)level, IRQL_CALLER());
+        irql_publish();
+    }
+    return saved;
+}
+
+void xbox_IrqlLeaveInterrupt(int saved)
+{
+    KIRQL cur = (KIRQL)t_isr_irql;
+    t_isr_irql = saved;                   /* dispatcher epilogue: restore the interrupted level */
+    if (saved < 0)
+        InterlockedDecrement(&g_isr_active);
+    if (cur != (KIRQL)(saved < 0 ? PASSIVE_LEVEL : saved)) {
+        irql_track(cur, saved < 0 ? PASSIVE_LEVEL : (KIRQL)saved, IRQL_CALLER());
+        irql_publish();
     }
 }
 
@@ -172,7 +261,7 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  */
 KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 {
-    KIRQL old = g_current_irql;
+    KIRQL old = irql_swap(NewIrql);
 
     if (NewIrql < old) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
@@ -181,7 +270,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
     }
 
     irql_track(old, NewIrql, IRQL_CALLER());
-    g_current_irql = NewIrql;
+    irql_publish();
     return old;
 }
 
@@ -191,33 +280,40 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
  */
 VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
-    if (NewIrql > g_current_irql) {
-        /* A lower that raises the count.
-         *
-         * irql_track works on the edge, so this call crosses the boundary
-         * upwards and increments. The pair that would bring it back down has
-         * already happened, so the depth is now permanently one too high --
-         * and the count is what every device model reads before delivering.
-         * One of these ends interrupts for the rest of the run.
-         *
-         * Loud rather than a filtered warning because of that consequence:
-         * the symptom is a device going silent minutes later, with nothing
-         * connecting it back to here. */
-        static volatile LONG n;
-        if (InterlockedIncrement(&n) <= 20) {
-            fprintf(stderr, "  [IRQLBUG] tid %lu KfLowerIrql(%d) while at %d"
-                    " -- counted as a raise, depth is now stuck\n",
-                    (unsigned long)GetCurrentThreadId(),
-                    (int)NewIrql, (int)g_current_irql);
-            fflush(stderr);
-        }
-        xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
-            "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
-            g_current_irql, NewIrql);
-    }
+    KIRQL requested = NewIrql;
+    KIRQL cur = irql_now();
 
-    irql_track(g_current_irql, NewIrql, IRQL_CALLER());
-    g_current_irql = NewIrql;
+    /* A lower must never raise. The guest IRQL is a single shared level while
+     * guest threads run concurrently on different host cores, so a thread
+     * whose own lowering arrives late can set a level *above* the current one
+     * (its saved "old" was another thread's raise). That wedges the shared
+     * value at DISPATCH_LEVEL: xbox_IrqlBlocksInterrupts() then holds off the
+     * APU interrupt forever and DirectSound's lock stops protecting its voice
+     * lists, so one-shot effects/voices disappear. Clamp instead.
+     * ponytail: clamp is a patch; a per-thread guest IRQL is the real fix. */
+    if (NewIrql > cur)
+        NewIrql = cur;
+
+    {
+        KIRQL old = irql_swap(NewIrql);
+
+        if (requested > old) {
+            static volatile LONG n;
+            if (InterlockedIncrement(&n) <= 20) {
+                fprintf(stderr, "  [IRQLWARN] tid %lu KfLowerIrql(%d) while at %d"
+                        " (clamped to %d)\n",
+                        (unsigned long)GetCurrentThreadId(),
+                        (int)requested, (int)old, (int)NewIrql);
+                fflush(stderr);
+            }
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
+                "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
+                old, requested);
+        }
+
+        irql_track(old, NewIrql, IRQL_CALLER());
+    }
+    irql_publish();
 }
 
 /*
@@ -225,10 +321,10 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
  */
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
-    KIRQL old = g_current_irql;
+    KIRQL old = irql_swap(DISPATCH_LEVEL);
 
     irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
-    g_current_irql = DISPATCH_LEVEL;
+    irql_publish();
     return old;
 }
 
@@ -384,6 +480,7 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
 {
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
         "*** KeBugCheck: code=0x%08X ***", BugCheckCode);
+    fprintf(stderr, "[EXIT] KeBugCheck 0x%08X\n", (unsigned)BugCheckCode);
 
 #ifdef _DEBUG
     DebugBreak();
@@ -402,6 +499,7 @@ VOID __stdcall xbox_KeBugCheckEx(
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
         "*** KeBugCheckEx: code=0x%08X, params=(0x%p, 0x%p, 0x%p, 0x%p) ***",
         BugCheckCode, (void*)Param1, (void*)Param2, (void*)Param3, (void*)Param4);
+    fprintf(stderr, "[EXIT] KeBugCheckEx 0x%08X\n", (unsigned)BugCheckCode);
 
 #ifdef _DEBUG
     DebugBreak();
@@ -452,12 +550,16 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "HalReturnToFirmware: routine=%u (exiting)", Routine);
+    /* stderr too: the kernel log file is rewritten on every run, so a title
+     * that ends itself otherwise leaves no trace in the run's own log. */
+    fprintf(stderr, "[EXIT] HalReturnToFirmware routine=%u\n", (unsigned)Routine);
     ExitProcess(0);
 }
 
 VOID __stdcall xbox_HalInitiateShutdown(void)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL, "HalInitiateShutdown (exiting)");
+    fprintf(stderr, "[EXIT] HalInitiateShutdown\n");
     ExitProcess(0);
 }
 
@@ -624,6 +726,9 @@ NTSTATUS __stdcall xbox_NtSetSystemTime(PLARGE_INTEGER SystemTime, PLARGE_INTEGE
 static ULONG g_av_saved_data_address = 0;
 static ULONG g_av_display_mode = 0;
 
+/* Set by xbox_VideoSetAvPackHook; used earlier in xbox_AvSendTVEncoderOption. */
+static void (*s_video_avpack_hook)(uint32_t *);
+
 ULONG __stdcall xbox_AvGetSavedDataAddress(void)
 {
     return g_av_saved_data_address;
@@ -637,6 +742,7 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL,
         "AvSendTVEncoderOption: option=0x%02X param=0x%X", Option, Param);
+    fprintf(stderr, "  [AVOPT] option=0x%02X param=0x%X\n", Option, Param);
 
     if (!Result)
         return;
@@ -658,6 +764,13 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         *Result = AV_PACK_HDTV
                 | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
                 | AV_REFRESH_60Hz;
+        {
+            const char *ov = getenv("RECOMP_AVPACK");
+            if (ov && *ov)
+                *Result = (ULONG)strtoul(ov, NULL, 0);
+        }
+        if (s_video_avpack_hook)
+            s_video_avpack_hook(Result);
         break;
 
     case AV_OPTION_QUERY_MODE:
@@ -702,6 +815,7 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         *Result = 0;
         break;
     }
+    fprintf(stderr, "  [AVOPT]   -> 0x%08X\n", *Result);
 }
 
 VOID __stdcall xbox_AvSetSavedDataAddress(ULONG Address)
@@ -724,6 +838,55 @@ VOID __stdcall xbox_AvSetDisplayMode(
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "AvSetDisplayMode: step=%u mode=0x%X format=0x%X pitch=%u fb=0x%X",
         Step, Mode, Format, Pitch, FrameBuffer);
+}
+
+/* ---- Desired output resolution (see kernel.h) --------------------------- */
+
+static int s_video_width, s_video_height, s_video_parsed;
+static void (*s_video_query_hook)(uint32_t, uint32_t *, int *);
+
+int xbox_VideoDesiredResolution(uint32_t *width, uint32_t *height)
+{
+    if (!s_video_parsed) {
+        const char *spec = getenv("RECOMP_RESOLUTION");
+
+        s_video_parsed = 1;
+        if (spec && *spec) {
+            unsigned w = 0, h = 0;
+
+            if (sscanf(spec, "%ux%u", &w, &h) == 2 &&
+                w >= 16 && w <= 4096 && h >= 16 && h <= 4096) {
+                s_video_width  = (int)w;
+                s_video_height = (int)h;
+            } else {
+                fprintf(stderr, "[VIDEO] ignoring RECOMP_RESOLUTION '%s'"
+                                " (want WIDTHxHEIGHT, 16..4096)\n", spec);
+            }
+        }
+    }
+    if (!s_video_width)
+        return 0;
+    if (width)  *width  = (uint32_t)s_video_width;
+    if (height) *height = (uint32_t)s_video_height;
+    return 1;
+}
+
+void xbox_VideoSetQueryHook(void (*hook)(uint32_t, uint32_t *, int *))
+{
+    s_video_query_hook = hook;
+}
+
+void xbox_VideoSetAvPackHook(void (*hook)(uint32_t *))
+{
+    s_video_avpack_hook = hook;
+}
+
+void xbox_VideoQueryHook(uint32_t value_index, uint32_t *value, int *handled)
+{
+    if (handled)
+        *handled = 0;
+    if (s_video_query_hook)
+        s_video_query_hook(value_index, value, handled);
 }
 
 /* ============================================================================

@@ -843,7 +843,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, &d->ram_ptr[addr & 0x03FFFFFF],
+                    memcpy(adpcm_block, mcpx_apu_phys(addr),
                            block_size);
                 } else {
                     linear_addr += ba;
@@ -940,32 +940,77 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (simplified - no libsamplerate)
+ * Voice resampling (libsamplerate, from xemu)
  *
- * Since libsamplerate is stubbed, we do a simple nearest-neighbor
- * resample. This gives us functional audio at the cost of quality.
+ * Pitch-shifted voices are resampled through the vendored libsamplerate
+ * using the same sinc converter as xemu. The callback pulls source
+ * samples from voice_get_samples() as the converter needs them.
  * ============================================================ */
+
+static long voice_resample_callback(void *cb_data, float **data)
+{
+    MCPXAPUVoiceFilter *filter = cb_data;
+    uint16_t v = filter->voice;
+    assert(v < MCPX_HW_MAX_VOICES);
+    MCPXAPUState *d = container_of(filter, MCPXAPUState, vp.filters[v]);
+
+    int sample_count = 0;
+    while (sample_count < NUM_SAMPLES_PER_FRAME) {
+        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+        if (!active) {
+            break;
+        }
+        int count = voice_get_samples(
+            d, v, &filter->resample_buf[sample_count],
+            NUM_SAMPLES_PER_FRAME - sample_count);
+        if (count < 0) {
+            break;
+        }
+        sample_count += count;
+    }
+
+    if (sample_count < NUM_SAMPLES_PER_FRAME) {
+        /* Starvation causes SRC to hang on repeated calls. Provide silence. */
+        memset(&filter->resample_buf[sample_count], 0,
+               2 * (NUM_SAMPLES_PER_FRAME - sample_count) * sizeof(float));
+        sample_count = NUM_SAMPLES_PER_FRAME;
+    }
+
+    *data = (float *)filter->resample_buf;
+    return sample_count;
+}
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
+    assert(v < MCPX_HW_MAX_VOICES);
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
 
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+    if (filter->resampler == NULL) {
+        filter->voice = v;
+        int err;
+        filter->resampler = src_callback_new(&voice_resample_callback,
+                                             SRC_SINC_FASTEST, 2, &err, filter);
+        if (filter->resampler == NULL) {
+            fprintf(stderr, "src error: %s\n", src_strerror(err));
+            assert(0);
+        }
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+
+    int count = src_callback_read(filter->resampler, rate, requested_num,
+                                  (float *)samples);
+    if (count == -1) {
+        DPRINTF("resample error\n");
+    }
+    if (count != requested_num) {
+        DPRINTF("resample returned fewer than expected: %d\n", count);
+        if (count == 0) {
+            return -1;
+        }
+    }
+
+    return count;
 }
 
 /* ============================================================
@@ -1038,6 +1083,7 @@ static void voice_process(MCPXAPUState *d,
             memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
         }
     } else {
+        int empty = 0;
         for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
@@ -1045,6 +1091,11 @@ static void voice_process(MCPXAPUState *d,
             int count = voice_resample(d, v, &samples[sample_count],
                                        NUM_SAMPLES_PER_FRAME - sample_count, rate);
             if (count < 0) break;
+            /* An active voice that keeps producing nothing is an underrun,
+             * not a reason to spin. Asking it again at once cannot change the
+             * answer, and this loop holds d->lock: Burnout 3's vehicle select
+             * sat here indefinitely while the title waited in voice_lock. */
+            if (count == 0 && ++empty > 4) break;
             sample_count += count;
         }
     }

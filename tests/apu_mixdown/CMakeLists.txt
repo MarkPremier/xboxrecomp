@@ -4,7 +4,9 @@ set(CMAKE_C_STANDARD 11)
 add_subdirectory(../.. runtime)
 add_executable(apu_mixdown_test test_main.c)
 target_include_directories(apu_mixdown_test PRIVATE ../../src ../../src/apu)
-target_link_libraries(apu_mixdown_test PRIVATE xbox_apu)
+# The whole runtime: the APU delivers its interrupt and resolves physical
+# addresses through the kernel.
+target_link_libraries(apu_mixdown_test PRIVATE xboxrecomp)
 enable_testing()
 # Registered TWICE, on purpose. mcpx_apu_mixdown_all caches its getenv in a
 # static, so one process can only ever exercise one arm -- and an arm that

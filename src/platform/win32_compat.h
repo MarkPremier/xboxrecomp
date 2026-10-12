@@ -434,8 +434,19 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
 
 /* Win32 VEH: opaque PEXCEPTION_POINTERS + AddVectoredExceptionHandler stub.
  * On Linux the equivalent goes through sigaction(SIGSEGV/SIGFPE) +
- * ucontext_t; for now we accept the registration and never fire. */
+ * ucontext_t; for now we accept the registration and never fire. 
+ * 
+ * Note: GCC needs correct struct. This is from nxdk
+ * */
+#ifdef __linux__
+typedef struct _EXCEPTION_POINTERS
+{
+    PEXCEPTION_RECORD ExceptionRecord;
+    PCONTEXT ContextRecord;
+} EXCEPTION_POINTERS, *PEXCEPTION_POINTERS;
+#else
 typedef void *PEXCEPTION_POINTERS;
+#endif
 typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(PEXCEPTION_POINTERS info);
 PVOID AddVectoredExceptionHandler(ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER Handler);
 ULONG RemoveVectoredExceptionHandler(PVOID Handle);
@@ -454,6 +465,11 @@ ULONG RemoveVectoredExceptionHandler(PVOID Handle);
 #define EXCEPTION_FLT_UNDERFLOW          0xC0000093u
 #define EXCEPTION_FLT_INEXACT_RESULT     0xC000008Fu
 #define EXCEPTION_FLT_DENORMAL_OPERAND   0xC000008Du
+
+/* For linux devices*/
+#ifndef EXCEPTION_SINGLE_STEP
+  #define EXCEPTION_SINGLE_STEP 0x80000004u
+#endif
 
 /* ---- Memory query ----------------------------------------------------- */
 typedef struct _MEMORY_BASIC_INFORMATION {

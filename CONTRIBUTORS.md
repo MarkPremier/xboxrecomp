@@ -235,6 +235,20 @@ direction.
   recovered code, refused jump tables whose scale is not a dword stride, and
   made `iret` terminal.
 
+*v0.13.1 — a function list cut in the wrong place (#173–#175)*
+- **Arms after their own inline jump table (#173)** — MSVC's hand-written CRT
+  `memcpy` puts each table before the arms it indexes, so the function list
+  ended at the table and the arms, which branch back into the body, had no
+  owner. The function is now extended over its tables when every path stays
+  inside.
+- **Gap aliases spanned the whole gap (#174)** — an alias entry with no
+  enclosing body ran to the next function start measured before the other
+  aliases existed, so DOA3's 25 C++ initialisers each lifted the same ~100 KB,
+  and one ran past its section into data. Each now ends after its own body.
+- **Calls skipped the hand-written wrapper (#175)** — renaming a wrapped body
+  to `sub_X_gen` renamed every reference to it too, so direct calls and the
+  dispatch table bypassed `recomp_manual.c`'s `sub_X`.
+
 ### DarthSidious666 — [@DarthSidious666](https://github.com/DarthSidious666)
 - **Implemented the missing `tools/abi_analysis` (#6)** — the pipeline had a
   hole in it: `tools.recomp` looked for `abi_functions.json`, warned when it
@@ -709,6 +723,68 @@ nothing about it.
   compared against hand-typed offsets instead of the header's constants, so the
   frame counter counted the wrong method, `WAIT_FOR_IDLE` was swallowed as a
   flip, and the real flip methods fell through to the unhandled path.
+
+### BearddOddity — [@BearddOddity](https://github.com/BearddOddity)
+A bring-up batch on *X-Men Legends*, a title that links the XDK's own D3D,
+DirectSound and USB stack. Developed with Claude Code.
+
+- **`XBOX_THREAD_LOCAL` tested `_WIN32`, not the compiler (#157)** — MinGW targets
+  Windows but is GCC, which ignores `__declspec(thread)` with only a warning,
+  so on that host every kernel thread-local was one process-wide variable.
+- **`NtCurrentThread()` widened as unsigned on x64 (#157)** — `DuplicateHandle`
+  never recognised it, and the CRT retried forever.
+- **The kernel call counter wrapped after 2^31 calls (#157)** — and "log the first
+  N" became "log everything": about 1 FPS some minutes into a level.
+- **`STATUS_CONFLICTING_ADDRESSES` had no DOS error (#157)** — 487 is the only
+  answer on which the CRT heap tries another address when it grows.
+- **A short IN packet without bufferRounding is DATA UNDERRUN (#157)** — the OHCI
+  model reported success, and XAPI followed a dead TD link.
+- **Documented** — four ways function detection misses functions, lifter
+  gaps, template and build traps, the ABI checker's standing reports, two
+  Ghidra scripts for headless triage, and a documentation index by symptom.
+- **Memory never came back (#158)** — a small request after a large free took
+  the whole block, `NtFreeVirtualMemory` handed a 32-bit guest slot to the
+  host's `VirtualFree`, and `MmFreeContiguousMemory` gave contiguous memory to
+  a heap that did not own it, so a title that frees one scene and loads the
+  next ran the 64 MB window dry. All of it behind `RECOMP_HEAP_RECLAIM`.
+- **A reservation above the RAM mirrors was refused (#158)** — X-Men Legends
+  reserves `0x76000000` and checks it got exactly that; under `RECOMP_EXT_VMA`
+  it does, and the CRT heap-grow loop that ran 161 million kernel calls is gone.
+- **KEVENTs a title builds by writing the header (#160)** — with no
+  `KeInitializeEvent` there was no shadow, every wait failed at once and the
+  title retried forever; `RECOMP_TITLE_KEVENTS` gives them a host event, and
+  `RECOMP_GUEST_LOCK` runs one guest thread at a time to rule a race in or out.
+- **Two joins that read a flag nobody set (#159)** — swapped-operand float
+  compares, and a result snapshot meeting a compare snapshot, both fell back to
+  the never-assigned `_flags`; each edge now computes the join's condition.
+  Found on a racer whose clamp always fired and zeroed its wheels' torque.
+- **Diagnostics (#161)** — a guest path hook, an `[EXIT]` line when a title
+  ends itself, and an opt-in direct-call profile for diffing two runs.
+
+### Vlad Yanhursky — [@vyanhursky](https://github.com/vyanhursky)
+Five fixes extracted from a *Def Jam* bring-up fork, each with a fixture that
+fails on the old code and a real-CPU conformance case where one applies.
+
+- **`pushad`/`popad` were lifted as TODOs (#167)** — a routine that saved
+  every register with them returned with its working registers in its
+  caller's state.
+- **`rep movs` into the hardware aperture used host `memcpy` (#170)** — whose
+  vector loads skip the element-sized accesses trapped device memory needs.
+  Device, crossing, overlapping and backward copies now go element by element.
+- **A failed indirect call popped the caller's arguments twice (#169)** — the
+  failure path rewound over them and the caller's `add esp, N` removed them
+  again, leaving ESP 4+N too high.
+- **Closing a directory mid-search leaked the host search (#171)** — and a
+  later handle with the same value continued the old cursor.
+- **Manual entry hooks (#168)** — `sub_XXXXXXXX_enter()` in the manual file
+  runs at the top of the generated function on every call, direct ones
+  included, and boundary repair leaves that start alone.
+
+### Leonardo Valdes Arteaga — [@eolandro](https://github.com/eolandro)
+- **The runtime did not build with GCC on Linux (#172)** — the VEH code
+  needed real `EXCEPTION_POINTERS`/`CONTEXT` shapes and `EXCEPTION_SINGLE_STEP`,
+  and the view-length helpers were declared only for macOS. Found and fixed on
+  Debian with GCC 12.
 
 ---
 
