@@ -470,10 +470,8 @@ RECOMP_TLS uint32_t g_xbox_kernel_caller;
  *   PXBOX_SYSTEM_ROUTINE StartRoutine  // arg9: Xbox function pointer
  * )
  *
- * For static recompilation, we don't create a real thread.
- * Instead we call the StartRoutine synchronously via RECOMP_ICALL.
- * This is correct because on Xbox, the entry point creates a system
- * thread and returns, and the thread runs the actual game.
+ * The first unsuspended thread may run inline; workers and suspended threads
+ * use host threads with their own guest registers and stack.
  */
 static int g_thread_call_count = 0;
 
@@ -550,7 +548,8 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 }
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
-                                  uint32_t ctx2, uint32_t stack_top)
+                                  uint32_t ctx2, uint32_t stack_top,
+                                  BOOL suspended, DWORD *thread_id)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
@@ -558,7 +557,8 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
 
-    th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
+    th = CreateThread(NULL, 0, bridge_thread_main, s,
+                      suspended ? CREATE_SUSPENDED : 0, thread_id);
     if (!th) free(s);
     /* Record the game thread so a host-tick-driven title's watchdog can sample
      * it via xbox_thread_debug_handle. Harmless for default-model titles: they
@@ -585,13 +585,15 @@ void xbox_SetThreadMode(int mode) { g_thread_mode = mode; }
 static void bridge_PsCreateSystemThreadEx(void)
 {
     uint32_t xbox_handle_ptr = STACK_ARG(0);
+    uint32_t thread_id_ptr   = STACK_ARG(4);
     uint32_t start_context1  = STACK_ARG(5);
     uint32_t start_context2  = STACK_ARG(6);
+    BOOL create_suspended   = (BOOLEAN)STACK_ARG(7) != FALSE;
     uint32_t start_routine   = STACK_ARG(9);
     /* In SPAWN mode there is no privileged "first call": every thread is real,
      * so the entry can return. In INLINE mode the first call runs the game. */
     int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
-                        && (g_thread_call_count == 0);
+                        && (g_thread_call_count == 0) && !create_suspended;
     g_thread_call_count++;
 
     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X ctx1=0x%08X ctx2=0x%08X\n",
@@ -619,6 +621,8 @@ static void bridge_PsCreateSystemThreadEx(void)
         if (!fn) fn = recomp_lookup_manual(start_routine);
         if (fn) {
             if (is_first_call) {
+                if (thread_id_ptr)
+                    BRIDGE_MEM32(thread_id_ptr) = GetCurrentThreadId();
                 /* Main game thread: run directly, inheriting register state */
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
@@ -651,7 +655,7 @@ static void bridge_PsCreateSystemThreadEx(void)
                 const char *inline_workers = getenv("RECOMP_WORKERS");
                 uint32_t stack_top;
 
-                if (inline_workers && !strcmp(inline_workers, "inline")) {
+                if (!create_suspended && inline_workers && !strcmp(inline_workers, "inline")) {
                     fprintf(stderr, "  [KERNEL] RECOMP_WORKERS=inline: running "
                             "worker 0x%08X on this thread\n", start_routine);
                     fflush(stderr);
@@ -662,14 +666,31 @@ static void bridge_PsCreateSystemThreadEx(void)
                 stack_top = xbox_AllocThreadStack();
 
                 if (!stack_top) {
+                    if (create_suspended) {
+                        fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: "
+                                "cannot allocate stack for suspended thread\n");
+                        if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr) = 0;
+                        g_eax = (uint32_t)STATUS_INSUFFICIENT_RESOURCES;
+                        return;
+                    }
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: out of "
                             "thread stacks, running worker 0x%08X inline\n",
                             start_routine);
                     fflush(stderr);
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
+                    DWORD thread_id = 0;
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top,
+                                                    create_suspended, &thread_id);
+                    if (!th) {
+                        fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: "
+                                "CreateThread failed (error %lu)\n", GetLastError());
+                        xbox_FreeThreadStack(stack_top);
+                        if (xbox_handle_ptr) BRIDGE_MEM32(xbox_handle_ptr) = 0;
+                        g_eax = (uint32_t)STATUS_INSUFFICIENT_RESOURCES;
+                        return;
+                    }
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -677,6 +698,8 @@ static void bridge_PsCreateSystemThreadEx(void)
                     if (xbox_handle_ptr && th) {
                         bridge_write_handle(xbox_handle_ptr, th);
                     }
+                    if (thread_id_ptr)
+                        BRIDGE_MEM32(thread_id_ptr) = thread_id;
                 }
             }
         } else {
@@ -1780,6 +1803,8 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     (void)wait_mode;
     HANDLE   handles[MAXIMUM_WAIT_OBJECTS];
     uint32_t i;
+    int log_wait = 0;
+    DWORD wait_started = 0;
 
     if (count == 0 || count > MAXIMUM_WAIT_OBJECTS || !handles_va) {
         g_eax = 0xC000000Du;             /* STATUS_INVALID_PARAMETER */
@@ -1791,8 +1816,14 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     {
         static int logged;
         if (logged++ < 20) {
+            log_wait = 1;
+            wait_started = GetTickCount();
             fprintf(stderr, "  [KERNEL] NtWaitForMultipleObjectsEx: count=%u type=%u timeout=%s\n",
                     count, wait_type, timeout_ptr ? "finite" : "INFINITE");
+            if (timeout_ptr)
+                fprintf(stderr, "      timeout_100ns=%lld caller=0x%08X tid=%lu\n",
+                        *(LONGLONG *)XBOX_TO_NATIVE(timeout_ptr),
+                        g_xbox_kernel_caller, GetCurrentThreadId());
             for (i = 0; i < count; i++)
                 fprintf(stderr, "      [%u] token=0x%08X host=%p\n", i,
                         BRIDGE_MEM32(handles_va + i * 4), handles[i]);
@@ -1803,6 +1834,9 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
         count, handles, wait_type, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
+    if (log_wait)
+        fprintf(stderr, "      wait_status=0x%08X elapsed_ms=%lu\n",
+                g_eax, GetTickCount() - wait_started);
 }
 
 /*
@@ -4580,11 +4614,21 @@ static void bridge_NtCreateMutant(void)
  */
 static void bridge_NtReleaseMutant(void)
 {
+    uint32_t token = STACK_ARG(0);
     uint32_t count_va = STACK_ARG(1);
+    HANDLE handle = bridge_resolve_handle(token);
+    NTSTATUS status = xbox_NtReleaseMutant(
+        handle, count_va ? (PLONG)XBOX_TO_NATIVE(count_va) : NULL);
 
-    g_eax = (uint32_t)xbox_NtReleaseMutant(
-        bridge_resolve_handle(STACK_ARG(0)),
-        count_va ? (PLONG)XBOX_TO_NATIVE(count_va) : NULL);
+    if (status < 0) {
+        fprintf(stderr, "  [MUTANT] release failed: token=0x%08X handle=%p "
+                "status=0x%08X tid=%lu caller=0x%08X esp=0x%08X "
+                "return=0x%08X\n",
+                token, handle, (uint32_t)status, GetCurrentThreadId(),
+                g_xbox_kernel_caller, g_esp,
+                bridge_va_mapped(g_esp + 8, 4) ? BRIDGE_MEM32(g_esp + 8) : 0);
+    }
+    g_eax = (uint32_t)status;
 }
 
 /* -- NtSuspendThread (ordinal 231, 2 args) --------------------------------
@@ -8177,7 +8221,8 @@ static void bridge_PsCreateSystemThread(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top,
+                                                    FALSE, NULL);
                     if (xbox_handle_ptr && th)
                         bridge_write_handle(xbox_handle_ptr, th);
                 }

@@ -186,6 +186,16 @@ xbox_path_init("Burnout 3 Takedown", "saves");
 
 Xbox threads use `PsCreateSystemThreadEx` with NT-style parameters. We create Win32 threads with a wrapper that sets up the register context:
 
+The bridge honors `CreateSuspended`, including on its first call and when
+inline-worker diagnostics are requested. Suspended threads do not execute guest
+code until resumed, allowing the title to initialize their mutexes and events.
+Spawned threads return their host thread ID through the guest output pointer.
+`tests/kernel_thread_creation` covers suspension, resume counts, context
+arguments, initialization ordering and ordinary unsuspended workers.
+
+Failed `NtReleaseMutant` calls also report the guest token, resolved handle,
+thread ID and guest caller in the diagnostic output.
+
 ```c
 // The kernel bridge creates a thread that:
 // 1. Looks up the start routine via recomp_lookup()
