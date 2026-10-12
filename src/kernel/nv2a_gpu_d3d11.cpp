@@ -408,10 +408,8 @@ static std::vector<DepthSurface> depth_surfaces;
 static uint64_t surface_use_serial;
 static uint64_t target_content_serial;
 static std::vector<CachedTexture> textures;
-/* Bind-time lookup: every texture bind used to scan the whole cache comparing
- * key fields. Guest addresses identify a texture, so index by source and fall
- * back to the linear scan only when the key fields differ. Rebuilt whenever the
- * cache size changes (creates and the rare eviction). */
+/* Bind-time lookup is limited to entries with the same guest source address.
+ * Rebuild after insertion, even when eviction keeps the cache size unchanged. */
 static std::unordered_multimap<const void *, size_t> texture_index_by_source;
 static size_t texture_index_count = (size_t)-1;
 static void rebuild_texture_index()
@@ -2434,6 +2432,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         gpu_timing.texture_evicted++;
     }
     textures.push_back(std::move(entry));
+    texture_index_count = (size_t)-1;
     gpu_timing.texture_cache_entries = textures.size();
     gpu_timing.texture_cache_bytes = cache_bytes;
     return textures.back().view.Get();

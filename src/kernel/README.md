@@ -71,6 +71,20 @@ automatic `RECOMP_ABI_CHECK` instrumentation is disabled. Guest audio code
 can use the recursive `xbox_GuestAudioGuardEnter`/`Leave` API; audio interrupt
 delivery uses `TryEnter` to defer callbacks while the guest holds the guard.
 
+Guest IRQL is thread-local because guest threads execute concurrently on host
+threads. Kernel raises return only the calling thread's previous level, and
+`fs:[0x24]` reflects that same level. Interrupt delivery remains gated by all
+raised guest threads and active host ISR/DPC dispatchers; lowering one thread
+must not release another thread's gate. Worker return and termination paths
+release any remaining IRQL contribution. The `tests/kernel_irql_abi` regression
+covers overlapping raises/lowers, fastcall argument handling, ISR restoration,
+and thread-exit cleanup.
+
+`RECOMP_HEAP_RECLAIM=1` enables reuse of freed heap and contiguous allocations;
+`0` disables it. Titles that load and unload scenes should enable it before
+runtime initialization, otherwise the contiguous arena remains a bump allocator
+and eventually exhausts its fixed capacity.
+
 ```c
 // Defined in xbox_memory_layout.c, used everywhere
 extern ptrdiff_t g_xbox_mem_offset;  // Add to Xbox VA → get native pointer

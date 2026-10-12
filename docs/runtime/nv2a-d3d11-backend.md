@@ -424,6 +424,9 @@ remain the invalidation authority. Same-address textures with different
 pitch, mip count, cube layout or source extent retain separate cache entries.
 FIFO eviction uses 1024 entries and a 256MiB resource-plus-snapshot threshold;
 a single oversized entry may exceed the byte threshold.
+The source-address lookup index must be invalidated after insertion, even
+when eviction leaves the entry count unchanged. Otherwise shifted vector
+indices cause resident textures to miss and be recreated on subsequent binds.
 
 Resource reuse must preserve synchronization, surface publication and draw
 work. Measure creation, upload and publication costs separately when
@@ -471,6 +474,16 @@ sources and that the executable matches the configuration being tested.
 Compare displayed frames with reference output using equivalent guest state.
 Exercise index/chunk boundaries, primitive types, texture layouts and shader
 combinations independently.
+
+The headless Windows texture-cache regression uses a D3D11 WARP device and
+the production lookup/upload implementation. It checks resident SRV reuse
+after 64 full-cache evictions and reads back changed guest pixels:
+
+```powershell
+cmake -S .\tests\nv2a_texture_cache -B .\build-xr\nv2a-texture-cache -A x64
+cmake --build .\build-xr\nv2a-texture-cache --config Release
+ctest --test-dir .\build-xr\nv2a-texture-cache -C Release --output-on-failure
+```
 
 ### Framebuffer Capture
 

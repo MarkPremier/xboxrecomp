@@ -3373,8 +3373,10 @@ static SRWLOCK g_heap_lock = SRWLOCK_INIT;
 int xbox_HeapReclaimEnabled(void)
 {
     static int on = -1;
-    if (on < 0)
-        on = getenv("RECOMP_HEAP_RECLAIM") != NULL;
+    if (on < 0) {
+        const char *value = getenv("RECOMP_HEAP_RECLAIM");
+        on = value && *value && strcmp(value, "0") != 0;
+    }
     return on;
 }
 

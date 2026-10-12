@@ -537,6 +537,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
     guest_cpu_join();
     bridge_run_thread_inline(fn, ctx1, ctx2);
+    xbox_IrqlThreadExit();
     guest_cpu_part();
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
@@ -2034,6 +2035,7 @@ static void bridge_PsTerminateSystemThread(void)
         /* The normal exit for a worker, and therefore the one that has to
          * return the stack -- ExitThread never comes back to bridge_thread_main
          * to do it. */
+        xbox_IrqlThreadExit();
         xbox_FreeThreadStack(g_thread_stack_top);
         g_thread_stack_top = 0;
         ExitThread(exit_status);

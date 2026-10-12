@@ -33,42 +33,50 @@
  *   APC_LEVEL (1) - APC delivery
  *   DISPATCH_LEVEL (2) - scheduler/DPC level, no page faults allowed
  *
- * On Windows, we simulate IRQL with a single processor-wide variable. The
- * console has one processor, so every guest thread shares one IRQL and every
- * device model reads the same one. A per-thread model lets a guest thread
- * lower IRQL against a level another thread raised, read its own stale
- * PASSIVE_LEVEL, and make the lower look like a raise -- the raised-count
- * that gated every interrupt then climbed and never came back down, so OHCI
- * held the gamepad interrupt off for seconds at a time and input appeared
- * dead. A single level, swapped atomically, can be momentarily wrong under a
- * mismatched pair but can never wedge the gate shut.
+ * Guest threads execute concurrently on host threads. Each needs its own
+ * current level and saved old level, otherwise another thread's raise makes
+ * DirectSound skip a critical section and corrupt its pending lists.
+ * Device models use the aggregate of raised threads, not their own TLS.
  * ============================================================================ */
 
-static volatile LONG g_cpu_irql = PASSIVE_LEVEL;
+static RECOMP_TLS KIRQL t_guest_irql = PASSIVE_LEVEL;
+static volatile LONG g_guest_raised;
+static volatile LONG g_guest_levels[256];
 
 /* A host ISR/DPC thread runs the interrupted work at its own device level,
  * which the guest must never observe: on hardware the dispatcher restores the
  * interrupted IRQL before that thread runs again, so no guest thread can read
  * the ISR's level. Here the device threads run concurrently with guest threads,
- * and swapping the one shared g_cpu_irql let them: a guest KfRaiseIrql(2) that
+ * and sharing the guest's IRQL let them: a guest KfRaiseIrql(2) that
  * landed inside an ISR got 16 back and later lowered to 16 "while at 2" (the
  * gate left shut and 16 written into KPCR), and an IrqlLeaveInterrupt restored
  * its saved level over a raise the guest made meanwhile. The ISR level is kept
- * per host thread; the guest's shared level is left alone, which is also why
- * the shared model below stays. */
+ * per host thread and is not included in the guest-level counters. */
 static RECOMP_TLS int t_isr_irql = -1;   /* this ISR/DPC thread's level; -1 = not in one */
 static volatile LONG g_isr_active;       /* host ISRs/DPCs in flight */
 
 static KIRQL irql_swap(KIRQL v)
 {
     if (t_isr_irql >= 0) { KIRQL o = (KIRQL)t_isr_irql; t_isr_irql = v; return o; }
-    return (KIRQL)InterlockedExchange(&g_cpu_irql, (LONG)v);
+    KIRQL old = t_guest_irql;
+    if (old != v) {
+        if (v >= DISPATCH_LEVEL)
+            InterlockedIncrement(&g_guest_levels[v]);
+        if (old < DISPATCH_LEVEL && v >= DISPATCH_LEVEL)
+            InterlockedIncrement(&g_guest_raised);
+        t_guest_irql = v;
+        if (old >= DISPATCH_LEVEL)
+            InterlockedDecrement(&g_guest_levels[old]);
+        if (old >= DISPATCH_LEVEL && v < DISPATCH_LEVEL)
+            InterlockedDecrement(&g_guest_raised);
+    }
+    return old;
 }
 
 static KIRQL irql_now(void)
 {
     return t_isr_irql >= 0 ? (KIRQL)t_isr_irql
-                           : (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0);
+                           : t_guest_irql;
 }
 
 /* The current IRQL, where guest code reads it: KPCR.Irql, fs:[0x24].
@@ -79,7 +87,7 @@ static KIRQL irql_now(void)
  * wrote that byte, so it read 0 everywhere: DirectSound's DPC took the
  * critical section, blocked against the thread that held it, and the title
  * froze with IRQL raised on the blocked thread. Every change of
- * g_cpu_irql is published here. */
+ * the calling thread's IRQL is published here. */
 extern RECOMP_TLS uint32_t g_fs_base;
 /* The offset lifted code adds to every guest address; host code that reads
  * guest memory on its behalf uses the same one. */
@@ -100,7 +108,7 @@ static void irql_publish(void)
 int xbox_IrqlBlocksInterrupts(void)
 {
     return InterlockedCompareExchange(&g_isr_active, 0, 0) > 0
-        || (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0) >= DISPATCH_LEVEL;
+        || InterlockedCompareExchange(&g_guest_raised, 0, 0) > 0;
 }
 
 /* The current level, for callers that want to report it. A level that stays
@@ -108,7 +116,13 @@ int xbox_IrqlBlocksInterrupts(void)
  * never lowered, not a counter artefact. */
 int xbox_IrqlRaisedCount(void)
 {
-    KIRQL guest = (KIRQL)InterlockedCompareExchange(&g_cpu_irql, 0, 0);
+    KIRQL guest = PASSIVE_LEVEL;
+    for (int level = 255; level >= DISPATCH_LEVEL; --level) {
+        if (InterlockedCompareExchange(&g_guest_levels[level], 0, 0) > 0) {
+            guest = (KIRQL)level;
+            break;
+        }
+    }
     KIRQL isr = InterlockedCompareExchange(&g_isr_active, 0, 0) > 0 ? 16 : 0;
     return (int)(guest > isr ? guest : isr);
 }
@@ -234,7 +248,7 @@ int xbox_IrqlEnterInterrupt(int level)
     KIRQL old;
     if (saved < 0)
         InterlockedIncrement(&g_isr_active);
-    old = saved < 0 ? PASSIVE_LEVEL : (KIRQL)saved;
+    old = saved < 0 ? t_guest_irql : (KIRQL)saved;
     t_isr_irql = level;
     if (old != (KIRQL)level) {
         irql_track(old, (KIRQL)level, IRQL_CALLER());
@@ -246,11 +260,12 @@ int xbox_IrqlEnterInterrupt(int level)
 void xbox_IrqlLeaveInterrupt(int saved)
 {
     KIRQL cur = (KIRQL)t_isr_irql;
+    KIRQL restored = saved < 0 ? t_guest_irql : (KIRQL)saved;
     t_isr_irql = saved;                   /* dispatcher epilogue: restore the interrupted level */
     if (saved < 0)
         InterlockedDecrement(&g_isr_active);
-    if (cur != (KIRQL)(saved < 0 ? PASSIVE_LEVEL : saved)) {
-        irql_track(cur, saved < 0 ? PASSIVE_LEVEL : (KIRQL)saved, IRQL_CALLER());
+    if (cur != restored) {
+        irql_track(cur, restored, IRQL_CALLER());
         irql_publish();
     }
 }
@@ -283,14 +298,7 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
     KIRQL requested = NewIrql;
     KIRQL cur = irql_now();
 
-    /* A lower must never raise. The guest IRQL is a single shared level while
-     * guest threads run concurrently on different host cores, so a thread
-     * whose own lowering arrives late can set a level *above* the current one
-     * (its saved "old" was another thread's raise). That wedges the shared
-     * value at DISPATCH_LEVEL: xbox_IrqlBlocksInterrupts() then holds off the
-     * APU interrupt forever and DirectSound's lock stops protecting its voice
-     * lists, so one-shot effects/voices disappear. Clamp instead.
-     * ponytail: clamp is a patch; a per-thread guest IRQL is the real fix. */
+    /* Invalid lowers must not raise the calling thread's level. */
     if (NewIrql > cur)
         NewIrql = cur;
 
@@ -314,6 +322,15 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
         irql_track(old, NewIrql, IRQL_CALLER());
     }
     irql_publish();
+}
+
+void xbox_IrqlThreadExit(void)
+{
+    if (t_guest_irql != PASSIVE_LEVEL) {
+        fprintf(stderr, "  [IRQLWARN] thread %lu exited at IRQL %u; releasing its interrupt gate\n",
+                GetCurrentThreadId(), (unsigned)t_guest_irql);
+        xbox_KfLowerIrql(PASSIVE_LEVEL);
+    }
 }
 
 /*
