@@ -375,6 +375,41 @@ static unsigned long long g_ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
  * lines through the shared stderr lock -- the frame rate fell to ~1 FPS. */
 static long long g_kernel_call_count = 0;
 
+static INIT_ONCE g_audio_guard_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION g_audio_guard;
+
+static BOOL CALLBACK kernel_audio_guard_init(PINIT_ONCE once, PVOID parameter,
+                                             PVOID *context)
+{
+    (void)once; (void)parameter; (void)context;
+    if (!InitializeCriticalSectionEx(&g_audio_guard, 0, 0)) {
+        fprintf(stderr, "  [AUDIO] Cannot initialize guest audio guard: error %lu\n",
+                GetLastError());
+        fflush(stderr);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+void xbox_GuestAudioGuardEnter(void)
+{
+    if (!InitOnceExecuteOnce(&g_audio_guard_once, kernel_audio_guard_init, NULL, NULL))
+        _Exit(EXIT_FAILURE);
+    EnterCriticalSection(&g_audio_guard);
+}
+
+int xbox_GuestAudioGuardTryEnter(void)
+{
+    if (!InitOnceExecuteOnce(&g_audio_guard_once, kernel_audio_guard_init, NULL, NULL))
+        _Exit(EXIT_FAILURE);
+    return TryEnterCriticalSection(&g_audio_guard) != FALSE;
+}
+
+void xbox_GuestAudioGuardLeave(void)
+{
+    LeaveCriticalSection(&g_audio_guard);
+}
+
 /* How many kernel calls get logged before the log goes quiet.
  *
  * The cap keeps a title that makes thousands of calls from burying the
@@ -2263,10 +2298,15 @@ static int kernel_raise_interrupt(uint32_t vector)
     if (!fn)
         return -1;
 
+    if (vector == 5u && !xbox_GuestAudioGuardTryEnter())
+        return -2;
+
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    if (vector == 5u)
+        xbox_GuestAudioGuardLeave();
     return (int)(g_eax & 1u);
 }
 

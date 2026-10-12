@@ -18,9 +18,19 @@ static int failures;
 uint32_t g_xbox_image_lo, g_xbox_image_hi;
 size_t g_xbox_total_ram = sizeof memory;
 size_t g_xbox_map_size;
+void (*g_xbox_path_hook)(const char *xbox_path);
+unsigned long long g_cba_calls, g_cba_iters;
 
 ptrdiff_t xbox_GetMemoryOffset(void) { return (ptrdiff_t)memory; }
 uint32_t xbox_ContiguousAllocatedBytes(void) { return 0; }
+int xbox_ContigBlockCount(void) { return 0; }
+int xbox_ContiguousOwnsHead(uint32_t offset) { (void)offset; return 0; }
+int xbox_ContigApuOwned(uint32_t offset) { (void)offset; return 0; }
+int xbox_ApuContigTouched(uint32_t physical) { (void)physical; return 0; }
+int xbox_DmaBankOf(uint64_t physical) { (void)physical; return 0; }
+int xbox_ContigOwnsOffset(uint64_t physical) { (void)physical; return 0; }
+uint32_t xbox_HeapBlockSize(uint32_t guest_va) { (void)guest_va; return 0; }
+void xbox_DumpArenas(uint32_t address, uint32_t count) { (void)address; (void)count; }
 uint32_t xbox_ContiguousBlockSize(uint32_t guest_va)
 {
     (void)guest_va;
@@ -55,6 +65,14 @@ void xbox_Nv2aSoftwareMethodReport(void)
 {
     /* No guest software callbacks are registered by this harness. */
 }
+int xbox_Nv2aSoftwareMethodDeferred(uint32_t parameter, uint32_t depth_clear,
+                                   uint32_t color_clear)
+{
+    return xbox_Nv2aSoftwareMethod(parameter, depth_clear, color_clear);
+}
+int xbox_Nv2aSoftwareMethodPending(void) { return 0; }
+void xbox_Nv2aAcknowledgeHandshakes(void) {}
+void xbox_Nv2aFlipPacingReport(void) {}
 void xbox_FramebufferWindowSet(uint32_t address, uint32_t pitch) { (void)address; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowPresent(uint32_t address, uint32_t pitch) { (void)address; (void)pitch; }

@@ -32,7 +32,7 @@ extern "C" void xbox_Nv2aAcknowledgeHandshakes(void);
  * kernel_path.c invokes g_xbox_path_hook for every opened Xbox path; install a
  * hook that edge-latches a "[CLOAK] active" log line a test can wait for. */
 extern "C" void xbox_CloakMarker(const char *what);
-extern void (*g_xbox_path_hook)(const char *xbox_path);
+extern "C" void (*g_xbox_path_hook)(const char *xbox_path);
 
 static void nv2a_cloak_path_hook(const char *xbox_path)
 {

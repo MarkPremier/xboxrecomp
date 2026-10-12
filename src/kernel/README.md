@@ -64,6 +64,13 @@ for (int i = 1; i < 28; i++)
 
 ### Global State
 
+Host diagnostic code must serialize DbgHelp calls (including `SymInitialize`
+and `SymFromAddr`) with the exported `g_xbox_debug_symbols_lock` SRW lock.
+`recomp_abi_violation_log` is available for explicit diagnostics even when
+automatic `RECOMP_ABI_CHECK` instrumentation is disabled. Guest audio code
+can use the recursive `xbox_GuestAudioGuardEnter`/`Leave` API; audio interrupt
+delivery uses `TryEnter` to defer callbacks while the guest holds the guard.
+
 ```c
 // Defined in xbox_memory_layout.c, used everywhere
 extern ptrdiff_t g_xbox_mem_offset;  // Add to Xbox VA → get native pointer

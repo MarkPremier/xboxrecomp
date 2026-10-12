@@ -122,6 +122,9 @@ Every Xbox game has its own asset formats. If you reverse-engineer a texture for
 - **C11** standard, targeting MSVC (Visual Studio 2022).
 - **No external dependencies** for the runtime libraries. Everything needed is either in the Windows SDK or self-contained in this repo.
 - Use `stdint.h` types (`uint32_t`, `int16_t`, etc.) rather than platform-specific types.
+- Keep runtime C portable to MSVC: use explicit bounds checks rather than GNU
+  `case low ... high` ranges, and `size_t` for buffer capacities rather than
+  the POSIX-only `ssize_t`.
 - 4-space indentation, no tabs.
 - Function names: `xbox_ModuleName_FunctionName` for public APIs, `snake_case` for internal helpers.
 - Comments: explain *why*, not *what*. The code should be readable on its own.

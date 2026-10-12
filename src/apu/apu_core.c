@@ -76,6 +76,19 @@ extern size_t g_xbox_total_ram, g_xbox_map_size;
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
+    return mcpx_apu_ram_address(addr, 1);
+}
+
+uint8_t *mcpx_apu_ram_address(uint64_t addr, uint32_t bytes)
+{
+    if (g_state && g_state->physical_mapper) {
+        uint8_t *pointer = g_state->physical_mapper(addr, bytes);
+        if (pointer)
+            return pointer;
+        fprintf(stderr, "[APU] unmapped DMA address 0x%llX + %u\n",
+                (unsigned long long)addr, bytes);
+        abort();
+    }
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
     size_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
@@ -143,6 +156,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
     static int tib_ready;
     static unsigned held_off;
     uint32_t kint, routine, context;
+    uint8_t *guest_ram = (uint8_t *)(uintptr_t)xbox_GetMemoryOffset();
     apu_guest_fn fn;
     int slot;
 
@@ -154,8 +168,8 @@ static void apu_deliver_irq(MCPXAPUState *d)
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
         return;
-    routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
-    context = *(uint32_t *)(g_apu_ram_ptr + kint + 4);
+    routine = *(uint32_t *)(guest_ram + kint + 0);
+    context = *(uint32_t *)(guest_ram + kint + 4);
     fn = routine ? recomp_lookup(routine) : NULL;
     if (!fn)
         return;
@@ -171,12 +185,18 @@ static void apu_deliver_irq(MCPXAPUState *d)
         return;
 
     qemu_mutex_unlock(&d->lock);
+    if (!xbox_GuestAudioGuardTryEnter()) {
+        xbox_worker_stack_free(slot);
+        qemu_mutex_lock(&d->lock);
+        return;
+    }
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
-    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
-    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
-    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
+    g_esp -= 4; *(uint32_t *)(guest_ram + g_esp) = context;
+    g_esp -= 4; *(uint32_t *)(guest_ram + g_esp) = kint;
+    g_esp -= 4; *(uint32_t *)(guest_ram + g_esp) = 0xDEADBEEFu;
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    xbox_GuestAudioGuardLeave();
     xbox_worker_stack_free(slot);
     qemu_mutex_lock(&d->lock);
 
@@ -729,6 +749,12 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
 
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
 {
+    return mcpx_apu_init_standalone_mapped(ram_ptr, NULL);
+}
+
+MCPXAPUState *mcpx_apu_init_standalone_mapped(
+    uint8_t *ram_ptr, APUPhysicalMemoryMapper mapper)
+{
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(MCPXAPUState));
     if (!d) {
         fprintf(stderr, "[APU] Failed to allocate MCPXAPUState\n");
@@ -738,6 +764,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     g_apu_ram_ptr = ram_ptr;
     g_state = d;
     d->ram_ptr = ram_ptr;
+    d->physical_mapper = mapper;
 
     d->set_irq = false;
     d->exiting = false;

@@ -23,6 +23,7 @@
 
 #include "apu_shim.h"
 #include "apu_regs.h"
+#include "apu.h"
 #include "apu_debug.h"
 
 /* ============================================================
@@ -377,6 +378,7 @@ struct MCPXAPUState {
 
     MemoryRegion *ram;
     uint8_t *ram_ptr;
+    APUPhysicalMemoryMapper physical_mapper;
     MemoryRegion mmio;
 
     MCPXAPUVPState vp;

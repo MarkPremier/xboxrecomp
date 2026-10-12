@@ -48,7 +48,7 @@ extern "C" {
 #define XBOX_DEVKIT_RAM         (128 * 1024 * 1024) /* 128 MB (debug kit) */
 #define XBOX_GPU_RESERVED       (4 * 1024 * 1024)   /* ~4 MB for GPU */
 #define XBOX_MCPX_BASE          0xFE800000u
-#define XBOX_MCPX_APU_MMIO_END  0xFE830000u
+#define XBOX_MCPX_APU_MMIO_END  0xFE880000u
 #define XBOX_MCPX_APU_MMIO_SIZE (XBOX_MCPX_APU_MMIO_END - XBOX_MCPX_BASE)
 
 /* Actual mapped RAM for this run. Defaults to XBOX_DEVKIT_RAM (128 MB) for this
@@ -258,6 +258,8 @@ void *xbox_GetMemoryBase(void);
  * Returns 0 if memory is mapped at original Xbox addresses (ideal case).
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
+/* DbgHelp is process-global and not thread-safe; serialize all symbol calls. */
+extern SRWLOCK g_xbox_debug_symbols_lock;
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);

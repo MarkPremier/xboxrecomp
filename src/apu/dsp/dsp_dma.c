@@ -203,7 +203,7 @@ static void dsp_dma_run(DSPDMAState *s)
 
         // FIXME: Remove this intermediate buffer
         static uint8_t *scratch_buf = NULL;
-        static ssize_t scratch_buf_size = -1;
+        static size_t scratch_buf_size = 0;
         if (count * item_size > scratch_buf_size) {
             scratch_buf_size = count * item_size;
             scratch_buf = malloc(scratch_buf_size);
@@ -366,4 +366,3 @@ void dsp_dma_write(DSPDMAState *s, DSPDMARegister reg, uint32_t v)
         assert(!"Invalid dma write register");
     }
 }
-

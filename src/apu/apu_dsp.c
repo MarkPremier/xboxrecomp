@@ -6,9 +6,9 @@
  *  - The real GP/EP DSP56300 pipeline, ported verbatim from xemu under
  *    dsp/. VP mixbins are written into the GP mix buffer, the GP and EP
  *    programs run, and the EP output fifo is sunk into the monitor frame
- *    buffer. Selected with RECOMP_APU_DSP=1.
+ *    buffer. Enabled by default; selected with RECOMP_APU_DSP=1.
  *
- *  - A passthrough stub (default). VP mixbins are mixed straight down to
+ *  - A passthrough stub (RECOMP_APU_DSP=0). VP mixbins are mixed straight down to
  *    the monitor buffer. DirectSound command doorbells are acknowledged by
  *    RECOMP_APU_DSP_ACK rather than by a running DSP program.
  *
@@ -36,6 +36,13 @@
 #include <inttypes.h>
 
 extern uint8_t *xbox_ApuPhysicalPointer(uint64_t physical, uint32_t bytes);
+
+static uint8_t *dsp_ram_address(uint64_t physical, uint32_t bytes)
+{
+    if (g_state && g_state->physical_mapper)
+        return mcpx_apu_ram_address(physical, bytes);
+    return xbox_ApuPhysicalPointer(physical, bytes);
+}
 
 /* ── Engine selection ────────────────────────────────────────────────────
  *
@@ -141,7 +148,7 @@ void mcpx_apu_dsp_ack_frame(MCPXAPUState *d)
             if (!base) continue;
             physical = (uint64_t)base + (s_dsp_ack[i].offset & 0xFFFu);
         }
-        volatile uint32_t *slot = (volatile uint32_t *)xbox_ApuPhysicalPointer(physical, 4);
+        volatile uint32_t *slot = (volatile uint32_t *)dsp_ram_address(physical, 4);
         if (*slot) {
             static int shown[APU_DSP_ACK_MAX];
             if (shown[i]++ < 3)
@@ -163,8 +170,10 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
 bool mcpx_apu_diagnostics_enabled(void)
 {
     static int enabled = -1;
-    if (enabled < 0)
-        enabled = getenv("RECOMP_APU_DIAG") != NULL;
+    if (enabled < 0) {
+        const char *setting = getenv("RECOMP_APU_DIAG");
+        enabled = setting && strcmp(setting, "0") != 0;
+    }
     return enabled != 0;
 }
 
@@ -294,7 +303,7 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
     while (len > 0) {
         uint32_t prd_address = ldl_le_phys(address_space_memory,
                                            sge_base + page_entry * 8 + 0);
-        uint8_t *guest = xbox_ApuPhysicalPointer(prd_address + offset_in_page,
+        uint8_t *guest = dsp_ram_address(prd_address + offset_in_page,
                                                  TARGET_PAGE_SIZE);
 
         /* Diagnostic: force DSP payload writes to ordinary RAM instead of the
@@ -364,7 +373,7 @@ static uint32_t circular_scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
         }
 
         DPRINTF("circular scatter gather %s in range 0x%x - 0x%x at 0x%x of "
-                "length 0x%x / 0x%lx bytes\n",
+                "length 0x%x / 0x%zx bytes\n",
                 dir ? "write" : "read", base, end, cur, bytes_to_copy, len);
 
         assert((cur >= base) && ((cur + bytes_to_copy) <= end));
@@ -508,32 +517,22 @@ uint64_t mcpx_apu_gp_read(void *opaque, hwaddr addr, unsigned int size)
     assert(addr % 4 == 0);
 
     uint64_t r = 0;
-    switch (addr) {
-    case NV_PAPU_GPXMEM ... NV_PAPU_GPXMEM + 0x1000 * 4 - 1: {
+    if (addr >= NV_PAPU_GPXMEM && addr < NV_PAPU_GPXMEM + 0x1000 * 4) {
         uint32_t xaddr = (addr - NV_PAPU_GPXMEM) / 4;
         r = dsp_read_memory(d->gp.dsp, 'X', xaddr);
-        break;
-    }
-    case NV_PAPU_GPMIXBUF ... NV_PAPU_GPMIXBUF + 0x400 * 4 - 1: {
+    } else if (addr >= NV_PAPU_GPMIXBUF && addr < NV_PAPU_GPMIXBUF + 0x400 * 4) {
         uint32_t xaddr = (addr - NV_PAPU_GPMIXBUF) / 4;
         r = dsp_read_memory(d->gp.dsp, 'X', GP_DSP_MIXBUF_BASE + xaddr);
-        break;
-    }
-    case NV_PAPU_GPYMEM ... NV_PAPU_GPYMEM + 0x800 * 4 - 1: {
+    } else if (addr >= NV_PAPU_GPYMEM && addr < NV_PAPU_GPYMEM + 0x800 * 4) {
         uint32_t yaddr = (addr - NV_PAPU_GPYMEM) / 4;
         r = dsp_read_memory(d->gp.dsp, 'Y', yaddr);
-        break;
-    }
-    case NV_PAPU_GPPMEM ... NV_PAPU_GPPMEM + 0x1000 * 4 - 1: {
+    } else if (addr >= NV_PAPU_GPPMEM && addr < NV_PAPU_GPPMEM + 0x1000 * 4) {
         uint32_t paddr = (addr - NV_PAPU_GPPMEM) / 4;
         r = dsp_read_memory(d->gp.dsp, 'P', paddr);
-        break;
-    }
-    default:
+    } else {
         r = d->gp.regs[addr];
-        break;
     }
-    DPRINTF("mcpx apu GP: read [0x%" HWADDR_PRIx "] -> 0x%lx\n", addr, r);
+    DPRINTF("mcpx apu GP: read [0x%" HWADDR_PRIx "] -> 0x%" PRIx64 "\n", addr, r);
 
     return r;
 }
@@ -545,36 +544,25 @@ void mcpx_apu_gp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int siz
     assert(size == 4);
     assert(addr % 4 == 0);
 
-    DPRINTF("mcpx apu GP: [0x%" HWADDR_PRIx "] = 0x%lx\n", addr, val);
+    DPRINTF("mcpx apu GP: [0x%" HWADDR_PRIx "] = 0x%" PRIx64 "\n", addr, val);
 
-    switch (addr) {
-    case NV_PAPU_GPXMEM ... NV_PAPU_GPXMEM + 0x1000 * 4 - 1: {
+    if (addr >= NV_PAPU_GPXMEM && addr < NV_PAPU_GPXMEM + 0x1000 * 4) {
         uint32_t xaddr = (addr - NV_PAPU_GPXMEM) / 4;
         dsp_write_memory(d->gp.dsp, 'X', xaddr, val);
-        break;
-    }
-    case NV_PAPU_GPMIXBUF ... NV_PAPU_GPMIXBUF + 0x400 * 4 - 1: {
+    } else if (addr >= NV_PAPU_GPMIXBUF && addr < NV_PAPU_GPMIXBUF + 0x400 * 4) {
         uint32_t xaddr = (addr - NV_PAPU_GPMIXBUF) / 4;
         dsp_write_memory(d->gp.dsp, 'X', GP_DSP_MIXBUF_BASE + xaddr, val);
-        break;
-    }
-    case NV_PAPU_GPYMEM ... NV_PAPU_GPYMEM + 0x800 * 4 - 1: {
+    } else if (addr >= NV_PAPU_GPYMEM && addr < NV_PAPU_GPYMEM + 0x800 * 4) {
         uint32_t yaddr = (addr - NV_PAPU_GPYMEM) / 4;
         dsp_write_memory(d->gp.dsp, 'Y', yaddr, val);
-        break;
-    }
-    case NV_PAPU_GPPMEM ... NV_PAPU_GPPMEM + 0x1000 * 4 - 1: {
+    } else if (addr >= NV_PAPU_GPPMEM && addr < NV_PAPU_GPPMEM + 0x1000 * 4) {
         uint32_t paddr = (addr - NV_PAPU_GPPMEM) / 4;
         dsp_write_memory(d->gp.dsp, 'P', paddr, val);
-        break;
-    }
-    case NV_PAPU_GPRST:
+    } else if (addr == NV_PAPU_GPRST) {
         proc_rst_write(d->gp.dsp, d->gp.regs[NV_PAPU_GPRST], val);
         d->gp.regs[NV_PAPU_GPRST] = val;
-        break;
-    default:
+    } else {
         d->gp.regs[addr] = val;
-        break;
     }
 }
 
@@ -587,27 +575,19 @@ uint64_t mcpx_apu_ep_read(void *opaque, hwaddr addr, unsigned int size)
     assert(addr % 4 == 0);
 
     uint64_t r = 0;
-    switch (addr) {
-    case NV_PAPU_EPXMEM ... NV_PAPU_EPXMEM + 0xC00 * 4 - 1: {
+    if (addr >= NV_PAPU_EPXMEM && addr < NV_PAPU_EPXMEM + 0xC00 * 4) {
         uint32_t xaddr = (addr - NV_PAPU_EPXMEM) / 4;
         r = dsp_read_memory(d->ep.dsp, 'X', xaddr);
-        break;
-    }
-    case NV_PAPU_EPYMEM ... NV_PAPU_EPYMEM + 0x100 * 4 - 1: {
+    } else if (addr >= NV_PAPU_EPYMEM && addr < NV_PAPU_EPYMEM + 0x100 * 4) {
         uint32_t yaddr = (addr - NV_PAPU_EPYMEM) / 4;
         r = dsp_read_memory(d->ep.dsp, 'Y', yaddr);
-        break;
-    }
-    case NV_PAPU_EPPMEM ... NV_PAPU_EPPMEM + 0x1000 * 4 - 1: {
+    } else if (addr >= NV_PAPU_EPPMEM && addr < NV_PAPU_EPPMEM + 0x1000 * 4) {
         uint32_t paddr = (addr - NV_PAPU_EPPMEM) / 4;
         r = dsp_read_memory(d->ep.dsp, 'P', paddr);
-        break;
-    }
-    default:
+    } else {
         r = d->ep.regs[addr];
-        break;
     }
-    DPRINTF("mcpx apu EP: read [0x%" HWADDR_PRIx "] -> 0x%lx\n", addr, r);
+    DPRINTF("mcpx apu EP: read [0x%" HWADDR_PRIx "] -> 0x%" PRIx64 "\n", addr, r);
 
     return r;
 }
@@ -619,32 +599,23 @@ void mcpx_apu_ep_write(void *opaque, hwaddr addr, uint64_t val, unsigned int siz
     assert(size == 4);
     assert(addr % 4 == 0);
 
-    DPRINTF("mcpx apu EP: [0x%" HWADDR_PRIx "] = 0x%lx\n", addr, val);
+    DPRINTF("mcpx apu EP: [0x%" HWADDR_PRIx "] = 0x%" PRIx64 "\n", addr, val);
 
-    switch (addr) {
-    case NV_PAPU_EPXMEM ... NV_PAPU_EPXMEM + 0xC00 * 4 - 1: {
+    if (addr >= NV_PAPU_EPXMEM && addr < NV_PAPU_EPXMEM + 0xC00 * 4) {
         uint32_t xaddr = (addr - NV_PAPU_EPXMEM) / 4;
         dsp_write_memory(d->ep.dsp, 'X', xaddr, val);
-        break;
-    }
-    case NV_PAPU_EPYMEM ... NV_PAPU_EPYMEM + 0x100 * 4 - 1: {
+    } else if (addr >= NV_PAPU_EPYMEM && addr < NV_PAPU_EPYMEM + 0x100 * 4) {
         uint32_t yaddr = (addr - NV_PAPU_EPYMEM) / 4;
         dsp_write_memory(d->ep.dsp, 'Y', yaddr, val);
-        break;
-    }
-    case NV_PAPU_EPPMEM ... NV_PAPU_EPPMEM + 0x1000 * 4 - 1: {
+    } else if (addr >= NV_PAPU_EPPMEM && addr < NV_PAPU_EPPMEM + 0x1000 * 4) {
         uint32_t paddr = (addr - NV_PAPU_EPPMEM) / 4;
         dsp_write_memory(d->ep.dsp, 'P', paddr, val);
-        break;
-    }
-    case NV_PAPU_EPRST:
+    } else if (addr == NV_PAPU_EPRST) {
         proc_rst_write(d->ep.dsp, d->ep.regs[NV_PAPU_EPRST], val);
         d->ep.regs[NV_PAPU_EPRST] = val;
         d->ep_frame_div = 0; /* FIXME: Still unsure about frame sync */
-        break;
-    default:
+    } else {
         d->ep.regs[addr] = val;
-        break;
     }
 }
 

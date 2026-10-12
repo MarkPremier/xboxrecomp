@@ -18,6 +18,8 @@ typedef struct MCPXAPUState MCPXAPUState;
  * Returns the APU state, or NULL on failure. */
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 typedef uint8_t *(*APUPhysicalMemoryMapper)(uint64_t physical, uint32_t bytes);
+/* The mapper resolves complete DMA extents for VP and DSP reads/writes.
+ * A rejected extent is reported and aborts rather than using another bank. */
 MCPXAPUState *mcpx_apu_init_standalone_mapped(
     uint8_t *ram_ptr, APUPhysicalMemoryMapper mapper);
 
