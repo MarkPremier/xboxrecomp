@@ -52,6 +52,22 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
 
+/* The utility drive is the exception to 16 KB. XAPI formats the cache
+ * partition it mounts as Z: with the cluster size the XBE asks for in
+ * InitFlags bits 30-31 (16 KB << n), and re-checks it on every boot against
+ * FileFsSizeInformation. Turok Evolution asks for 64 KB: told 16 KB, it decides
+ * the drive is unformatted, formats it, and reboots to the dashboard -- a clean
+ * HalReturnToFirmware(2) before the title has drawn anything. The header is
+ * mapped at its XBE base, so InitFlags is read from guest memory. */
+extern ptrdiff_t g_xbox_mem_offset;
+#define XBOX_XBE_INIT_FLAGS_VA      0x00010124u
+
+static ULONG xbox_utility_sectors_per_cluster(void)
+{
+    uint32_t flags = *(const uint32_t *)((uintptr_t)XBOX_XBE_INIT_FLAGS_VA + g_xbox_mem_offset);
+    return XBOX_SECTORS_PER_CLUSTER << (flags >> 30);
+}
+
 /* ======================================================================== */
 /* Shared by both backends. kernel_bridge.c calls xbox_LastFileError()
  * unconditionally, so defining it only under _WIN32 leaves every POSIX link
@@ -114,6 +130,49 @@ static DWORD xbox_share_to_win32(ULONG Share)
     return result;
 }
 
+/* Volume handles on a cache partition (3-5), the ones whose cluster size
+ * comes from InitFlags (see xbox_utility_sectors_per_cluster). A volume open
+ * is redirected to the directory holding the image, and every partition's
+ * image lives in the same directory, so the host path cannot tell Partition5
+ * from Partition1 afterwards. NtCreateFile marks the handle while it still
+ * knows; NtClose drops the mark. */
+#define UTILITY_VOLUME_MAX 16
+static HANDLE s_utility_volume[UTILITY_VOLUME_MAX];
+static SRWLOCK s_utility_volume_lock = SRWLOCK_INIT;
+
+static int is_cache_partition_image(const WCHAR *leaf)
+{
+    return _wcsicmp(leaf, L"Partition3.img") == 0
+        || _wcsicmp(leaf, L"Partition4.img") == 0
+        || _wcsicmp(leaf, L"Partition5.img") == 0;
+}
+
+static void utility_volume_mark(HANDLE h)
+{
+    int i;
+    AcquireSRWLockExclusive(&s_utility_volume_lock);
+    for (i = 0; i < UTILITY_VOLUME_MAX; i++)
+        if (!s_utility_volume[i]) { s_utility_volume[i] = h; break; }
+    ReleaseSRWLockExclusive(&s_utility_volume_lock);
+}
+
+/* Returns 1 if h was marked; drop also clears it. */
+static int utility_volume_find(HANDLE h, int drop)
+{
+    int i, was = 0;
+    if (!h || h == INVALID_HANDLE_VALUE)
+        return 0;
+    AcquireSRWLockExclusive(&s_utility_volume_lock);
+    for (i = 0; i < UTILITY_VOLUME_MAX; i++)
+        if (s_utility_volume[i] == h) {
+            if (drop) s_utility_volume[i] = NULL;
+            was = 1;
+            break;
+        }
+    ReleaseSRWLockExclusive(&s_utility_volume_lock);
+    return was;
+}
+
 /* Translate an Xbox OBJECT_ATTRIBUTES path to a Win32 wide path */
 static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
                                WCHAR* win_path, DWORD buf_size)
@@ -144,6 +203,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     WCHAR win_path[MAX_PATH];
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
+    int utility_volume = 0;
     (void)AllocationSize;
 
     if (!FileHandle || !ObjectAttributes)
@@ -171,6 +231,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         !(GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY)) {
         WCHAR *slash = wcsrchr(win_path, L'\\');
         if (slash && slash != win_path) {
+            utility_volume = is_cache_partition_image(slash + 1);
             *slash = 0;
             xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
                      "NtCreateFile: directory open of a device image, "
@@ -223,6 +284,10 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     *FileHandle = h;
+    /* Reused HANDLE values: clear any stale mark before deciding. */
+    utility_volume_find(h, 1);
+    if (utility_volume)
+        utility_volume_mark(h);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -321,6 +386,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        utility_volume_find(Handle, 1);
         xbox_dir_context_drop(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
@@ -519,7 +585,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
+    (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
@@ -527,15 +593,18 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
+            ULONG spc = utility_volume_find(FileHandle, 0)
+                      ? xbox_utility_sectors_per_cluster()
+                      : XBOX_SECTORS_PER_CLUSTER;
             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
-                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+                info->SectorsPerAllocationUnit = spc;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
                 info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
             } else {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
-                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+                info->SectorsPerAllocationUnit = spc;
                 info->TotalAllocationUnits.QuadPart = 1048576;
                 info->AvailableAllocationUnits.QuadPart = 524288;
             }
