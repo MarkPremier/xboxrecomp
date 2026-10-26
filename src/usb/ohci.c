@@ -500,8 +500,22 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * inside it is the image. Sending that one to the window delivered the
  * descriptor where the driver never looked, and it reset the port and asked
  * again, forever. */
-static uint32_t bus_resolve(uint32_t addr)
+/* This runtime's contiguous allocator starts at physical 0x1000, so a
+ * contiguous physical address and an image address can be the same number.
+ * Turok Evolution has both on one bus: its HCCA, EDs and TDs are contiguous
+ * at 0x00202000-0x00203FFF -- inside its own .rdata by number -- while its
+ * control transfers read into 0x00257B54, a .data static. One rule cannot
+ * serve both, so descriptors and data buffers resolve differently.
+ *
+ * Descriptors (HCCA, ED, TD -- rd32/wr32): the Xbox USB stack always builds
+ * them in MmAllocateContiguousMemory, so a live allocation wins. Reading them
+ * by the image rule walked .rdata strings as endpoint descriptors and stormed
+ * the title with interrupts. */
+static uint32_t bus_resolve_desc(uint32_t addr)
 {
+    extern int xbox_ContigOwnsOffset(uint64_t physical);
+    if (addr && xbox_ContigOwnsOffset(addr))
+        return OHCI_CONTIG_BASE + addr;
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
     if (addr && addr < xbox_ContiguousAllocatedBytes())
@@ -509,23 +523,42 @@ static uint32_t bus_resolve(uint32_t addr)
     return addr;
 }
 
+/* Data buffers (guest_ptr): may be a driver's statics, so go by where the
+ * driver got the address. MmGetPhysicalAddress records each page's bank --
+ * 2 translated from a contiguous-window VA, 1 from ordinary memory. Sending
+ * Turok's 0x00257B54 to the window because a contiguous block happens to
+ * cover that number delivered its device descriptor where it never looked,
+ * and it asked again forever. A page never translated uses the descriptor
+ * rule. (Banks are per page and last-writer-wins, which is why descriptors,
+ * whose pages collide more, do not use them.) */
+static uint32_t bus_resolve_data(uint32_t addr)
+{
+    extern int xbox_DmaBankOf(uint64_t physical);
+    int bank = addr ? xbox_DmaBankOf(addr) : 0;
+    if (bank == 2)
+        return OHCI_CONTIG_BASE + addr;
+    if (bank == 1)
+        return addr;
+    return bus_resolve_desc(addr);
+}
+
 static uint32_t rd32(uint32_t va)
 {
-    va = bus_resolve(va);
+    va = bus_resolve_desc(va);
     if (!guest_ok(va, 4))
         return 0;
     return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
 }
 static void wr32(uint32_t va, uint32_t v)
 {
-    va = bus_resolve(va);
+    va = bus_resolve_desc(va);
     if (!guest_ok(va, 4))
         return;
     *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
 }
 static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
 {
-    va = bus_resolve(va);
+    va = bus_resolve_data(va);
     return guest_ok(va, bytes)
          ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
 }
