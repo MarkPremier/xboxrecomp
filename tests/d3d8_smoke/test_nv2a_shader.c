@@ -73,6 +73,10 @@ int xbox_Nv2aSoftwareMethodDeferred(uint32_t parameter, uint32_t depth_clear,
 int xbox_Nv2aSoftwareMethodPending(void) { return 0; }
 void xbox_Nv2aAcknowledgeHandshakes(void) {}
 void xbox_Nv2aFlipPacingReport(void) {}
+uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch) { if (pitch) *pitch = 0; return 0; }
+long xbox_Nv2aVblankCount(void) { return 0; }
+int xbox_Nv2aVblankSchedule(long long *epoch, long long *period) { (void)epoch; (void)period; return 0; }
+void xbox_Nv2aVblankAtFlip(void) {}
 void xbox_FramebufferWindowSet(uint32_t address, uint32_t pitch) { (void)address; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowPresent(uint32_t address, uint32_t pitch) { (void)address; (void)pitch; }

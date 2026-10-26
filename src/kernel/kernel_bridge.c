@@ -2372,21 +2372,112 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* Vertical blanks raised so far, and when the next one is due (QPC ticks).
+ *
+ * The blank used to be timed with GetTickCount64 (15.6 ms resolution) and
+ * scheduled 16 ms after whenever the timer thread noticed the last one, so
+ * the "60 Hz" clock ran irregularly at 16-31 ms. A title that ticks its logic
+ * on the vblank and draws parts of a frame only on frames that saw a tick --
+ * Turok Evolution's title-screen overlay -- then lost those parts on any frame
+ * that fell between two late blanks. A deadline advancing by exactly one NTSC
+ * field period keeps the rate exact; xbox_Nv2aVblankCount lets a flip wait for
+ * the blank the way the hardware's FLIP_STALL does. */
+static volatile LONG g_vblank_count;
+static long long g_vblank_due, g_vblank_period, g_vblank_epoch;
+/* A flip asks for its blank (xbox_Nv2aVblankAtFlip); when the last one was
+ * raised, so the free-running schedule does not add a second in a period. */
+static volatile LONG g_vblank_flip_request;
+static long long g_vblank_last_raised;
+
+LONG xbox_Nv2aVblankCount(void)
+{
+    return InterlockedCompareExchange(&g_vblank_count, 0, 0);
+}
+
+/* The blank schedule: blanks fall at epoch + k * period (QPC ticks). A flip
+ * that wants to land on a blank computes the boundary from this rather than
+ * waiting for the counter, because the timer thread that raises blanks also
+ * runs D3D's software methods, and those can wait for the GPU -- the very
+ * executor thread a counter wait would be holding. During Turok's intro
+ * movie that deadlock held each flip until a timeout: 2.5 fps. Returns 0
+ * while blanks are off. */
+static HANDLE g_nv2a_wake;   /* defined with the software-method dispatch */
+
+/* The flip has reached its blank: raise the vertical-blank interrupt now.
+ *
+ * On the console FLIP_STALL waits for the blank and the blank's interrupt
+ * fires at that moment, so every presented frame comes with exactly one
+ * vblank. A title that ticks its logic on the vblank and draws parts of a
+ * frame only on frames that saw a tick -- Turok Evolution's title overlay --
+ * depends on that. Blanks raised on a separate schedule drifted against the
+ * flips, and a flip that landed between two ticks showed the screen without
+ * its logo for a frame (10 times in 16 s in a screen recording). The
+ * scheduled blanks remain for when the title is not flipping. */
+void xbox_Nv2aVblankAtFlip(void)
+{
+    InterlockedExchange(&g_vblank_flip_request, 1);
+    if (g_nv2a_wake)
+        SetEvent(g_nv2a_wake);
+}
+
+int xbox_Nv2aVblankSchedule(long long *epoch, long long *period)
+{
+    if (!g_vblank_period || !g_vblank_epoch)
+        return 0;
+    *epoch = g_vblank_epoch;
+    *period = g_vblank_period;
+    return 1;
+}
+
+/* Milliseconds until the next blank is due (0 if due now); 10 if disabled. */
+static DWORD kernel_vblank_wait_ms(void)
+{
+    LARGE_INTEGER now, freq;
+    long long left;
+    if (!g_vblank_period)
+        return 10;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    left = g_vblank_due - now.QuadPart;
+    if (left <= 0)
+        return 0;
+    left = left * 1000 / freq.QuadPart;
+    return left > 10 ? 10 : (DWORD)left;
+}
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long next_ms;
-    long long now;
+    LARGE_INTEGER now;
 
-    if (enabled < 0)
+    if (enabled < 0) {
+        LARGE_INTEGER freq;
         enabled = getenv("RECOMP_VBLANK") != NULL;
-    if (!enabled)
+        if (enabled && QueryPerformanceFrequency(&freq))
+            g_vblank_period = freq.QuadPart * 1001 / 60000;   /* 59.94 Hz */
+    }
+    if (!enabled || !g_vblank_period)
         return;
 
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
-        return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    QueryPerformanceCounter(&now);
+    if (!g_vblank_epoch)
+        g_vblank_epoch = now.QuadPart;
+    if (InterlockedExchange(&g_vblank_flip_request, 0)) {
+        /* A flip's blank: raise it now. */
+    } else {
+        if (now.QuadPart < g_vblank_due)
+            return;
+        /* The next boundary on the fixed schedule: after a stall this skips
+         * the missed blanks rather than raising a burst of them, and stays in
+         * phase with xbox_Nv2aVblankSchedule. */
+        g_vblank_due = g_vblank_epoch
+                     + ((now.QuadPart - g_vblank_epoch) / g_vblank_period + 1) * g_vblank_period;
+        /* A flip already raised this period's blank. */
+        if (g_vblank_last_raised && now.QuadPart - g_vblank_last_raised < g_vblank_period * 3 / 4)
+            return;
+    }
+    g_vblank_last_raised = now.QuadPart;
+    InterlockedIncrement(&g_vblank_count);
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
@@ -2910,10 +3001,16 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
+        /* A fixed 10 ms wake, as before. A flip's blank does not wait for it:
+         * xbox_Nv2aVblankAtFlip signals g_nv2a_wake, which ends the wait at
+         * once. Waking on a high-resolution timer at every scheduled blank
+         * instead slowed Turok's intro movie to 10-13 fps presented (58 with
+         * this wake), so only the flip path is precise. */
         if (g_nv2a_wake)
             WaitForSingleObject(g_nv2a_wake, 10);
         else
             Sleep(10);
+        (void)kernel_vblank_wait_ms;
         kernel_nv2a_software_tick();  /* D3D software methods, at DISPATCH_LEVEL */
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
