@@ -368,6 +368,7 @@ struct DepthSurface {
     std::vector<uint8_t> source_snapshot;
     ComPtr<ID3D11Texture2D> texture, staging;
     ComPtr<ID3D11DepthStencilView> view;
+    ComPtr<ID3D11ShaderResourceView> sample_view;   /* depth as a texture: shadow-map stages */
 };
 
 struct Constants {
@@ -1083,14 +1084,18 @@ static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, T
     description.Width = extent.width; description.Height = extent.height;
     description.MipLevels = description.ArraySize = 1; description.SampleDesc.Count = 1;
     description.Format = bytes == 2 ? DXGI_FORMAT_R16_TYPELESS : DXGI_FORMAT_R24G8_TYPELESS;
-    description.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    description.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
     DepthSurface surface = {};
     surface.memory = state.depth; surface.width = extent.width; surface.height = extent.height; surface.pitch = state.depth_pitch; surface.format = state.depth_format;
     surface.last_used = ++surface_use_serial;
     D3D11_DEPTH_STENCIL_VIEW_DESC view = {};
     view.Format = bytes == 2 ? DXGI_FORMAT_D16_UNORM : DXGI_FORMAT_D24_UNORM_S8_UINT; view.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sample = {};
+    sample.Format = bytes == 2 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    sample.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sample.Texture2D.MipLevels = 1;
     if (!target_operation_succeeded("depth", "create texture", device->CreateTexture2D(&description, nullptr, &surface.texture)) ||
-        !target_operation_succeeded("depth", "create view", device->CreateDepthStencilView(surface.texture.Get(), &view, &surface.view))) return nullptr;
+        !target_operation_succeeded("depth", "create view", device->CreateDepthStencilView(surface.texture.Get(), &view, &surface.view)) ||
+        !target_operation_succeeded("depth", "create sample view", device->CreateShaderResourceView(surface.texture.Get(), &sample, &surface.sample_view))) return nullptr;
     description.Usage = D3D11_USAGE_STAGING; description.BindFlags = 0; description.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
     if (!target_operation_succeeded("depth", "create staging", device->CreateTexture2D(&description, nullptr, &surface.staging))) return nullptr;
     // Creation-data uploads can round D24 values; use the bit-preserving refresh path.
@@ -1695,6 +1700,36 @@ static bool stage_flip(const void *presented, size_t bytes, uint32_t va, uint32_
  * it is the previous frame's buffer, resolved without a GPU wait. */
 extern "C" uint32_t nv2a_gpu_flip(const void *presented, size_t bytes, uint32_t va, uint32_t pitch)
 {
+    { /* DIAG RECOMP_DEPTH_DUMP=<seconds>: save each 16-bit depth surface once, as a PGM */
+        static int at = -2; static ULONGLONG start; static bool done;
+        if (at == -2) { const char *e = std::getenv("RECOMP_DEPTH_DUMP"); at = e ? std::atoi(e) : -1; start = GetTickCount64(); }
+        if (at >= 0 && !done && GetTickCount64() - start >= (ULONGLONG)at * 1000u) {
+            done = true;
+            int n = 0;
+            for (auto &surface : depth_surfaces) {
+                if (surface.format != 1) continue;
+                context->CopyResource(surface.staging.Get(), surface.texture.Get());
+                D3D11_MAPPED_SUBRESOURCE mapped = {};
+                if (FAILED(context->Map(surface.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) continue;
+                char path[64]; std::snprintf(path, sizeof path, "depth_%d_%ux%u.pgm", n++, surface.width, surface.height);
+                FILE *f = std::fopen(path, "wb");
+                unsigned lo = 65535, hi = 0;
+                if (f) {
+                    std::fprintf(f, "P5\n%u %u\n255\n", surface.width, surface.height);
+                    for (uint32_t y = 0; y < surface.height; y++)
+                        for (uint32_t x = 0; x < surface.width; x++) {
+                            uint16_t v = ((const uint16_t *)((const uint8_t *)mapped.pData + (size_t)y * mapped.RowPitch))[x];
+                            if (v < lo) lo = v; if (v > hi) hi = v;
+                            std::fputc(v >> 8, f);
+                        }
+                    std::fclose(f);
+                }
+                context->Unmap(surface.staging.Get(), 0);
+                std::fprintf(stderr, "[DEPTHDUMP] %s memory %p dirty %u range %u..%u\n", path,
+                             (void *)surface.memory, (unsigned)surface.dirty, lo, hi);
+            }
+        }
+    }
     if (!presented) { nv2a_gpu_flush(); return va; }
     uint32_t show = va;
     if (async_flip_enabled()) {
@@ -1903,7 +1938,10 @@ extern "C" int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t
     }
     if (depth && !partial) {
         UINT clear_flags = (clear_depth ? D3D11_CLEAR_DEPTH : 0u) | (clear_stencil ? D3D11_CLEAR_STENCIL : 0u);
-        float normalized = state->depth_format == 1 ? (float)((depth_value >> 8) & 65535u) / 65535.0f :
+        /* ZSTENCIL_CLEAR_VALUE holds Z16 in its low 16 bits and Z24 above the
+         * stencil byte (as xemu reads it). Shifting Z16 too turned Turok's
+         * 0xFFFF "far" shadow-map clear into 0x00FF, shadowing everything. */
+        float normalized = state->depth_format == 1 ? (float)(depth_value & 65535u) / 65535.0f :
             (float)(depth_value >> 8) / 16777215.0f;
         context->ClearDepthStencilView(depth->view.Get(), clear_flags, normalized, (UINT8)depth_value);
     }
@@ -1914,7 +1952,7 @@ extern "C" int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t
     if (depth) {
         bool known = known_clears && !partial && (depth->format == 1 ? clear_depth :
             (clear_depth && clear_stencil) || depth->clear_value_valid);
-        uint32_t value = depth->format == 1 ? (depth_value >> 8) & 65535u :
+        uint32_t value = depth->format == 1 ? depth_value & 65535u :
             (clear_depth ? depth_value & 0xFFFFFF00u : depth->clear_value & 0xFFFFFF00u) |
             (clear_stencil ? depth_value & 255u : depth->clear_value & 255u);
         mark_written_region(*depth, region);
@@ -2068,6 +2106,19 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
     gpu_timing.texture_calls++;
     gpu_timing.surface_count = surfaces.size();
     gpu_timing.depth_surface_count = depth_surfaces.size();
+    if (binding.shadow) {
+        /* A shadow-map stage reads the depth the GPU drew there; no guest
+         * round trip. Null when no pass has drawn it yet (the caller lights
+         * the stage). */
+        for (auto &surface : depth_surfaces)
+            if (surface.memory == binding.source && surface.width == binding.width &&
+                    surface.height == binding.height && surface.pitch == binding.pitch) {
+                if (!surface.dirty && !refresh_depth(surface)) return nullptr;
+                surface.last_used = ++surface_use_serial;
+                return surface.sample_view.Get();
+            }
+        return nullptr;
+    }
     static const bool mirror_aliases = []() {
         const char *setting = std::getenv("RECOMP_NV2A_GPU_ALIAS_COPIES");
         return !setting || std::strcmp(setting, "0") != 0;
@@ -2745,7 +2796,7 @@ static bool clear_target_rectangle(const Nv2aGpuDraw &state, Surface *surface, D
     const float constants[8] = {
         (float)((color >> 16) & 255u) / 255.0f, (float)((color >> 8) & 255u) / 255.0f,
         (float)(color & 255u) / 255.0f, (float)(color >> 24) / 255.0f,
-        state.depth_format == 1 ? (float)((depth_value >> 8) & 65535u) / 65535.0f :
+        state.depth_format == 1 ? (float)(depth_value & 65535u) / 65535.0f :
             (float)(depth_value >> 8) / 16777215.0f, 0, 0, 0
     };
     D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -2784,9 +2835,14 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         std::fprintf(stderr, "[GPU-D3D11] rejected: %s\n", reason);
         return 0;
     };
-    if (!state || !vertices || !count || count > NV2A_GPU_MAX_VERTICES || !state->color || !state->width || !state->height ||
-        state->width > 4096 || state->height > 4096 || state->pitch < state->width * 4 || state->bytes_per_pixel != 4 ||
+    /* No colour pointer on a 16-bit target: a depth-only pass (see
+     * gpu_raster_batch), drawn with no render target bound. */
+    bool depth_only = state && !state->color && state->bytes_per_pixel == 2;
+    if (!state || !vertices || !count || count > NV2A_GPU_MAX_VERTICES || (!state->color && !depth_only) ||
+        !state->width || !state->height || state->width > 4096 || state->height > 4096 ||
+        (!depth_only && (state->pitch < state->width * 4 || state->bytes_per_pixel != 4)) ||
         (state->combiners.control & 255u) > 8 || !initialize_pipeline()) return 0;
+    if (depth_only && !state->depth_enable && !state->stencil_enable) return 1;   /* nothing it can change */
     if (state->topology > NV2A_GPU_TOPOLOGY_POINTS) return reject("primitive topology");
     uint32_t primitive_width = state->topology == NV2A_GPU_TOPOLOGY_TRIANGLES ? 3u :
                                state->topology == NV2A_GPU_TOPOLOGY_LINES ? 2u : 1u;
@@ -2878,8 +2934,9 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             !nv_cpu_finite(vertices[vertex].position[2]) || !nv_cpu_finite(vertices[vertex].position[3])) return 0;
     TargetExtent extent = reusable_target_extent(*state);
     prepare_target_cache(*state, extent);
-    Surface *surface = get_surface(*state, true, extent);
-    if (!surface) return 0;
+    static const Surface no_color_target = {};
+    Surface *surface = depth_only ? nullptr : get_surface(*state, true, extent);
+    if (!surface && !depth_only) return 0;
     DepthSurface *depth = state->depth_enable || state->stencil_enable ? get_depth(*state, true, extent) : nullptr;
     if ((state->depth_enable || state->stencil_enable) && !depth) return reject("depth/stencil surface");
     D3D11_DEPTH_STENCIL_DESC depth_description = {};
@@ -3075,7 +3132,8 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             constants.texture_info[stage][3] = 0.0f;
             continue;
         }
-        if ((mode == 2) != (binding.depth != 0) || (binding.depth && (binding.cube || binding.linear)))
+        if (!binding.shadow &&
+                ((mode == 2) != (binding.depth != 0) || (binding.depth && (binding.cube || binding.linear))))
             return reject("projective volume texture dimensionality");
         uint32_t sign_mask = binding.filter >> 28;
         uint32_t key_mode = binding.control0_valid ? binding.control0 & 3u : 0;
@@ -3113,7 +3171,12 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             if ((mode == 1 || mode == 2) && vertices[vertex].texture[stage][3] == 0) return reject("zero projective texture coordinate");
         }
         if (!binding.source_bytes) return reject("missing texture data");
-        views[stage] = get_texture(binding, *surface);
+        views[stage] = get_texture(binding, surface ? *surface : no_color_target);
+        uint32_t shadow_func = binding.shadow_func;
+        if (!views[stage] && binding.shadow) {
+            views[stage] = default_white_view();   /* nothing drawn there yet: lit */
+            shadow_func = 7;                       /* ALWAYS */
+        }
         if (!views[stage]) return reject("texture upload or resource alias");
         if (!make_sampler(binding, samplers[stage])) {
             static unsigned shown;   /* which state was refused, not just that one was */
@@ -3132,7 +3195,11 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         constants.texture_info[stage][3] = (float)((binding.format == 0x1E ? 1u : 0u) | (binding.cube ? 2u : 0u) |
             (binding.address_u == 5 ? 4u : 0u) | (binding.address_v == 5 ? 8u : 0u) |
             (binding.control0_valid && (binding.control0 & 4u) ? 16u : 0u) |
-            (binding.address_w == 5 ? 32u : 0u));
+            (binding.address_w == 5 ? 32u : 0u) |
+            /* shadow compare: 64, 128 for a 24-bit depth, function in 8..10 */
+            (binding.shadow ? 64u | ((shadow_func & 7u) << 8) |
+                (binding.format == 0x2A || binding.format == 0x2B || binding.format == 0x2E ||
+                 binding.format == 0x2F ? 128u : 0u) : 0u));
         if (sign_mask) signed_texture_stages++;
         switch (binding.format) {
         case 0x01: case 0x16: case 0x17: case 0x1A: case 0x1B: case 0x20: case 0x28: case 0x29:
@@ -3210,7 +3277,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     UINT stride = vertex_stride, offset = vertex_offset;
     ID3D11Buffer *buffers[] = {vertex_stream.buffer.Get()}, *constants_buffer[] = {constant_buffer.Get()};
     ID3D11Buffer *constant_ring_buffer = constant_stream.buffer.Get();
-    ID3D11RenderTargetView *target = surface->target.Get();
+    ID3D11RenderTargetView *target = surface ? surface->target.Get() : nullptr;
     ID3D11ShaderResourceView *resources[12] = {}; ID3D11SamplerState *sampler_states[4];
     for (uint32_t stage = 0; stage < 4; stage++) {
         resources[state->textures[stage].depth ? stage + 8 : state->textures[stage].cube ? stage + 4 : stage] = views[stage].Get();
@@ -3279,7 +3346,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         if (texture_matrix_used) gpu_timing.texture_matrix_draws++;
     }
     pending_draws = true;
-    if (state->color_mask & 0x01010101u) { if (writes) mark_written_region(*surface, region); }
+    if (surface && (state->color_mask & 0x01010101u)) { if (writes) mark_written_region(*surface, region); }
     else gpu_timing.color_masked_draws++;
     bool stencil_writes = state->stencil_enable && (state->stencil_write_mask & 255u) &&
         (state->stencil_fail != 0x1E00 || state->stencil_depth_fail != 0x1E00 || state->stencil_pass != 0x1E00);

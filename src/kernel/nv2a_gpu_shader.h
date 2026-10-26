@@ -471,7 +471,26 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
   default:value=cube3.Sample(sampler3,direction);break;
    }
   }
-  if(mode==2) {
+  if(mode==2 && (textureFlags&64)) {
+   float3 uvw=coordinate.xyz/coordinate.w;
+   float2 uv=uvw.xy;
+   if(textureInfo[stage].z!=0)uv/=textureInfo[stage].xy;
+   float stored;
+   switch(stage) {
+   case 0:stored=image0.SampleLevel(sampler0,uv,0).r;break;
+   case 1:stored=image1.SampleLevel(sampler1,uv,0).r;break;
+   case 2:stored=image2.SampleLevel(sampler2,uv,0).r;break;
+   default:stored=image3.SampleLevel(sampler3,uv,0).r;break;
+   }
+   float maxDepth=(textureFlags&128)?16777215.0:65535.0;
+   stored*=maxDepth;
+   float reference=clamp(uvw.z,0,maxDepth);   /* stored OP reference, as xemu does */
+   uint func=(textureFlags>>8)&7;
+   bool lit=func==1?stored<reference:func==2?stored==reference:func==3?stored<=reference:
+            func==4?stored>reference:func==5?stored!=reference:func==6?stored>=reference:func==7;
+   value=lit?1:0;
+  }
+  else if(mode==2) {
    float3 uvw=coordinate.xyz/coordinate.w;
    float3 gradientX=ddx(uvw),gradientY=ddy(uvw);
    if(textureFlags&4)uvw.x=saturate(uvw.x);

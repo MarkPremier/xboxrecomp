@@ -42,6 +42,8 @@ typedef struct Nv2aGpuTexture {
 	uint32_t color_key;
 	uint32_t mip_levels;
 	uint32_t disabled; /* sampled by the stage program but the texture unit is off */
+	uint32_t shadow;      /* depth texture under a 3D-projective stage: shadow compare */
+	uint32_t shadow_func; /* SET_SHADOW_DEPTH_FUNC, 0 NEVER .. 7 ALWAYS */
 	float bump_matrix[4], bump_scale, bump_offset;
 	void *decode_context;
 	int (*decode)(void *, uint32_t, uint32_t, uint32_t *);

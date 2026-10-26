@@ -487,6 +487,7 @@ static struct {
     uint32_t vp_load, vp_start, constant_load, vp_words, constant_words;
     Nv2aCpuCombiners combiners;
     uint32_t shade_mode, alpha_enable, alpha_func, alpha_ref;
+    uint32_t shadow_func;          /* SET_SHADOW_DEPTH_FUNC, for shadow-map stages */
     uint32_t depth_offset, depth_pitch, depth_clear, depth_enable, depth_func, depth_mask, control0;
     uint32_t zmin_max_control, depth_range_valid;
     float depth_clip_min, depth_clip_max;
@@ -1053,8 +1054,7 @@ static int benign_state_method(uint32_t method)
     case 0x17C4:  /* SET_LIGHT_MODEL_TWO_SIDE_ENABLE  */
     case 0x1D80:  /* UNK1D80                          */
     case 0x1E68:  /* SET_SHADOW_ZSLOPE_THRESHOLD      */
-    case 0x1E6C:  /* SET_SHADOW_DEPTH_FUNC            */
-        return 1;
+        return 1;   /* SET_SHADOW_DEPTH_FUNC (0x1E6C) is stored: shadow-map stages */
     default:
         return 0;
     }
@@ -1439,6 +1439,24 @@ static int gpu_clear_surface(uint32_t param)
     state.depth_pitch = s_gpu.depth_pitch;
     state.depth_format = (s_gpu.format >> 4) & 15u;
     state.control0 = s_gpu.control0;
+    /* A 16-bit target only ever has depth on the GPU (gpu_raster_batch):
+     * clear that here and leave its colour bytes to clear_surface. */
+    if ((param & NV097_CLEAR_COLOR_MASK) && state.bytes_per_pixel == 2 && (param & 3u)) {
+        uint32_t base = dma_resolve(s_gpu.depth_offset);
+        uint32_t bytes = state.depth_format == 1 ? 2u : state.depth_format == 2 ? 4u : 0u;
+        if (!s_gpu.depth_offset || !state.depth_pitch || !bytes || (state.control0 & 0x1000u) ||
+            state.width > state.depth_pitch / bytes ||
+            surface_write_refused(base, state.height * state.depth_pitch, "depth clear")) return 0;
+        state.depth = memory + base;
+        result = nv2a_gpu_clear(&state, param & 3u, s_gpu.clear_color, s_gpu.depth_clear);
+        if (result < 0) {
+            fprintf(stderr, "  [GPU] native depth clear failed: flags 0x%08X, depth 0x%08X\n",
+                    param, s_gpu.depth_offset);
+            fflush(stderr);
+            exit(EXIT_FAILURE);
+        }
+        return result > 0 ? 2 : 0;
+    }
     if (param & NV097_CLEAR_COLOR_MASK) {
         uint32_t base = dma_resolve(s_gpu.color_offset);
         if (!s_gpu.color_offset || !state.pitch || !state.bytes_per_pixel ||
@@ -1475,7 +1493,12 @@ static void clear_surface(uint32_t param)
 #ifdef _WIN32
     native_clear = gpu_clear_surface(param);
 #endif
-    if (!native_clear) { s_gpu.flush_clear++; nv2a_pb_exec_flush(); }
+    if (native_clear == 2) {
+        /* Depth cleared on the GPU; the 16-bit colour bytes no draw ever
+         * writes are cleared below in guest RAM, with no sync needed. */
+        param &= ~3u;
+        native_clear = 0;
+    } else if (!native_clear) { s_gpu.flush_clear++; nv2a_pb_exec_flush(); }
 
     if (!native_clear && (param & 3u) && s_gpu.depth_offset && s_gpu.depth_pitch) {
         uint32_t format = (s_gpu.format >> 4) & 15u;
@@ -1488,7 +1511,7 @@ static void clear_surface(uint32_t param)
                 uint8_t *row = mem + base + (size_t)y * s_gpu.depth_pitch;
                 for (x = s_gpu.clip_x; x < s_gpu.clip_x + s_gpu.clip_w; x++) {
                     if (depth_bpp == 2) {
-                        if (param & 1u) ((uint16_t *)row)[x] = (uint16_t)(s_gpu.depth_clear >> 8);
+                        if (param & 1u) ((uint16_t *)row)[x] = (uint16_t)s_gpu.depth_clear;
                     } else {
                         uint32_t previous = ((uint32_t *)row)[x];
                         uint32_t mask = ((param & 1u) ? 0xFFFFFF00u : 0u) | ((param & 2u) ? 255u : 0u);
@@ -2938,16 +2961,20 @@ static int gpu_raster_batch(void)
     }
     gpu_begin_chunk();
     if (!s_gpu.combiners_configured) return gpu_batch_rejected("unconfigured combiners");
-    if (surface_bpp() != 4) return gpu_batch_rejected("surface pixel format");
+    /* 16-bit colour targets draw depth only (state.color stays NULL). The
+     * backend's colour surfaces are 32-bit throughout, and the 16-bit pass
+     * that matters -- Turok Evolution's 512x512 R5G6B5 + Z16 shadow pass --
+     * is sampled for its depth alone; its colour writes are dropped. */
+    if (surface_bpp() != 4 && surface_bpp() != 2) return gpu_batch_rejected("surface pixel format");
     if (!s_gpu.clip_w || !s_gpu.clip_h || !surface_begin_batch(memory)) return gpu_batch_rejected("surface mapping or clip extent");
     {
-        uint32_t sx, sy;
+        uint32_t sx, sy, bpp = surface_bpp();
         surface_aa_scale(&sx, &sy);
         state.aa_scale_x = sx; state.aa_scale_y = sy;
-        state.color = s_surface;
+        state.color = bpp == 4 ? s_surface : NULL;
         state.width = (s_gpu.clip_x + s_gpu.clip_w) * sx; state.height = (s_gpu.clip_y + s_gpu.clip_h) * sy;
-        if (state.width > s_gpu.pitch / 4) state.width = s_gpu.pitch / 4;
-        state.pitch = s_gpu.pitch; state.bytes_per_pixel = 4;
+        if (state.width > s_gpu.pitch / bpp) state.width = s_gpu.pitch / bpp;
+        state.pitch = s_gpu.pitch; state.bytes_per_pixel = bpp;
         state.clip_x = s_gpu.clip_x * sx; state.clip_y = s_gpu.clip_y * sy;
         state.clip_width = s_gpu.clip_w * sx; state.clip_height = s_gpu.clip_h * sy;
     }
@@ -3047,23 +3074,43 @@ static int gpu_raster_batch(void)
         if (((texture->raw_format >> 4) & 15u) == 3u)
             binding->depth = 1u << (texture->raw_format >> 28);
         if (mode == 2 && !binding->depth && !(texture->raw_format & 4u)) {
-            /* 3D projective lookup of a 2D texture: the NV2A shadow-map
-             * compare (r/q against a depth texture, SET_SHADOW_DEPTH_FUNC).
-             * The backend has no compare path, and rejecting deletes the
-             * shadow receivers (Turok's terrain and sky). Sample it as a
-             * lit (white) 2D stage instead. */
-            static uint32_t shown;
-            if (shown++ < 8)
-                fprintf(stderr, "[GPU] shadow-compare stage %u: texture format 0x%02X raw 0x%08X %ux%u stages 0x%X\n",
-                        stage, texture->color, texture->raw_format, texture->width, texture->height,
-                        state.stage_program);
-            state.stage_program = (state.stage_program & ~(31u << (stage * 5))) | (1u << (stage * 5));
-            binding->disabled = 1;
-            binding->source = NULL; binding->source_bytes = 0;
-            binding->width = 1; binding->height = 1; binding->pitch = 4;
-            binding->format = 0; binding->linear = 0;
-            binding->depth = 0; binding->cube = 0; binding->mip_levels = 1;
-            continue;
+            /* 3D projective lookup of a 2D texture. On a depth texture this
+             * is the NV2A shadow-map compare: the stored depth against r/q,
+             * by SET_SHADOW_DEPTH_FUNC, giving 1 (lit) or 0 per stage.
+             * Turok Evolution's terrain samples its 512x512 Z16 shadow pass
+             * this way. Any other 2D texture is sampled 2D-projectively. */
+            uint32_t depth_bytes = 0;
+            switch (texture->color) {
+            case 0x2C: case 0x2D: case 0x30: case 0x31: depth_bytes = 2; break;   /* D16/F16, LIN_ */
+            case 0x2A: case 0x2B: case 0x2E: case 0x2F: depth_bytes = 4; break;   /* D24S8/F24S8 */
+            default: break;
+            }
+            if (!depth_bytes) {
+                state.stage_program = (state.stage_program & ~(31u << (stage * 5))) | (1u << (stage * 5));
+                mode = 1;
+            } else {
+                if (!texture->valid) return gpu_batch_rejected("invalid texture binding");
+                binding->shadow = 1;
+                binding->shadow_func = s_gpu.shadow_func;
+                {
+                    static int shadows = -1;   /* RECOMP_SHADOWS=0: every compare passes (lit) */
+                    if (shadows < 0) {
+                        const char *e = getenv("RECOMP_SHADOWS");
+                        shadows = !(e && e[0] == '0');
+                    }
+                    if (!shadows) binding->shadow_func = 7;
+                }
+                binding->source = memory + texture->offset;
+                binding->width = texture->width; binding->height = texture->height;
+                binding->pitch = texture->pitch ? texture->pitch : texture->width * depth_bytes;
+                binding->format = texture->color; binding->linear = 1;
+                binding->source_bytes = (size_t)binding->pitch * texture->height;
+                binding->address_u = texture->addr_u; binding->address_v = texture->addr_v;
+                binding->address_w = texture->addr_w;
+                binding->border_color = texture->border_color;
+                binding->mip_levels = 1;
+                continue;
+            }
         }
         if ((mode == 2) != (binding->depth != 0) || (binding->depth && (texture->raw_format & 4u)))
             return gpu_batch_rejected("projective volume texture dimensionality");
@@ -3245,6 +3292,72 @@ static void raster_batch(void)
     }
 
 #ifdef _WIN32
+    { /* DIAG RECOMP_DRAW_ONLY=<first>[-<last>]: draw only those batches of each
+       * frame (numbered from 1 after FLIP_INCREMENT_WRITE), plus anything aimed
+       * at the display buffer so the frame still reaches the window. */
+        static int lo = -2, hi;
+        static uint32_t frame_flips, index;
+        if (lo == -2) {
+            const char *e = getenv("RECOMP_DRAW_ONLY");
+            lo = -1;
+            if (e) { lo = atoi(e); hi = strchr(e, '-') ? atoi(strchr(e, '-') + 1) : lo; }
+        }
+        static int info_sec = -2, info_lo, info_hi, info_state;   /* 0 wait, 1 this frame, 2 done */
+        static ULONGLONG info_start;
+        if (info_sec == -2) {
+            const char *e = getenv("RECOMP_BATCH_INFO");   /* <sec>:<first>-<last> */
+            info_sec = -1;
+            if (e && strchr(e, ':')) {
+                info_sec = atoi(e);
+                info_lo = atoi(strchr(e, ':') + 1);
+                info_hi = strchr(e, '-') ? atoi(strchr(e, '-') + 1) : info_lo;
+                info_start = GetTickCount64();
+            }
+        }
+        if (frame_flips != s_gpu.flips) {
+            frame_flips = s_gpu.flips; index = 0;
+            if (info_state == 1) info_state = 2;
+            if (info_sec >= 0 && info_state == 0 &&
+                    GetTickCount64() - info_start >= (ULONGLONG)info_sec * 1000u) info_state = 1;
+        }
+        index++;
+        if (info_state == 1 && (int)index >= info_lo && (int)index <= info_hi) {
+            uint32_t st, n = s_gpu.combiners.control & 255u;
+            float in[4] = {0};
+            if (s_gpu.idx_count) fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], in);
+            fprintf(stderr, "[BINFO] b%u prim %u n %u surf %06X stages %X tm %X in %.3f,%.3f,%.3f,%.3f\n",
+                    index, s_gpu.prim, s_gpu.idx_count, s_gpu.color_offset & 0x0FFFFFFFu,
+                    s_gpu.shader_stage_program, s_gpu.transform_execution_mode, in[0], in[1], in[2], in[3]);
+            for (st = 0; st < 4; st++) {
+                const Texture *t = st ? &s_gpu.extra_tex[st - 1] : &s_gpu.tex;
+                fprintf(stderr, "[BINFO]   tex%u valid %d off %08X raw %08X %ux%u ctl0 %08X filt %08X addr %u/%u/%u\n",
+                        st, t->valid, t->offset, t->raw_format, t->width, t->height, t->control0,
+                        t->filter, t->addr_u, t->addr_v, t->addr_w);
+            }
+            fprintf(stderr, "[BINFO]   combiner control %08X final %08X %08X\n", s_gpu.combiners.control,
+                    s_gpu.combiners.final_input[0], s_gpu.combiners.final_input[1]);
+            for (st = 0; st < n && st < 8; st++)
+                fprintf(stderr, "[BINFO]   cs%u rgb in %08X out %08X alpha in %08X out %08X f0 %.2f,%.2f,%.2f,%.2f f1 %.2f,%.2f,%.2f,%.2f\n",
+                        st, s_gpu.combiners.rgb_input[st], s_gpu.combiners.rgb_output[st],
+                        s_gpu.combiners.alpha_input[st], s_gpu.combiners.alpha_output[st],
+                        s_gpu.combiners.factors[st][0][0], s_gpu.combiners.factors[st][0][1],
+                        s_gpu.combiners.factors[st][0][2], s_gpu.combiners.factors[st][0][3],
+                        s_gpu.combiners.factors[st][1][0], s_gpu.combiners.factors[st][1][1],
+                        s_gpu.combiners.factors[st][1][2], s_gpu.combiners.factors[st][1][3]);
+            fprintf(stderr, "[BINFO]   depth %u/%X/%u blend %u/%X/%X alpha %u/%X/%X fog %u/%X %.2f,%.2f,%.2f cull %u/%X\n",
+                    s_gpu.depth_enable, s_gpu.depth_func, s_gpu.depth_mask, s_gpu.blend_enable,
+                    s_gpu.blend_sfactor, s_gpu.blend_dfactor, s_gpu.alpha_enable, s_gpu.alpha_func,
+                    s_gpu.alpha_ref, s_gpu.fog_enable, s_gpu.fog_mode, s_gpu.combiners.fog_color[0],
+                    s_gpu.combiners.fog_color[1], s_gpu.combiners.fog_color[2], s_gpu.cull_enable,
+                    s_gpu.cull_face);
+        }
+        if (lo >= 0 && ((int)index < lo || (int)index > hi)) {
+            uint32_t scan_pitch = 0;
+            uint32_t scan = xbox_GetDisplayFramebuffer(&scan_pitch) & 0x0FFFFFFFu;
+            if ((s_gpu.color_offset & 0x0FFFFFFFu) != scan)
+                return;
+        }
+    }
     double started = gpu_clock_seconds();
     double prior_submit = s_gpu.gpu_submit_seconds;
     int rendered = gpu_raster_batch();
@@ -4016,6 +4129,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (method == 0x037C) { s_gpu.shade_mode = param; return; }
     if (method == 0x0300) { s_gpu.alpha_enable = param; return; }
     if (method == 0x033C) { s_gpu.alpha_func = param; return; }
+    if (method == 0x1E6C) { s_gpu.shadow_func = param; return; }   /* SET_SHADOW_DEPTH_FUNC */
     if (method == 0x0340) { s_gpu.alpha_ref = param & 255u; return; }
     if (method == 0x034C) { s_gpu.blend_constant = param; return; }
     if (method == 0x0350) { s_gpu.blend_equation = param; return; }
