@@ -111,6 +111,10 @@ typedef struct Nv2aGpuDraw {
 	float light_infinite_direction[8][4];
 	float light_infinite_half_vector[8][4];
 	float light_spot_direction[8][4];    /* xyz = direction, w = spot cone parameter */
+	/* Anti-aliasing factor of the surface (SET_SURFACE_FORMAT bits 12-15):
+	 * width/height/clip above are in real surface pixels, vertex positions
+	 * in logical ones, so the shader divides by the logical size. 0 = 1. */
+	uint32_t aa_scale_x, aa_scale_y;
 } Nv2aGpuDraw;
 
 int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, uint32_t count);

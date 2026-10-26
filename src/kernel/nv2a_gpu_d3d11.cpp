@@ -2520,6 +2520,14 @@ static bool make_sampler(const Nv2aGpuTexture &binding, ComPtr<ID3D11SamplerStat
     uint32_t minimum = (binding.filter >> 16) & 255u, maximum = (binding.filter >> 24) & 15u;
     if (!minimum) minimum = 1;
     if (!maximum) maximum = 1;
+    /* The 2D convolution kernels (MIN 7 CONVOLUTION_2D_LOD0, MAG 4
+     * CONVOLUTION_2D) have no D3D11 sampler. Xbox D3D uses them to resolve an
+     * anti-aliased surface into the displayed one (Turok Evolution's
+     * 1280x480 -> 640x480 present, filter 0x04072000); rejecting them dropped
+     * that draw, so nothing reached the screen. Bilinear is the nearest
+     * built-in equivalent. */
+    if (minimum == 7) minimum = 2;
+    if (maximum == 4) maximum = 2;
     if (minimum > 6 || maximum > 2) return false;
     D3D11_SAMPLER_DESC description = {};
     description.AddressU = texture_address(binding.address_u);
@@ -2971,7 +2979,10 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             }
         }
     }
-    constants.viewport[0] = (float)state->width; constants.viewport[1] = (float)state->height;
+    /* Logical size: vertex positions are in the title's logical pixels, and
+     * an anti-aliased surface is larger by the AA factor (see Nv2aGpuDraw). */
+    constants.viewport[0] = (float)state->width / (float)(state->aa_scale_x ? state->aa_scale_x : 1u);
+    constants.viewport[1] = (float)state->height / (float)(state->aa_scale_y ? state->aa_scale_y : 1u);
     constants.viewport[2] = state->depth_format == 1 ? 65535.0f : 16777215.0f;
     constants.depth_range[0] = depth_clip_min; constants.depth_range[1] = depth_clip_max;
     constants.depth_range[2] = (float)depth_clamp;
@@ -3092,7 +3103,14 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         if (!binding.source_bytes) return reject("missing texture data");
         views[stage] = get_texture(binding, *surface);
         if (!views[stage]) return reject("texture upload or resource alias");
-        if (!make_sampler(binding, samplers[stage])) return reject("texture filter, addressing or LOD state");
+        if (!make_sampler(binding, samplers[stage])) {
+            static unsigned shown;   /* which state was refused, not just that one was */
+            if (shown++ < 8)
+                std::fprintf(stderr, "[GPU-D3D11] sampler: stage %u filter %08X address %u/%u/%u control0 %08X valid %u\n",
+                             stage, binding.filter, binding.address_u, binding.address_v, binding.address_w,
+                             binding.control0, binding.control0_valid);
+            return reject("texture filter, addressing or LOD state");
+        }
         constants.texture_info[stage][0] = (float)binding.width; constants.texture_info[stage][1] = (float)binding.height; constants.texture_info[stage][2] = (float)binding.linear;
         constants.texture_key[stage][0] = binding.color_key;
         constants.texture_key[stage][1] = binding.format == 0x03 || binding.format == 0x07 ||

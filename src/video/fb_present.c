@@ -91,6 +91,20 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 
         if (bpp == 4) {
             memcpy(dst, row, (size_t)s_fb_width * 4);
+        } else if (bpp == 8) {
+            /* A 2x1 anti-aliased 32-bit surface: twice the window's width at
+             * the same height. A title whose last draw before the flip went
+             * into its supersampled scene buffer rather than the display
+             * buffer (Turok Evolution, logo and title screens) presents that;
+             * blanking it left the window black. Averaging each pair is the
+             * resolve the title would have done. */
+            const uint32_t *p = (const uint32_t *)row;
+            for (x = 0; x < s_fb_width; x++) {
+                uint32_t a = p[2 * x], b = p[2 * x + 1];
+                dst[x] = ((((a >> 16) & 0xFF) + ((b >> 16) & 0xFF)) / 2) << 16
+                       | ((((a >> 8) & 0xFF) + ((b >> 8) & 0xFF)) / 2) << 8
+                       | (((a & 0xFF) + (b & 0xFF)) / 2);
+            }
         } else if (bpp == 2) {
             const uint16_t *p = (const uint16_t *)row;
             for (x = 0; x < s_fb_width; x++) {
@@ -102,6 +116,44 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
             }
         } else {
             memset(dst, 0, (size_t)s_fb_width * 4);
+        }
+    }
+    {   /* DIAG (RECOMP_FLIP_DUMP_DIR + RECOMP_FLIP_DUMP_AFTER): consecutive frames */
+        static unsigned seq, presents;
+        const char *dir = getenv("RECOMP_FLIP_DUMP_DIR");
+        const char *after = getenv("RECOMP_FLIP_DUMP_AFTER");
+        const char *every = getenv("RECOMP_FLIP_DUMP_EVERY");
+        unsigned step = every ? (unsigned)atoi(every) : 1u;
+        static ULONGLONG start_ms;
+        const char *after_sec = getenv("RECOMP_FLIP_DUMP_AFTER_SEC");
+        if (!start_ms) start_ms = GetTickCount64();
+        presents++;
+        if (after_sec && GetTickCount64() - start_ms < (ULONGLONG)atoi(after_sec) * 1000u)
+            presents = 0;   /* hold the counter until the start time */
+        if (dir && after && seq < (getenv("RECOMP_FLIP_DUMP_COUNT") ? (unsigned)atoi(getenv("RECOMP_FLIP_DUMP_COUNT")) : 120u) && presents > (unsigned)atoi(after)
+                && (step <= 1u || presents % step == 0)) {
+            char path[512];
+            FILE *f;
+            LARGE_INTEGER qpc, qpf;
+            QueryPerformanceCounter(&qpc); QueryPerformanceFrequency(&qpf);
+            snprintf(path, sizeof path, "%s\\f_%04u_%08X_%010.3f.bmp", dir, seq++, fb_va,
+                     (double)qpc.QuadPart * 1000.0 / (double)qpf.QuadPart);
+            if ((f = fopen(path, "wb")) != NULL) {
+                uint8_t hdr[54] = {'B','M'};
+                uint32_t rowb = s_fb_width * 3, img = rowb * s_fb_height, fsz = 54 + img, xx, yy;
+                memcpy(hdr + 2, &fsz, 4); hdr[10] = 54; hdr[14] = 40;
+                memcpy(hdr + 18, &s_fb_width, 4); memcpy(hdr + 22, &s_fb_height, 4);
+                hdr[26] = 1; hdr[28] = 24; memcpy(hdr + 34, &img, 4);
+                fwrite(hdr, 1, 54, f);
+                for (yy = s_fb_height; yy-- > 0; ) {
+                    const uint32_t *px = s_present[next] + (size_t)yy * s_fb_width;
+                    for (xx = 0; xx < s_fb_width; xx++) {
+                        uint8_t bgr[3] = {(uint8_t)px[xx], (uint8_t)(px[xx] >> 8), (uint8_t)(px[xx] >> 16)};
+                        fwrite(bgr, 1, 3, f);
+                    }
+                }
+                fclose(f);
+            }
         }
     }
     /* Published only once it is whole. */
@@ -667,6 +719,20 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
 
         if (bpp == 4) {
             memcpy(dst, row, (size_t)s_fb_width * 4);
+        } else if (bpp == 8) {
+            /* A 2x1 anti-aliased 32-bit surface: twice the window's width at
+             * the same height. A title whose last draw before the flip went
+             * into its supersampled scene buffer rather than the display
+             * buffer (Turok Evolution, logo and title screens) presents that;
+             * blanking it left the window black. Averaging each pair is the
+             * resolve the title would have done. */
+            const uint32_t *p = (const uint32_t *)row;
+            for (x = 0; x < s_fb_width; x++) {
+                uint32_t a = p[2 * x], b = p[2 * x + 1];
+                dst[x] = ((((a >> 16) & 0xFF) + ((b >> 16) & 0xFF)) / 2) << 16
+                       | ((((a >> 8) & 0xFF) + ((b >> 8) & 0xFF)) / 2) << 8
+                       | (((a & 0xFF) + (b & 0xFF)) / 2);
+            }
         } else if (bpp == 2) {
             const uint16_t *p = (const uint16_t *)row;
             for (x = 0; x < s_fb_width; x++) {

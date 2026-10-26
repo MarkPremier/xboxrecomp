@@ -437,6 +437,13 @@ static struct {
      * that has not been drawn yet -- which is how a correctly rendered
      * sequence came out as 12 black BMPs. */
     uint32_t drawn_offset;
+    /* The pitch and height of that surface when it was drawn. By the flip the
+     * title has usually set up the next frame's surface, and its pitch is not
+     * this one's: Turok draws its 1280x480 scene, resolves it into the
+     * 640x480 display buffer, then rebinds the scene surface before
+     * FLIP_STALL. Presenting the display buffer at the scene's 5120-byte
+     * pitch showed its top half doubled with alternate rows garbled. */
+    uint32_t drawn_pitch, drawn_height;
     uint64_t pixels;
     uint32_t pixel_max;   /* brightest value any pixel write carried */
     uint32_t clip_x, clip_w, clip_y, clip_h;
@@ -1252,6 +1259,162 @@ static void raster_triangle(const float a[2], const float b[2],
                             const float uv[3][2], const Nv2aCpuVertex varying[3]);
 
 #ifdef _WIN32
+/* The surface's anti-aliasing factor, from SET_SURFACE_FORMAT bits 12-15
+ * (0 = 1x1, 1 = 2x1 "center corner 2", 2 = 2x2 "square offset 4"), as the
+ * upstream executor reads it. SET_SURFACE_CLIP and every vertex position are
+ * in logical pixels; the surface itself is larger by this factor. Ignoring it
+ * drew Turok Evolution's 640x480 title screen into the left half of its
+ * 1280x480 surface and cleared only that half. */
+static void surface_aa_scale(uint32_t *sx, uint32_t *sy)
+{
+    uint32_t aa = (s_gpu.format >> 12) & 0xFu;
+    *sx = aa ? 2u : 1u;
+    *sy = aa == 2u ? 2u : 1u;
+}
+
+/* A packed window-clip edge pair (min | max << 16, 12 bits each, max
+ * inclusive) from logical to surface pixels. */
+static uint32_t window_clip_scale(uint32_t packed, uint32_t scale)
+{
+    uint32_t lo = packed & 4095u, hi = (packed >> 16) & 4095u;
+    if (scale == 1u) return packed;
+    lo *= scale;
+    hi = (hi + 1u) * scale - 1u;
+    if (hi > 4095u) hi = 4095u;
+    return (packed & 0xF000F000u) | (lo & 4095u) | (hi << 16);
+}
+
+/* RECOMP_FPS_CAP=<hz>: hold each FLIP_STALL to a fixed frame clock.
+ *
+ * On the console FLIP_STALL waits for the vertical blank, so a title cannot
+ * present faster than the display refreshes, and its fence waits throttle the
+ * CPU side to match. Here the stall ended at once, and Turok Evolution's title
+ * screen swung between 100 and 240 fps with the scene, which reads as uneven
+ * animation. A deadline that advances by one period per flip (resynced after a
+ * stall rather than caught up in a burst) restores a steady rate. Off by
+ * default. */
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+static uint64_t fps_cap_now_ns(void)
+{
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER c;
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&c);
+    return (uint64_t)((double)c.QuadPart * 1e9 / (double)freq.QuadPart);
+}
+
+/* RECOMP_FPS_CAP=vblank: one flip per emulated vertical blank, the hardware's
+ * own rule. A fixed-rate cap on the host clock beats against the guest's
+ * vblank clock, and a title that draws part of a frame only on frames that
+ * saw a vblank tick (Turok's title overlay) loses that part whenever a frame
+ * falls between two blanks. Waiting for the blank counter to move past the
+ * value the previous flip saw locks the two. A frame that took longer than a
+ * blank finds the counter already moved and flips at once. */
+static void flip_wait_vblank(HANDLE timer)
+{
+    /* The blank schedule, not the blank counter: the counter is advanced by
+     * the timer thread, which can itself be waiting on this executor thread
+     * (see xbox_Nv2aVblankSchedule), so waiting for it deadlocked until a
+     * timeout and took the intro movie to 2.5 fps. */
+    extern int xbox_Nv2aVblankSchedule(long long *epoch, long long *period);
+    extern LONG xbox_Nv2aVblankCount(void);
+    static long long last_flip;
+    static LONG seen;
+    static LARGE_INTEGER freq;
+    long long epoch, period, boundary;
+    LARGE_INTEGER now;
+    LONG count = xbox_Nv2aVblankCount();
+
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    if (!xbox_Nv2aVblankSchedule(&epoch, &period) || !last_flip || last_flip < epoch) {
+        last_flip = now.QuadPart;
+        seen = count;
+        return;
+    }
+    (void)count;
+    boundary = epoch + ((last_flip - epoch) / period + 1) * period;
+    if (now.QuadPart < boundary) {
+        long long left = boundary - now.QuadPart;
+        long long half_ms = freq.QuadPart / 2000;
+        if (timer && left > half_ms) {
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)((left - half_ms) * 10000000 / freq.QuadPart);
+            if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+                WaitForSingleObject(timer, INFINITE);
+        }
+        do {
+            YieldProcessor();
+            QueryPerformanceCounter(&now);
+        } while (now.QuadPart < boundary);
+    }
+    last_flip = now.QuadPart;
+    seen = xbox_Nv2aVblankCount();
+    /* This flip's blank, raised now as the hardware's would be. */
+    {
+        extern void xbox_Nv2aVblankAtFlip(void);
+        xbox_Nv2aVblankAtFlip();
+    }
+}
+
+static void flip_fps_cap(void)
+{
+    static int hz, inited;
+    static uint64_t deadline;
+    static HANDLE timer;
+    uint64_t period, now;
+
+    if (!inited) {
+        const char *e = getenv("RECOMP_FPS_CAP");
+        inited = 1;
+        hz = !e ? 0 : strcmp(e, "vblank") == 0 ? -2 : atoi(e);
+        if (hz < -2 || hz > 1000) hz = 0;
+        if (hz)
+            timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                           TIMER_ALL_ACCESS);
+    }
+    if (hz == -2) {
+        flip_wait_vblank(timer);
+        return;
+    }
+    if (!hz)
+        return;
+    period = 1000000000ull / (uint64_t)hz;
+    now = fps_cap_now_ns();
+    if (!deadline || now > deadline + period) {
+        deadline = now + period;          /* first flip, or resync after a stall */
+        return;
+    }
+    if (timer && deadline > now + 500000u) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)((deadline - now - 500000u) / 100u);
+        if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+            WaitForSingleObject(timer, INFINITE);
+    }
+    while (fps_cap_now_ns() < deadline)
+        YieldProcessor();
+    deadline += period;
+}
+#else
+static void flip_fps_cap(void) {}
+#endif
+
+/* Remember the surface just drawn into, with its own geometry (see
+ * drawn_pitch). Height is in real rows: an anti-aliased surface has more. */
+static void note_drawn_surface(void)
+{
+    uint32_t sx, sy;
+    surface_aa_scale(&sx, &sy);
+    s_gpu.drawn_offset = s_gpu.color_offset;
+    s_gpu.drawn_pitch = s_gpu.pitch;
+    s_gpu.drawn_height = (s_gpu.clip_y + s_gpu.clip_h) * sy;
+}
+
 static int gpu_clear_surface(uint32_t param)
 {
     static int enabled = -1;
@@ -1264,8 +1427,13 @@ static int gpu_clear_surface(uint32_t param)
     }
     if (!enabled || s_gpu.clip_x || s_gpu.clip_y || !s_gpu.clip_w || !s_gpu.clip_h)
         return 0;
-    state.width = state.clip_width = s_gpu.clip_w;
-    state.height = state.clip_height = s_gpu.clip_h;
+    {   /* the whole real surface, not its left (or top) part */
+        uint32_t sx, sy;
+        surface_aa_scale(&sx, &sy);
+        state.aa_scale_x = sx; state.aa_scale_y = sy;
+        state.width = state.clip_width = s_gpu.clip_w * sx;
+        state.height = state.clip_height = s_gpu.clip_h * sy;
+    }
     state.bytes_per_pixel = surface_bpp();
     state.pitch = s_gpu.pitch;
     state.depth_pitch = s_gpu.depth_pitch;
@@ -2211,7 +2379,7 @@ static void raster_triangle(const float a[2], const float b[2],
         }
     }
     s_gpu.tris_drawn++;
-    s_gpu.drawn_offset = s_gpu.color_offset;
+    note_drawn_surface();
 }
 
 /* Attribute 3 is diffuse colour in every NV2A layout that sets one. Absent it,
@@ -2772,13 +2940,22 @@ static int gpu_raster_batch(void)
     if (!s_gpu.combiners_configured) return gpu_batch_rejected("unconfigured combiners");
     if (surface_bpp() != 4) return gpu_batch_rejected("surface pixel format");
     if (!s_gpu.clip_w || !s_gpu.clip_h || !surface_begin_batch(memory)) return gpu_batch_rejected("surface mapping or clip extent");
-    state.color = s_surface; state.width = s_gpu.clip_x + s_gpu.clip_w; state.height = s_gpu.clip_y + s_gpu.clip_h;
-    if (state.width > s_gpu.pitch / 4) state.width = s_gpu.pitch / 4;
-    state.pitch = s_gpu.pitch; state.bytes_per_pixel = 4;
-    state.clip_x = s_gpu.clip_x; state.clip_y = s_gpu.clip_y; state.clip_width = s_gpu.clip_w; state.clip_height = s_gpu.clip_h;
+    {
+        uint32_t sx, sy;
+        surface_aa_scale(&sx, &sy);
+        state.aa_scale_x = sx; state.aa_scale_y = sy;
+        state.color = s_surface;
+        state.width = (s_gpu.clip_x + s_gpu.clip_w) * sx; state.height = (s_gpu.clip_y + s_gpu.clip_h) * sy;
+        if (state.width > s_gpu.pitch / 4) state.width = s_gpu.pitch / 4;
+        state.pitch = s_gpu.pitch; state.bytes_per_pixel = 4;
+        state.clip_x = s_gpu.clip_x * sx; state.clip_y = s_gpu.clip_y * sy;
+        state.clip_width = s_gpu.clip_w * sx; state.clip_height = s_gpu.clip_h * sy;
+    }
     state.window_clip_valid = s_gpu.window_clip_valid; state.window_clip_type = s_gpu.window_clip_type;
-    memcpy(state.window_clip_horizontal, s_gpu.window_clip_horizontal, sizeof state.window_clip_horizontal);
-    memcpy(state.window_clip_vertical, s_gpu.window_clip_vertical, sizeof state.window_clip_vertical);
+    for (stage = 0; stage < 8; stage++) {
+        state.window_clip_horizontal[stage] = window_clip_scale(s_gpu.window_clip_horizontal[stage], state.aa_scale_x);
+        state.window_clip_vertical[stage] = window_clip_scale(s_gpu.window_clip_vertical[stage], state.aa_scale_y);
+    }
     state.stage_program = s_gpu.shader_stage_program; state.combiners = s_gpu.combiners;
     state.shader_clip_mode = s_gpu.shader_clip_mode;
     state.shader_other_stage_input = s_gpu.shader_other_stage_input;
@@ -2869,6 +3046,25 @@ static int gpu_raster_batch(void)
         if (!texture->valid) return gpu_batch_rejected("invalid texture binding");
         if (((texture->raw_format >> 4) & 15u) == 3u)
             binding->depth = 1u << (texture->raw_format >> 28);
+        if (mode == 2 && !binding->depth && !(texture->raw_format & 4u)) {
+            /* 3D projective lookup of a 2D texture: the NV2A shadow-map
+             * compare (r/q against a depth texture, SET_SHADOW_DEPTH_FUNC).
+             * The backend has no compare path, and rejecting deletes the
+             * shadow receivers (Turok's terrain and sky). Sample it as a
+             * lit (white) 2D stage instead. */
+            static uint32_t shown;
+            if (shown++ < 8)
+                fprintf(stderr, "[GPU] shadow-compare stage %u: texture format 0x%02X raw 0x%08X %ux%u stages 0x%X\n",
+                        stage, texture->color, texture->raw_format, texture->width, texture->height,
+                        state.stage_program);
+            state.stage_program = (state.stage_program & ~(31u << (stage * 5))) | (1u << (stage * 5));
+            binding->disabled = 1;
+            binding->source = NULL; binding->source_bytes = 0;
+            binding->width = 1; binding->height = 1; binding->pitch = 4;
+            binding->format = 0; binding->linear = 0;
+            binding->depth = 0; binding->cube = 0; binding->mip_levels = 1;
+            continue;
+        }
         if ((mode == 2) != (binding->depth != 0) || (binding->depth && (texture->raw_format & 4u)))
             return gpu_batch_rejected("projective volume texture dimensionality");
         binding->source = memory + texture->offset; binding->width = texture->width; binding->height = texture->height;
@@ -3008,7 +3204,7 @@ static int gpu_submit_chunk(Nv2aGpuDraw *state, uint32_t *count)
     }
     s_gpu.gpu_batches++;
     if (state->topology == NV2A_GPU_TOPOLOGY_TRIANGLES) s_gpu.tris_drawn += gpu_index_count / 3;
-    s_gpu.drawn_offset = s_gpu.color_offset;
+    note_drawn_surface();
     *count = 0;
     return 1;
 }
@@ -4253,6 +4449,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_FLIP_STALL:
+        flip_fps_cap();
         s_gpu.flush_flip++;
         cloak_marker_idle();
         /* The stall ends when the buffer being read is the one just finished.
@@ -4276,25 +4473,50 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * per-frame re-decode of render-to-texture surfaces. */
         if (s_gpu.pitch) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
-            uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
-                                               : s_gpu.color_offset;
+            int drawn = s_gpu.drawn_offset != 0;
+            uint32_t done = drawn ? s_gpu.drawn_offset : s_gpu.color_offset;
+            uint32_t pitch = drawn && s_gpu.drawn_pitch ? s_gpu.drawn_pitch : s_gpu.pitch;
+            uint32_t present_h = drawn ? s_gpu.drawn_height : 0;
+            /* RECOMP_PRESENT_SCANOUT: present the buffer AvSetDisplayMode
+             * registered, which is what the CRTC scans out, rather than the
+             * surface the last draw hit. Turok's last draw before a flip goes
+             * to its 1280x480 scene buffer on some frames and to the 640x480
+             * display buffer on others, and alternating between the two read
+             * as flicker. Opt-in: a title that flips between two front
+             * buffers by rewriting PCRTC_START needs the drawn-surface rule. */
+            {
+                static int scanout = -1;
+                uint32_t scan_pitch = 0, scan;
+                if (scanout < 0) {
+                    const char *e = getenv("RECOMP_PRESENT_SCANOUT");
+                    scanout = e && *e && *e != '0';
+                }
+                if (scanout && (scan = xbox_GetDisplayFramebuffer(&scan_pitch)) != 0 && scan_pitch) {
+                    uint32_t phys = scan & 0x0FFFFFFFu;
+                    if (!drawn || (s_gpu.drawn_offset & 0x0FFFFFFFu) != phys)
+                        present_h = 480u;   /* the display buffer's own rows */
+                    drawn = 1;
+                    done = phys;
+                    pitch = scan_pitch;
+                }
+            }
             if (done) {
                 uint32_t show = done;
                 if (lazy_flip()) {
                     uint8_t *base = (uint8_t *)xbox_GetMemoryOffset() + dma_resolve(done);
-                    uint32_t h = s_gpu.clip_y + s_gpu.clip_h;
+                    uint32_t h = present_h ? present_h : s_gpu.clip_y + s_gpu.clip_h;
                     /* With RECOMP_ASYNC_FLIP the call returns the previous
                      * frame's buffer (published without a GPU wait); the window
                      * shows that, one frame behind. */
-                    show = nv2a_gpu_flip(base, (size_t)s_gpu.pitch * (h ? h : 1u),
-                                         done, s_gpu.pitch);
+                    show = nv2a_gpu_flip(base, (size_t)pitch * (h ? h : 1u),
+                                         done, pitch);
                     if (!show) show = done;
                 } else {
                     nv2a_pb_exec_flush();
                 }
                 present_pvideo_overlay(show);
-                xbox_FramebufferWindowSet(dma_resolve(show), s_gpu.pitch);
-                xbox_FramebufferWindowPresent(dma_resolve(show), s_gpu.pitch);
+                xbox_FramebufferWindowSet(dma_resolve(show), pitch);
+                xbox_FramebufferWindowPresent(dma_resolve(show), pitch);
             } else {
                 nv2a_pb_exec_flush();
             }
