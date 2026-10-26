@@ -170,12 +170,12 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
      * a clean enumeration and a title that still saw no gamepad.
      */
     if ((setup->bmRequestType & 0x60u) == 0x40u) {   /* vendor */
-        static const uint8_t xid_desc[16] = {
+        static uint8_t xid_desc[16] = {
             0x10,           /* bLength                                  */
             0x42,           /* bDescriptorType: XID                     */
             0x00, 0x01,     /* bcdXid 1.00                              */
             0x01,           /* bType: gamepad                           */
-            0x02,           /* bSubType: gamepad S                      */
+            0x02,           /* bSubType: gamepad S (RECOMP_PAD_SUBTYPE) */
             20,             /* bMaxInputReportSize                      */
             6,              /* bMaxOutputReportSize                     */
             0xFF, 0xFF, 0xFF, 0xFF,   /* wAlternateProductIds[0..1]     */
@@ -194,6 +194,8 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
             0x00, 6, 0xFF, 0xFF, 0xFF, 0xFF
         };
 
+        if (getenv("RECOMP_PAD_SUBTYPE"))
+            xid_desc[5] = (uint8_t)strtoul(getenv("RECOMP_PAD_SUBTYPE"), NULL, 0);
         if (!is_in)
             return 0;                     /* accept, nothing to send back */
         if (setup->bRequest == REQ_GET_DESCRIPTOR
@@ -530,8 +532,11 @@ static void pad_script_apply(int pad, uint8_t *out)
             continue;
         if (!st->announced) {
             st->announced = 1;
-            fprintf(stderr, "  PAD: t=%lu ms step %d (digital 0x%02X analog 0x%02X)\n",
-                    t, i, st->digital, st->analog);
+            LARGE_INTEGER qpc, qpf;   /* the clock the flip dump names its files by */
+            QueryPerformanceCounter(&qpc); QueryPerformanceFrequency(&qpf);
+            fprintf(stderr, "  PAD: t=%lu ms step %d (digital 0x%02X analog 0x%02X stick 0x%02X) qpc %.3f\n",
+                    t, i, st->digital, st->analog, st->stick,
+                    (double)qpc.QuadPart * 1000.0 / (double)qpf.QuadPart);
             fflush(stderr);
         }
         out[2] |= st->digital;
