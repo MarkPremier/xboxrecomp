@@ -3013,6 +3013,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         (void)kernel_vblank_wait_ms;
         kernel_nv2a_software_tick();  /* D3D software methods, at DISPATCH_LEVEL */
         kernel_vblank_tick();  /* the GPU's frame clock */
+        /* DPCs and timer DPCs only while no guest thread is at DISPATCH_LEVEL
+         * (see xbox_DpcGateEnter); queued DPCs and due timers keep for the
+         * next tick. */
+        if (!xbox_DpcGateEnter())
+            continue;
+        /* And not alongside the audio ISR (which only try-enters this): DirectSound's DPC
+         * and ISR edit the same voice lists, which one CPU never interleaves. */
+        xbox_GuestAudioGuardEnter();
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 
@@ -3046,6 +3054,8 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 }
             }
         }
+        xbox_GuestAudioGuardLeave();
+        xbox_DpcGateLeave();
     }
 }
 

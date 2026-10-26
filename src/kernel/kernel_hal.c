@@ -55,6 +55,78 @@ static volatile LONG g_guest_levels[256];
 static RECOMP_TLS int t_isr_irql = -1;   /* this ISR/DPC thread's level; -1 = not in one */
 static volatile LONG g_isr_active;       /* host ISRs/DPCs in flight */
 
+/* DPCs, the audio ISR and DISPATCH_LEVEL guest code, kept apart.
+ *
+ * On the console's one CPU nothing deferred runs while a thread sits at
+ * DISPATCH_LEVEL, and the XDK relies on it. XPP raises to DPC level around
+ * its transfer lists (KeRaiseIrqlToDpcLevel, 20 sites in Turok Evolution);
+ * DirectSound raises (0x1B1FFE) and then bumps a counter its ISR checks
+ * before unlinking a finished voice. Here DPCs run on the timer thread and
+ * the audio ISR on the APU thread, in parallel with guest threads, so the
+ * USB DPC walked lists the title was relinking (the pad stopped being polled
+ * a few seconds into some runs) and the audio ISR passed the counter check
+ * just before the title bumped it, then both edited one voice list (crash in
+ * sub_001B34BF while sounds were torn down for a level load).
+ *
+ * A handshake with interlocked operations on both sides: deferred work
+ * counts itself running, then backs off if any guest thread is raised; a
+ * thread raising to DISPATCH counts itself raised, then waits out deferred
+ * work already running. One of them always sees the other. On hardware an
+ * ISR could still preempt DISPATCH code; holding it off instead is what the
+ * device models already did (bounded), and what DirectSound's counter
+ * assumes the ISR observes atomically. */
+static volatile LONG g_async_running;
+static RECOMP_TLS int t_async_depth;
+
+int xbox_AsyncGateEnter(int force)
+{
+    InterlockedIncrement(&g_async_running);
+    if (!force && InterlockedCompareExchange(&g_guest_raised, 0, 0) > 0) {
+        InterlockedDecrement(&g_async_running);
+        return 0;
+    }
+    t_async_depth++;
+    return 1;
+}
+
+void xbox_AsyncGateLeave(void)
+{
+    t_async_depth--;
+    InterlockedDecrement(&g_async_running);
+}
+
+int xbox_DpcGateEnter(void)
+{
+    static ULONGLONG blocked_since;
+    static int warned;
+    ULONGLONG now;
+
+    if (xbox_AsyncGateEnter(0)) {
+        blocked_since = 0;
+        return 1;
+    }
+    /* Bounded, like the device models' interrupt hold-off: a guest that
+     * raised and never lowered must not stop deferred work for good. */
+    now = GetTickCount64();
+    if (!blocked_since)
+        blocked_since = now;
+    if (now - blocked_since < 250)
+        return 0;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr, "  [KERNEL] a guest thread held DISPATCH_LEVEL for 250 ms; "
+                        "running DPCs anyway\n");
+        fflush(stderr);
+    }
+    blocked_since = 0;
+    return xbox_AsyncGateEnter(1);
+}
+
+void xbox_DpcGateLeave(void)
+{
+    xbox_AsyncGateLeave();
+}
+
 static KIRQL irql_swap(KIRQL v)
 {
     if (t_isr_irql >= 0) { KIRQL o = (KIRQL)t_isr_irql; t_isr_irql = v; return o; }
@@ -62,8 +134,11 @@ static KIRQL irql_swap(KIRQL v)
     if (old != v) {
         if (v >= DISPATCH_LEVEL)
             InterlockedIncrement(&g_guest_levels[v]);
-        if (old < DISPATCH_LEVEL && v >= DISPATCH_LEVEL)
+        if (old < DISPATCH_LEVEL && v >= DISPATCH_LEVEL) {
             InterlockedIncrement(&g_guest_raised);
+            while (!t_async_depth && InterlockedCompareExchange(&g_async_running, 0, 0) > 0)
+                SwitchToThread();
+        }
         t_guest_irql = v;
         if (old >= DISPATCH_LEVEL)
             InterlockedDecrement(&g_guest_levels[old]);

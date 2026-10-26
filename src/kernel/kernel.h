@@ -806,6 +806,10 @@ KIRQL   __stdcall xbox_KeGetCurrentIrql(void);
  * Device models ask before delivering an interrupt; raising IRQL masks the
  * line for the whole processor on hardware, not just for one thread. */
 int     xbox_IrqlBlocksInterrupts(void);
+int     xbox_DpcGateEnter(void);   /* 0: a guest thread is at DISPATCH, try later */
+void    xbox_DpcGateLeave(void);
+int     xbox_AsyncGateEnter(int force);   /* same gate, for an ISR; 0: hold off */
+void    xbox_AsyncGateLeave(void);
 int     xbox_IrqlRaisedCount(void);
 int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
 void    xbox_IrqlLeaveInterrupt(int saved);
