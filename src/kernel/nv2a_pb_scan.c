@@ -307,6 +307,9 @@ void nv2a_pb_run(uint32_t put_va)
      * one. A local here lost it, and the RETURN then went nowhere (or worse,
      * took the stale s_get). */
     static uint32_t ret;
+    /* End of the static pushbuffer a RunPushBuffer CALL entered (see the
+     * CALL handling below); 0 when the call is not one. Persists with ret. */
+    static uint32_t call_end;
     uint32_t va;
     uint32_t budget = 0x200000u;
     const uint32_t win_lo = XBOX_CONTIG_BASE;
@@ -364,6 +367,15 @@ void nv2a_pb_run(uint32_t put_va)
     unsigned ret_u_n = 0;
 
     while (va != put_va && budget && !desync) {
+        if (call_end && va == call_end && !st.count) {
+            /* The end of a RunPushBuffer block: what follows is the JUMP D3D
+             * patched on for the block's latest use, not necessarily this
+             * one. Resume where this call's record says. */
+            va = ret;
+            ret = 0;
+            call_end = 0;
+            continue;
+        }
         if (va < win_lo || va + 4u > win_hi || (va & 3u)) {
             why = "read out of contiguous window";
             desync = 1;
@@ -413,10 +425,31 @@ void nv2a_pb_run(uint32_t put_va)
         } else if ((w & 3u) == 2u) {                                /* CALL */
             ret = va;                                               /* after CALL */
             off = w & 0x0FFFFFFCu;
+            call_end = 0;
+            /* XDK 4627 D3D RunPushBuffer (Turok Evolution): the CALL is
+             * followed by a four-word record the GPU never executes --
+             * 0, 0x80000000|target, size, resume VA -- and the static
+             * pushbuffer has no RETURN: D3D patches a JUMP onto its end
+             * (target + size) aimed at the latest call's resume VA, stale for
+             * every earlier call still queued. Returning to the word after
+             * the CALL decoded the record (0x80D2F000 is a reserved command)
+             * and the resync to PUT dropped the fence releases in between, so
+             * D3D's fence wait hung the title screen. Run [target, target +
+             * size) and resume after the record. */
+            if (va + 16u <= win_hi) {
+                const uint32_t *rec = (const uint32_t *)(mem + va);
+                uint32_t target_va = win_lo | off;
+                if (rec[0] == 0u && rec[1] == target_va && rec[2] && rec[2] < 0x400000u
+                        && !(rec[2] & 3u) && rec[3] == va + 16u
+                        && target_va + rec[2] <= win_hi) {
+                    ret = va + 16u;
+                    call_end = target_va + rec[2];
+                }
+            }
         } else if (w == 0x00020000u) {                              /* RETURN */
             /* A RETURN with no pending CALL is a no-op; taking it to address 0
              * walked the fake TIB and executed garbage, hanging at boot. */
-            if (ret) { va = ret; ret = 0; }
+            if (ret) { va = ret; ret = 0; call_end = 0; }
             continue;
         } else if ((w & 0xE0030003u) == 0u
                 || (w & 0xE0030003u) == 0x40000000u) {              /* method */
@@ -587,6 +620,7 @@ void nv2a_pb_run(uint32_t put_va)
     if (desync || !budget) {
         st.count = 0;
         ret = 0;
+        call_end = 0;
     }
     s_get = put_va;
 }
