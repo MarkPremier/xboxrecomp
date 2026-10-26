@@ -429,8 +429,14 @@ struct DynamicStream {
     ComPtr<ID3D11Buffer> buffer;
     UINT capacity = 0, used = 0;
     D3D11_MAPPED_SUBRESOURCE mapped = {};
-    bool active = false;   /* Map held across draws until the ring wraps / frame ends */
+    bool active = false;   /* mapped right now; always unmapped before a draw */
+    uint64_t generation = 0;   /* bumped by every DISCARD: older offsets are gone */
 };
+/* D3D11.1 driver capability: NO_OVERWRITE appends to a dynamic constant buffer.
+ * Without it every constant upload maps with DISCARD at offset 0. */
+static bool constant_no_overwrite;
+/* constant_stream.generation when uploaded_constants was written. */
+static uint64_t constant_upload_generation;
 static std::array<DynamicStream,2> vertex_streams;
 static DynamicStream constant_stream;
 static DynamicStream index_stream;
@@ -1708,7 +1714,7 @@ extern "C" uint32_t nv2a_gpu_flip(const void *presented, size_t bytes, uint32_t 
     } else {
         gpu_sync_impl(true, presented, bytes);
     }
-    /* Frame boundary: the GPU has consumed the stream; release the held Map. */
+    /* Draws unmap their own streams; this only guards against a stray Map. */
     for (auto &stream : vertex_streams) release_stream(stream);
     release_stream(constant_stream);
     s_texture_validate_serial++;
@@ -1928,10 +1934,16 @@ static void release_stream(DynamicStream &stream)
     }
 }
 
-/* Keep one Map alive across draws. A Map/Unmap pair per draw was ~800 driver
- * round trips per frame (281 k appends / 10 s); only re-map (DISCARD) when the
- * ring wraps or the buffer must be recreated. Draws issued while the buffer is
- * mapped read the committed append region normally. */
+/* A ring of dynamic memory: map, append, unmap -- the caller unmaps
+ * (release_stream) before the draw that reads it. DISCARD when the ring wraps,
+ * NO_OVERWRITE to append behind data earlier draws may still be reading.
+ *
+ * This used to hold one Map across all of a frame's draws. D3D11 only promises
+ * the GPU sees what was written to a mapped buffer once it is unmapped, and a
+ * native driver that uploads at Unmap fed every draw last frame's bytes at the
+ * same offset. Standing still that is invisible; whenever the batches before a
+ * draw changed size (Turok, about once a second), the weapon and HUD drew from
+ * other draws' vertices and constants -- the flicker. */
 static bool map_stream(DynamicStream &stream, UINT bytes, UINT bind, const char *kind, UINT &offset)
 {
     if (!stream.buffer || bytes > stream.capacity) {
@@ -1953,18 +1965,18 @@ static bool map_stream(DynamicStream &stream, UINT bytes, UINT bind, const char 
         stream.capacity = capacity;
         stream.used = 0;
     }
+    release_stream(stream);
     UINT aligned = (stream.used + 15u) & ~15u;
-    if (stream.active && (aligned > stream.capacity || bytes > stream.capacity - aligned)) {
-        release_stream(stream);
-        stream.used = 0;
-        aligned = 0;
-    }
-    if (!stream.active) {
-        if (!target_operation_succeeded(kind, "map stream",
-            context->Map(stream.buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &stream.mapped)))
-            return false;
-        stream.active = true;
-        aligned = 0;
+    bool discard = stream.used == 0 || aligned > stream.capacity || bytes > stream.capacity - aligned ||
+                   ((bind & D3D11_BIND_CONSTANT_BUFFER) && !constant_no_overwrite);
+    if (discard) aligned = 0;
+    if (!target_operation_succeeded(kind, "map stream",
+        context->Map(stream.buffer.Get(), 0, discard ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE,
+                     0, &stream.mapped)))
+        return false;
+    stream.active = true;
+    if (discard) {
+        stream.generation++;
         gpu_timing.stream_discards++;
     } else {
         gpu_timing.stream_appends++;
@@ -3134,8 +3146,8 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     UINT vertex_bytes = count * vertex_stride;
     UINT index_bytes = state->indices ? state->index_count * sizeof(uint32_t) : 0;
     UINT vertex_offset;
-    /* Vertex and index data share one dynamic buffer, written under one Map
-     * that is held across draws and released at the frame boundary. */
+    /* Vertex and index data share one dynamic buffer, appended and unmapped
+     * before the draw (see map_stream). */
     if (!map_stream(vertex_stream, vertex_bytes + index_bytes,
                     D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER, "geometry", vertex_offset))
         return 0;
@@ -3148,13 +3160,15 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         index_offset = vertex_offset + vertex_bytes;
         std::memcpy((uint8_t *)vertex_stream.mapped.pData + index_offset, state->indices, index_bytes);
     }
+    release_stream(vertex_stream);
     if (state->indices) context->IASetIndexBuffer(vertex_stream.buffer.Get(), DXGI_FORMAT_R32_UINT, index_offset);
     else context->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
     UINT constants_offset = 0;
     bool constants_ring = false;
     {
         GpuTimer constants_timer(gpu_timing.constants);
-        if (context1 && uploaded_constants_valid && constant_stream.active &&
+        if (context1 && uploaded_constants_valid && constant_stream.buffer &&
+                constant_upload_generation == constant_stream.generation &&
                 !std::memcmp(&uploaded_constants, &constants, sizeof constants)) {
             /* Same constants as the last upload this frame: rebind its offset. */
             gpu_timing.constant_reuses++;
@@ -3164,6 +3178,8 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             if (!map_stream(constant_stream, kConstantSlot, D3D11_BIND_CONSTANT_BUFFER, "constants", constants_offset))
                 return 0;
             std::memcpy((uint8_t *)constant_stream.mapped.pData + constants_offset, &constants, sizeof constants);
+            release_stream(constant_stream);
+            constant_upload_generation = constant_stream.generation;
             constant_upload_offset = constants_offset;
             uploaded_constants = constants;
             uploaded_constants_valid = true;
@@ -3332,6 +3348,8 @@ extern "C" int nv2a_gpu_available(void)
             if (FAILED(device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof options)) ||
                 !options.ConstantBufferOffsetting)
                 context1.Reset();
+            else
+                constant_no_overwrite = options.MapNoOverwriteOnDynamicConstantBuffer != FALSE;
         }
         std::fprintf(stderr, "[GPU-D3D11] constant buffer offsetting: %s\n",
                      context1 ? "supported" : "unavailable, using per-draw Map");
