@@ -181,9 +181,25 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
     unsigned int slot;
+    bool trapped = (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                   == NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
 
-    d->regs[NV_PAPU_FEDECMETH] = method;
-    d->regs[NV_PAPU_FEDECPARAM] = argument;
+    /* A trapped front end has stopped on FEDECMETH/FEDECPARAM until the
+     * driver's ISR reads them and resumes it (FECTL). Hardware processes no
+     * further method meanwhile; here the title's PIO writes still execute,
+     * but must not overwrite the trapped pair. They did: DirectSound's ISR
+     * reads the method, then the parameter, with the APU lock dropped, and
+     * paired SE2FE_IDLE_VOICE with the voice handle of a VOICE_OFF the game
+     * thread was issuing -- retiring a voice the game was tearing down
+     * (Turok Evolution: crash in sub_001B34BF under ISR 0x1B29D8). A second
+     * idle voice waits for the next frame's list walk instead; it is still
+     * in the list, so nothing is lost. */
+    if (trapped && method == SE2FE_IDLE_VOICE)
+        return;
+    if (!trapped) {
+        d->regs[NV_PAPU_FEDECMETH] = method;
+        d->regs[NV_PAPU_FEDECPARAM] = argument;
+    }
     unsigned int selected_handle, list;
 
     switch (method) {
