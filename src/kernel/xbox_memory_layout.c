@@ -1032,6 +1032,11 @@ static void event_signals_tick(void)
 }
 
 static int s_nv2a_trace = 0;
+/* The periodic GPU/pushbuffer report. It publishes every GPU surface to guest
+ * RAM first (nv2a_pb_exec_report -> nv2a_gpu_flush), a ~450 ms stall in
+ * Turok Evolution, so it is a diagnostic to ask for, not a side effect of
+ * running the executor. */
+static int s_nv2a_report = 0;
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
  * second so a run can answer the only question that matters before building a
@@ -1317,7 +1322,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         report_ms = e ? atol(e) : 10000;
                         if (report_ms < 100) report_ms = 100;
                     }
-                    if (s_nv2a_trace && now_ms - last_report > (uint64_t)report_ms) {
+                    if (s_nv2a_report && now_ms - last_report > (uint64_t)report_ms) {
                         last_report = now_ms;
                         nv2a_pb_scan_report();
                     }
@@ -2786,10 +2791,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             PAGE_READWRITE
         );
         /* The pushbuffer survey rides on the same poll, so either
-         * variable arms it. */
+         * variable arms it. The executor (RECOMP_PB_EXEC) runs without
+         * either: its report is opt-in through RECOMP_PB_REPORT_MS, or
+         * RECOMP_FB_DUMP, which writes its frames at report time. */
         s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
-                    || getenv("RECOMP_PB_SCAN") != NULL
-                    || getenv("RECOMP_PB_EXEC") != NULL;
+                    || getenv("RECOMP_PB_SCAN") != NULL;
+        s_nv2a_report = s_nv2a_trace
+                     || (getenv("RECOMP_PB_EXEC") != NULL
+                         && (getenv("RECOMP_PB_REPORT_MS") != NULL
+                             || getenv("RECOMP_FB_DUMP") != NULL));
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, no register semantics)\n",

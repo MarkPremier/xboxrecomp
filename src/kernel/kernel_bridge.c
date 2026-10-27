@@ -9956,10 +9956,15 @@ static void kernel_thunk_dispatch_body(void)
     }
 
     {
+        /* RECOMP_KERNEL_SUMMARY: every two seconds, from whichever guest
+         * thread is in the kernel at the time. Opt-in: it runs inside a
+         * title's kernel call. */
         static DWORD last_summary_tick = 0;
+        static int summary = -1;
         DWORD now = GetTickCount();
+        if (summary < 0) summary = getenv("RECOMP_KERNEL_SUMMARY") != NULL;
         if (last_summary_tick == 0) last_summary_tick = now;
-        if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
+        if (summary && now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
             fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             /* And which ones, ranked. "Latest" names whatever the sample

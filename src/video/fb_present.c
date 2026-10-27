@@ -74,6 +74,34 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     if (!s_fb_running || !fb_va || !pitch)
         return;
     InterlockedIncrement64(&s_present_frame);
+    {
+        /* RECOMP_HITCH_MS=<n>: log every flip that came more than n ms after
+         * the previous one, stamped with seconds since the first flip, so a
+         * periodic stutter can be lined up against whatever else the log
+         * shows at the same moment. */
+        static double threshold = -1.0, frequency, first;
+        static LARGE_INTEGER last;
+        LARGE_INTEGER now;
+        if (threshold < 0.0) {
+            const char *e = getenv("RECOMP_HITCH_MS");
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            frequency = (double)f.QuadPart;
+            threshold = e ? atof(e) : 0.0;
+        }
+        if (threshold > 0.0) {
+            QueryPerformanceCounter(&now);
+            if (!first) first = (double)now.QuadPart;
+            if (last.QuadPart) {
+                double ms = (double)(now.QuadPart - last.QuadPart) * 1000.0 / frequency;
+                if (ms > threshold)
+                    fprintf(stderr, "[HITCH] t=%.3f s frame %lld took %.1f ms\n",
+                            ((double)now.QuadPart - first) / frequency,
+                            (long long)s_present_frame, ms);
+            }
+            last = now;
+        }
+    }
     if (getenv("RECOMP_FB_VA"))
         return;                       /* pinned: leave the old path alone */
     next = (s_present_idx == 0) ? 1 : 0;
