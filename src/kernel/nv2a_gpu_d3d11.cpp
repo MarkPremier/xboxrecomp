@@ -331,9 +331,18 @@ struct TargetExtent {
     uint32_t width = 0, height = 0;
 };
 
+/* A target's width and height are the title's (guest RAM's); texture_width
+ * and texture_height are its texture's, larger by RECOMP_RENDER_SCALE. A scaled
+ * target reaches guest RAM through `resolve` (its guest-size copy, drawn down
+ * from the texture before a publish) and takes guest RAM through `upload`
+ * (drawn up into the texture by a refresh). */
 struct Surface {
     uint8_t *memory;
     uint32_t width, height, pitch;
+    uint32_t texture_width, texture_height;
+    ComPtr<ID3D11Texture2D> resolve, upload;
+    ComPtr<ID3D11RenderTargetView> resolve_target;
+    ComPtr<ID3D11ShaderResourceView> upload_view;
     bool dirty, needs_refresh, snapshot_valid;
     bool clear_value_valid;
     uint32_t clear_value;
@@ -360,6 +369,10 @@ struct CachedTexture {
 struct DepthSurface {
     uint8_t *memory;
     uint32_t width, height, pitch, format;
+    uint32_t texture_width, texture_height;   /* as Surface */
+    ComPtr<ID3D11Texture2D> resolve, upload;
+    ComPtr<ID3D11DepthStencilView> resolve_view;
+    ComPtr<ID3D11ShaderResourceView> upload_view;
     bool dirty, needs_refresh, snapshot_valid;
     bool clear_value_valid;
     uint32_t clear_value;
@@ -371,6 +384,61 @@ struct DepthSurface {
     ComPtr<ID3D11DepthStencilView> view;
     ComPtr<ID3D11ShaderResourceView> sample_view;   /* depth as a texture: shadow-map stages */
 };
+
+/* RECOMP_RENDER_SCALE=<n> (1 to 8, may be fractional): colour targets, and
+ * the depth targets drawn with them, are n times the title's size on each
+ * axis. Vertex positions arrive in the title's pixels and are mapped through
+ * its viewport size, so geometry fills the larger target by itself; scissors,
+ * window clips and target-to-target copies are scaled where they are set. A
+ * depth target only ever drawn without colour (a shadow map) keeps its size.
+ *
+ * Unset or "auto": the whole multiple of 480 lines that covers the primary
+ * monitor's height (3 on 1440p), so the frame is rendered at least at the
+ * screen's own resolution. */
+static float render_scale()
+{
+    static const float scale = []() {
+        const char *value = std::getenv("RECOMP_RENDER_SCALE");
+        if (!value || !*value || !_stricmp(value, "auto")) {
+            DEVMODEA mode = {};
+            mode.dmSize = sizeof mode;
+            if (!EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) || !mode.dmPelsHeight) return 1.0f;
+            float automatic = (float)std::min<DWORD>((mode.dmPelsHeight + 479) / 480, 4);
+            std::fprintf(stderr, "[GPU-D3D11] render scale %gx (monitor %lux%lu)\n", automatic,
+                         mode.dmPelsWidth, mode.dmPelsHeight);
+            return automatic;
+        }
+        float requested = (float)std::atof(value);
+        return requested >= 1.0f && requested <= 8.0f ? requested : 1.0f;
+    }();
+    return scale;
+}
+
+static UINT scaled_extent(uint32_t size, bool scaled)
+{
+    if (!scaled || render_scale() == 1.0f) return size;
+    return std::min<UINT>((UINT)((float)size * render_scale() + 0.5f), D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
+}
+
+template<typename Target>
+static bool is_scaled(const Target &target)
+{
+    return target.texture_width != target.width || target.texture_height != target.height;
+}
+
+/* Depth targets seen in a depth-only draw: those stay at the title's size. */
+static std::set<const uint8_t *> depth_only_targets;
+
+static bool depth_scaled(const uint8_t *memory)
+{
+    return render_scale() != 1.0f && !depth_only_targets.count(memory);
+}
+
+/* One edge of a rectangle, from one target's pixels to another's. */
+static LONG scale_edge(LONG value, uint32_t from, uint32_t to)
+{
+    return from == to ? value : (LONG)(((int64_t)value * to + from / 2) / from);
+}
 
 struct Constants {
     uint32_t control[4], misc[4], stages[8][4], final_input[4];
@@ -946,6 +1014,138 @@ static bool surface_memory_matches(const SurfaceType &surface, uint32_t bytes)
     return true;
 }
 
+/* Draw `source` onto a target of another size, nearest texel: colour onto a
+ * render target, or depth (the source's red channel, as SV_Depth) onto a depth
+ * view. Only `box` (target pixels) is written when one is given. This is the
+ * bridge between a scaled target and guest RAM's size, both ways. */
+static bool scale_blit(ID3D11ShaderResourceView *source, ID3D11RenderTargetView *color,
+                       ID3D11DepthStencilView *depth, UINT width, UINT height, const D3D11_BOX *box = nullptr)
+{
+    struct BlitPipeline {
+        ComPtr<ID3D11VertexShader> vertex;
+        ComPtr<ID3D11PixelShader> color, depth;
+        ComPtr<ID3D11SamplerState> sampler;
+        ComPtr<ID3D11RasterizerState> raster;
+        ComPtr<ID3D11BlendState> blend;
+        ComPtr<ID3D11DepthStencilState> depth_write, depth_off;
+    };
+    static BlitPipeline pipeline;
+    static bool failed;
+    if (failed || !source || (!color && !depth)) return false;
+    if (!pipeline.vertex) {
+        static const char text[] =
+            "Texture2D<float4> image:register(t0);SamplerState nearest:register(s0);"
+            "struct V{float4 position:SV_Position;float2 uv:TEXCOORD0;};"
+            "V vs(uint id:SV_VertexID){V v;float2 t=float2((id<<1)&2,id&2);"
+            "v.position=float4(t*float2(2,-2)+float2(-1,1),0,1);v.uv=t;return v;}"
+            "float4 color_ps(V v):SV_Target{return image.SampleLevel(nearest,v.uv,0);}"
+            "float depth_ps(V v):SV_Depth{return image.SampleLevel(nearest,v.uv,0).r;}";
+        BlitPipeline created;
+        ComPtr<ID3DBlob> vertex, color_pixel, depth_pixel, errors;
+        HRESULT result = D3DCompile(text, sizeof text - 1, "NV2A scale blit", nullptr, nullptr, "vs", "vs_5_0",
+                                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vertex, &errors);
+        if (SUCCEEDED(result))
+            result = D3DCompile(text, sizeof text - 1, "NV2A scale blit", nullptr, nullptr, "color_ps", "ps_5_0",
+                                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &color_pixel, &errors);
+        if (SUCCEEDED(result))
+            result = D3DCompile(text, sizeof text - 1, "NV2A scale blit", nullptr, nullptr, "depth_ps", "ps_5_0",
+                                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &depth_pixel, &errors);
+        if (SUCCEEDED(result))
+            result = device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(), nullptr, &created.vertex);
+        if (SUCCEEDED(result))
+            result = device->CreatePixelShader(color_pixel->GetBufferPointer(), color_pixel->GetBufferSize(), nullptr, &created.color);
+        if (SUCCEEDED(result))
+            result = device->CreatePixelShader(depth_pixel->GetBufferPointer(), depth_pixel->GetBufferSize(), nullptr, &created.depth);
+        D3D11_SAMPLER_DESC sampler = {};
+        sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        if (SUCCEEDED(result)) result = device->CreateSamplerState(&sampler, &created.sampler);
+        D3D11_RASTERIZER_DESC raster = {};
+        raster.FillMode = D3D11_FILL_SOLID; raster.CullMode = D3D11_CULL_NONE; raster.ScissorEnable = TRUE;
+        if (SUCCEEDED(result)) result = device->CreateRasterizerState(&raster, &created.raster);
+        D3D11_BLEND_DESC blend = {};
+        blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (SUCCEEDED(result)) result = device->CreateBlendState(&blend, &created.blend);
+        D3D11_DEPTH_STENCIL_DESC depth_state = {};
+        if (SUCCEEDED(result)) result = device->CreateDepthStencilState(&depth_state, &created.depth_off);
+        depth_state.DepthEnable = TRUE; depth_state.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+        depth_state.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        if (SUCCEEDED(result)) result = device->CreateDepthStencilState(&depth_state, &created.depth_write);
+        if (FAILED(result)) {
+            std::fprintf(stderr, "[GPU-D3D11] scale blit unavailable: 0x%08X %s\n", (unsigned)result,
+                         errors ? (const char *)errors->GetBufferPointer() : "");
+            failed = true;
+            return false;
+        }
+        pipeline = std::move(created);
+    }
+    D3D11_RECT clip = {0, 0, (LONG)width, (LONG)height};
+    if (box) clip = {(LONG)box->left, (LONG)box->top, (LONG)box->right, (LONG)box->bottom};
+    ID3D11ShaderResourceView *none[12] = {};
+    context->PSSetShaderResources(0, 12, none);
+    context->OMSetRenderTargets(color ? 1 : 0, color ? &color : nullptr, depth);
+    context->OMSetBlendState(pipeline.blend.Get(), nullptr, UINT_MAX);
+    context->OMSetDepthStencilState(depth ? pipeline.depth_write.Get() : pipeline.depth_off.Get(), 0);
+    context->IASetInputLayout(nullptr);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->VSSetShader(pipeline.vertex.Get(), nullptr, 0);
+    context->GSSetShader(nullptr, nullptr, 0);
+    context->PSSetShader(color ? pipeline.color.Get() : pipeline.depth.Get(), nullptr, 0);
+    context->PSSetShaderResources(0, 1, &source);
+    ID3D11SamplerState *sampler = pipeline.sampler.Get();
+    context->PSSetSamplers(0, 1, &sampler);
+    context->RSSetState(pipeline.raster.Get());
+    D3D11_VIEWPORT viewport = {0, 0, (float)width, (float)height, 0, 1};
+    context->RSSetViewports(1, &viewport);
+    context->RSSetScissorRects(1, &clip);
+    context->Draw(3, 0);
+    context->PSSetShaderResources(0, 1, none);
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    return true;
+}
+
+/* A box of guest pixels as the scaled texture's pixels, rounded outward. */
+template<typename Target>
+static D3D11_BOX texture_box(const Target &target, const D3D11_BOX &box)
+{
+    D3D11_BOX scaled = box;
+    scaled.left = (UINT)((uint64_t)box.left * target.texture_width / target.width);
+    scaled.top = (UINT)((uint64_t)box.top * target.texture_height / target.height);
+    scaled.right = (UINT)(((uint64_t)box.right * target.texture_width + target.width - 1) / target.width);
+    scaled.bottom = (UINT)(((uint64_t)box.bottom * target.texture_height + target.height - 1) / target.height);
+    return scaled;
+}
+
+/* Guest RAM's pixels (`box` of them, or all) into a colour target. */
+static void upload_surface(Surface &surface, const D3D11_BOX *box, const void *data, UINT row_pitch)
+{
+    if (!is_scaled(surface)) {
+        context->UpdateSubresource(surface.texture.Get(), 0, box, data, row_pitch, 0);
+        return;
+    }
+    context->UpdateSubresource(surface.upload.Get(), 0, box, data, row_pitch, 0);
+    D3D11_BOX all = {0, 0, 0, surface.width, surface.height, 1};
+    D3D11_BOX target = texture_box(surface, box ? *box : all);
+    scale_blit(surface.upload_view.Get(), surface.target.Get(), nullptr,
+               surface.texture_width, surface.texture_height, &target);
+}
+
+/* What a guest-size staging copy reads: the target itself, or for a scaled
+ * one its resolve, drawn down from the texture first. */
+static ID3D11Texture2D *publish_source(Surface &surface)
+{
+    if (!is_scaled(surface)) return surface.texture.Get();
+    scale_blit(surface.view.Get(), surface.resolve_target.Get(), nullptr, surface.width, surface.height);
+    return surface.resolve.Get();
+}
+
+static ID3D11Texture2D *publish_source(DepthSurface &surface)
+{
+    if (!is_scaled(surface)) return surface.texture.Get();
+    scale_blit(surface.sample_view.Get(), nullptr, surface.resolve_view.Get(), surface.width, surface.height);
+    return surface.resolve.Get();
+}
+
 static void refresh_surface(Surface &surface)
 {
     if (!surface.needs_refresh) return;
@@ -976,9 +1176,9 @@ static void refresh_surface(Surface &surface)
                 std::memcpy(surface.source_snapshot.data() + (size_t)row * row_bytes + changed.left * 4,
                             surface.memory + (size_t)row * surface.pitch + changed.left * 4,
                             (size_t)(changed.right - changed.left) * 4);
-            context->UpdateSubresource(surface.texture.Get(), 0, &changed,
-                                      surface.source_snapshot.data() + (size_t)changed.top * row_bytes + changed.left * 4,
-                                      (UINT)row_bytes, 0);
+            upload_surface(surface, &changed,
+                           surface.source_snapshot.data() + (size_t)changed.top * row_bytes + changed.left * 4,
+                           (UINT)row_bytes);
             surface.alias_copy_serial = 0;
             gpu_timing.color_refreshed++;
             gpu_timing.color_refresh_bytes += (uint64_t)(changed.right - changed.left) * (changed.bottom - changed.top) * 4;
@@ -987,7 +1187,7 @@ static void refresh_surface(Surface &surface)
         surface.needs_refresh = false;
         return;
     }
-    context->UpdateSubresource(surface.texture.Get(), 0, nullptr, surface.memory, surface.pitch, 0);
+    upload_surface(surface, nullptr, surface.memory, surface.pitch);
     surface.clear_value_valid = false;
     surface.alias_copy_serial = 0;
     gpu_timing.color_refresh_bytes += (uint64_t)surface.width * surface.height * 4;
@@ -1023,7 +1223,12 @@ static bool refresh_depth(DepthSurface &surface)
         encode_depth_row(surface.format, source, destination, surface.width);
     }
     context->Unmap(surface.staging.Get(), 0);
-    context->CopyResource(surface.texture.Get(), surface.staging.Get());
+    if (is_scaled(surface)) {
+        context->CopyResource(surface.upload.Get(), surface.staging.Get());
+        scale_blit(surface.upload_view.Get(), nullptr, surface.view.Get(), surface.texture_width, surface.texture_height);
+    } else {
+        context->CopyResource(surface.texture.Get(), surface.staging.Get());
+    }
     surface.clear_value_valid = false;
     surface.needs_refresh = false;
     surface.snapshot_valid = false;
@@ -1042,22 +1247,37 @@ static Surface *get_surface(const Nv2aGpuDraw &state, bool preserve = true, Targ
             return &surface;
         }
     D3D11_TEXTURE2D_DESC description = {};
-    description.Width = extent.width; description.Height = extent.height;
+    Surface surface = {};
+    surface.memory = state.color; surface.width = extent.width; surface.height = extent.height; surface.pitch = state.pitch;
+    surface.texture_width = scaled_extent(extent.width, true);
+    surface.texture_height = scaled_extent(extent.height, true);
+    surface.last_used = ++surface_use_serial;
+    bool scaled = is_scaled(surface);
+    description.Width = surface.texture_width; description.Height = surface.texture_height;
     description.MipLevels = description.ArraySize = 1;
     description.Format = DXGI_FORMAT_B8G8R8A8_UNORM; description.SampleDesc.Count = 1;
     description.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    Surface surface = {};
-    surface.memory = state.color; surface.width = extent.width; surface.height = extent.height; surface.pitch = state.pitch;
-    surface.last_used = ++surface_use_serial;
     D3D11_SUBRESOURCE_DATA data = {state.color, state.pitch, 0};
-    if (!target_operation_succeeded("color", "create texture", device->CreateTexture2D(&description, preserve ? &data : nullptr, &surface.texture)) ||
+    if (!target_operation_succeeded("color", "create texture", device->CreateTexture2D(&description, preserve && !scaled ? &data : nullptr, &surface.texture)) ||
         !target_operation_succeeded("color", "create view", device->CreateRenderTargetView(surface.texture.Get(), nullptr, &surface.target)) ||
         !target_operation_succeeded("color", "create sample view", device->CreateShaderResourceView(surface.texture.Get(), nullptr, &surface.view))) return nullptr;
+    description.Width = extent.width; description.Height = extent.height;
+    if (scaled) {
+        if (!target_operation_succeeded("color", "create resolve", device->CreateTexture2D(&description, nullptr, &surface.resolve)) ||
+            !target_operation_succeeded("color", "create resolve view", device->CreateRenderTargetView(surface.resolve.Get(), nullptr, &surface.resolve_target)) ||
+            !target_operation_succeeded("color", "create upload", device->CreateTexture2D(&description, nullptr, &surface.upload)) ||
+            !target_operation_succeeded("color", "create upload view", device->CreateShaderResourceView(surface.upload.Get(), nullptr, &surface.upload_view))) return nullptr;
+    }
     description.BindFlags = 0; description.Usage = D3D11_USAGE_STAGING; description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     if (!target_operation_succeeded("color", "create staging", device->CreateTexture2D(&description, nullptr, &surface.staging))) return nullptr;
     surfaces.push_back(std::move(surface));
     gpu_timing.color_created++;
-    return &surfaces.back();
+    Surface &created = surfaces.back();
+    if (preserve && scaled) {
+        created.needs_refresh = true;
+        refresh_surface(created);
+    }
+    return &created;
 }
 
 static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, TargetExtent extent = {})
@@ -1074,20 +1294,24 @@ static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, T
                      state.depth_pitch, extent.width, state.depth_format);
         return nullptr;
     }
+    UINT texture_width = scaled_extent(extent.width, depth_scaled(state.depth));
+    UINT texture_height = scaled_extent(extent.height, depth_scaled(state.depth));
     for (auto &surface : depth_surfaces)
         if (surface.memory == state.depth && surface.width == extent.width && surface.height == extent.height &&
-            surface.pitch == state.depth_pitch && surface.format == state.depth_format) {
+            surface.pitch == state.depth_pitch && surface.format == state.depth_format &&
+            surface.texture_width == texture_width && surface.texture_height == texture_height) {
             surface.last_used = ++surface_use_serial;
             if (!preserve) { surface.needs_refresh = false; return &surface; }
             return refresh_depth(surface) ? &surface : nullptr;
         }
     D3D11_TEXTURE2D_DESC description = {};
-    description.Width = extent.width; description.Height = extent.height;
+    description.Width = texture_width; description.Height = texture_height;
     description.MipLevels = description.ArraySize = 1; description.SampleDesc.Count = 1;
     description.Format = bytes == 2 ? DXGI_FORMAT_R16_TYPELESS : DXGI_FORMAT_R24G8_TYPELESS;
     description.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
     DepthSurface surface = {};
     surface.memory = state.depth; surface.width = extent.width; surface.height = extent.height; surface.pitch = state.depth_pitch; surface.format = state.depth_format;
+    surface.texture_width = texture_width; surface.texture_height = texture_height;
     surface.last_used = ++surface_use_serial;
     D3D11_DEPTH_STENCIL_VIEW_DESC view = {};
     view.Format = bytes == 2 ? DXGI_FORMAT_D16_UNORM : DXGI_FORMAT_D24_UNORM_S8_UINT; view.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
@@ -1097,6 +1321,15 @@ static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, T
     if (!target_operation_succeeded("depth", "create texture", device->CreateTexture2D(&description, nullptr, &surface.texture)) ||
         !target_operation_succeeded("depth", "create view", device->CreateDepthStencilView(surface.texture.Get(), &view, &surface.view)) ||
         !target_operation_succeeded("depth", "create sample view", device->CreateShaderResourceView(surface.texture.Get(), &sample, &surface.sample_view))) return nullptr;
+    description.Width = extent.width; description.Height = extent.height;
+    if (is_scaled(surface)) {
+        description.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        if (!target_operation_succeeded("depth", "create resolve", device->CreateTexture2D(&description, nullptr, &surface.resolve)) ||
+            !target_operation_succeeded("depth", "create resolve view", device->CreateDepthStencilView(surface.resolve.Get(), &view, &surface.resolve_view))) return nullptr;
+        description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (!target_operation_succeeded("depth", "create upload", device->CreateTexture2D(&description, nullptr, &surface.upload)) ||
+            !target_operation_succeeded("depth", "create upload view", device->CreateShaderResourceView(surface.upload.Get(), &sample, &surface.upload_view))) return nullptr;
+    }
     description.Usage = D3D11_USAGE_STAGING; description.BindFlags = 0; description.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
     if (!target_operation_succeeded("depth", "create staging", device->CreateTexture2D(&description, nullptr, &surface.staging))) return nullptr;
     // Creation-data uploads can round D24 values; use the bit-preserving refresh path.
@@ -1278,13 +1511,14 @@ static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_
                     has_known_clear = true;
                     continue;
                 }
+                ID3D11Texture2D *source = publish_source(surface);
                 if (surface.snapshot_valid) {
                     const auto &region = surface.written_region;
                     context->CopySubresourceRegion(surface.staging.Get(), 0, region.left, region.top, 0,
-                                                  surface.texture.Get(), 0, &region);
+                                                  source, 0, &region);
                     gpu_timing.color_copy_bytes += (uint64_t)(region.right - region.left) * (region.bottom - region.top) * 4;
                 } else {
-                    context->CopyResource(surface.staging.Get(), surface.texture.Get());
+                    context->CopyResource(surface.staging.Get(), source);
                     gpu_timing.color_copy_bytes += (uint64_t)surface.width * surface.height * 4;
                 }
                 has_readback = true;
@@ -1296,7 +1530,7 @@ static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_
                     has_known_clear = true;
                     continue;
                 }
-                context->CopyResource(surface.staging.Get(), surface.texture.Get());
+                context->CopyResource(surface.staging.Get(), publish_source(surface));
                 has_readback = true;
             }
     }
@@ -1671,12 +1905,13 @@ static bool stage_flip(const void *presented, size_t bytes, uint32_t va, uint32_
 {
     Surface *surface = surface_for_memory(presented);
     if (!surface) return false;
+    ID3D11Texture2D *source = publish_source(*surface);
     if (surface->snapshot_valid) {
         const auto &region = surface->written_region;
         context->CopySubresourceRegion(surface->staging.Get(), 0, region.left, region.top, 0,
-                                       surface->texture.Get(), 0, &region);
+                                       source, 0, &region);
     } else {
-        context->CopyResource(surface->staging.Get(), surface->texture.Get());
+        context->CopyResource(surface->staging.Get(), source);
     }
     if (!s_pending_flip.event) {
         D3D11_QUERY_DESC description = {D3D11_QUERY_EVENT, 0};
@@ -1722,7 +1957,7 @@ extern "C" uint32_t nv2a_gpu_flip(const void *presented, size_t bytes, uint32_t 
             int n = 0;
             for (auto &surface : depth_surfaces) {
                 if (surface.format != 1) continue;
-                context->CopyResource(surface.staging.Get(), surface.texture.Get());
+                context->CopyResource(surface.staging.Get(), publish_source(surface));
                 D3D11_MAPPED_SUBRESOURCE mapped = {};
                 if (FAILED(context->Map(surface.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) continue;
                 char path[64]; std::snprintf(path, sizeof path, "depth_%d_%ux%u.pgm", n++, surface.width, surface.height);
@@ -2034,7 +2269,8 @@ static bool matches_color_target(const Surface &surface, const Nv2aGpuDraw &stat
 static bool matches_depth_target(const DepthSurface &surface, const Nv2aGpuDraw &state, TargetExtent extent)
 {
     return surface.memory == state.depth && surface.width == extent.width &&
-        surface.height == extent.height && surface.pitch == state.depth_pitch && surface.format == state.depth_format;
+        surface.height == extent.height && surface.pitch == state.depth_pitch && surface.format == state.depth_format &&
+        surface.texture_width == scaled_extent(extent.width, depth_scaled(state.depth));
 }
 
 static TargetExtent reusable_target_extent(const Nv2aGpuDraw &state)
@@ -2461,7 +2697,12 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                     region.right = std::min(region.right, direct->width);
                     region.bottom = std::min(region.bottom, direct->height);
                     if (region.left >= region.right || region.top >= region.bottom) continue;
-                    auto copy = [&](const D3D11_BOX &box) {
+                    auto copy = [&](const D3D11_BOX &guest_box) {
+                        /* Both are colour targets, so scaled alike: the box in texture pixels. */
+                        D3D11_BOX box = texture_box(*direct, guest_box);
+                        box.right = std::min(box.right, std::min(direct->texture_width, surface.texture_width));
+                        box.bottom = std::min(box.bottom, std::min(direct->texture_height, surface.texture_height));
+                        if (box.left >= box.right || box.top >= box.bottom) return;
                         context->CopySubresourceRegion(direct->texture.Get(), 0, box.left, box.top, 0,
                                                       surface.texture.Get(), 0, &box);
                         direct->clear_value_valid = false;
@@ -3056,8 +3297,13 @@ static bool clear_target_rectangle(const Nv2aGpuDraw &state, Surface *surface, D
     ID3D11Buffer *buffer = pipeline.constants.Get();
     context->VSSetConstantBuffers(0, 1, &buffer);
     context->PSSetConstantBuffers(0, 1, &buffer);
-    D3D11_VIEWPORT viewport = {0, 0, (float)state.width, (float)state.height, 0, 1};
-    D3D11_RECT clip = {0, 0, (LONG)state.width, (LONG)state.height};
+    /* The rectangle is the title's; the target may be larger by the render scale. */
+    uint32_t guest_width = surface ? surface->width : depth->width, guest_height = surface ? surface->height : depth->height;
+    uint32_t texture_width = surface ? surface->texture_width : depth->texture_width;
+    uint32_t texture_height = surface ? surface->texture_height : depth->texture_height;
+    D3D11_RECT clip = {0, 0, scale_edge((LONG)state.width, guest_width, texture_width),
+                       scale_edge((LONG)state.height, guest_height, texture_height)};
+    D3D11_VIEWPORT viewport = {0, 0, (float)clip.right, (float)clip.bottom, 0, 1};
     context->RSSetState(pipeline.raster.Get());
     context->RSSetViewports(1, &viewport);
     context->RSSetScissorRects(1, &clip);
@@ -3170,6 +3416,10 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     for (uint32_t vertex = 0; !state->vertex_program && !state->fixed_transform && vertex < count; vertex++)
         if (!nv_cpu_finite(vertices[vertex].position[0]) || !nv_cpu_finite(vertices[vertex].position[1]) ||
             !nv_cpu_finite(vertices[vertex].position[2]) || !nv_cpu_finite(vertices[vertex].position[3])) return 0;
+    if (render_scale() != 1.0f && state->depth && (state->depth_enable || state->stencil_enable)) {
+        if (depth_only) depth_only_targets.insert(state->depth);
+        else depth_only_targets.erase(state->depth);
+    }
     TargetExtent extent = reusable_target_extent(*state);
     prepare_target_cache(*state, extent);
     static const Surface no_color_target = {};
@@ -3177,6 +3427,13 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     if (!surface && !depth_only) return 0;
     DepthSurface *depth = state->depth_enable || state->stencil_enable ? get_depth(*state, true, extent) : nullptr;
     if ((state->depth_enable || state->stencil_enable) && !depth) return reject("depth/stencil surface");
+    if (surface && depth && (surface->texture_width != depth->texture_width || surface->texture_height != depth->texture_height))
+        return reject("colour and depth targets at different render scales");
+    /* Title pixels to target pixels (RECOMP_RENDER_SCALE). */
+    uint32_t guest_width = surface ? surface->width : depth ? depth->width : state->width;
+    uint32_t guest_height = surface ? surface->height : depth ? depth->height : state->height;
+    uint32_t target_width = surface ? surface->texture_width : depth ? depth->texture_width : state->width;
+    uint32_t target_height = surface ? surface->texture_height : depth ? depth->texture_height : state->height;
     D3D11_DEPTH_STENCIL_DESC depth_description = {};
     depth_description.DepthEnable = state->depth_enable != 0;
     depth_description.DepthWriteMask = state->depth_mask ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
@@ -3218,6 +3475,20 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
                       (LONG)std::min(state->clip_y + state->clip_height, state->height)};
     if (state->topology == NV2A_GPU_TOPOLOGY_TRIANGLES && state->cull_enable && state->cull_face == 0x408) { clip.right = clip.left; clip.bottom = clip.top; }
     configure_window_clip(*state, constants, clip);
+    const D3D11_RECT guest_clip = clip;   /* what the draw may write, in title pixels */
+    if (target_width != guest_width || target_height != guest_height) {
+        clip.left = scale_edge(clip.left, guest_width, target_width);
+        clip.right = scale_edge(clip.right, guest_width, target_width);
+        clip.top = scale_edge(clip.top, guest_height, target_height);
+        clip.bottom = scale_edge(clip.bottom, guest_height, target_height);
+        for (uint32_t rectangle = 0; rectangle < constants.window_clip_control[1] && rectangle < 8; rectangle++) {
+            auto &bounds = constants.window_clip_rects[rectangle];
+            bounds[0] = (uint32_t)scale_edge((LONG)bounds[0], guest_width, target_width);
+            bounds[1] = (uint32_t)scale_edge((LONG)bounds[1], guest_height, target_height);
+            bounds[2] = (uint32_t)scale_edge((LONG)bounds[2], guest_width, target_width);
+            bounds[3] = (uint32_t)scale_edge((LONG)bounds[3], guest_height, target_height);
+        }
+    }
     constants.control[0] = state->combiners.control & 255u; constants.control[1] = state->stage_program;
     constants.control[2] = state->alpha_enable; constants.control[3] = state->alpha_function; constants.misc[0] = state->alpha_reference;
     constants.misc[1] = state->control0;
@@ -3546,12 +3817,13 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         context->GSSetConstantBuffers(0, 1, constants_buffer);
     }
     context->PSSetShaderResources(0, 12, resources); context->PSSetSamplers(0, 4, sampler_states);
-    D3D11_VIEWPORT viewport = {0,0,(float)state->width,(float)state->height,0,1};
+    D3D11_VIEWPORT viewport = {0, 0, (float)scale_edge((LONG)state->width, guest_width, target_width),
+                               (float)scale_edge((LONG)state->height, guest_height, target_height), 0, 1};
     D3D11_BOX region = {};
-    region.left = clip.left > 0 ? (UINT)clip.left : 0;
-    region.top = clip.top > 0 ? (UINT)clip.top : 0;
-    region.right = clip.right > 0 ? (UINT)clip.right : 0;
-    region.bottom = clip.bottom > 0 ? (UINT)clip.bottom : 0;
+    region.left = guest_clip.left > 0 ? (UINT)guest_clip.left : 0;
+    region.top = guest_clip.top > 0 ? (UINT)guest_clip.top : 0;
+    region.right = guest_clip.right > 0 ? (UINT)guest_clip.right : 0;
+    region.bottom = guest_clip.bottom > 0 ? (UINT)guest_clip.bottom : 0;
     if (region.right > state->width) region.right = state->width;
     if (region.bottom > state->height) region.bottom = state->height;
     region.back = 1;
