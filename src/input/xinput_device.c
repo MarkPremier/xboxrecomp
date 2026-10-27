@@ -242,6 +242,7 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
 extern int xbox_FramebufferMouseDelta(int *dx, int *dy);
 extern int xbox_FramebufferMouseButton(int which);
 extern int xbox_FramebufferMouseWheel(void);
+extern int xbox_FramebufferMenuPointer(void);
 
 static BOOL kbm_enabled(void)
 {
@@ -430,6 +431,30 @@ void xbox_KbmSetRawMouse(int on)
     InterlockedExchange(&kbm_raw_mouse, on != 0);
 }
 
+/* A title's own presses (a menu pointer's click, say): `target` (a
+ * RECOMP_KBM_MAP name) reads as held for `ms` from now. Any thread. */
+static volatile LONG kbm_pulse_until[KB_COUNT];
+
+void xbox_KbmPulse(const char *target, int ms)
+{
+    unsigned i;
+    for (i = 0; i < KB_COUNT; i++)
+        if (!strcmp(kbm_binds[i].name, target))
+            InterlockedExchange(&kbm_pulse_until[i], (LONG)(GetTickCount() + (DWORD)ms));
+}
+
+/* While a menu has the pointer (xbox_FramebufferSetMenuPointer) the mouse is
+ * the title's: its buttons press no target -- nor do they after, until let go,
+ * so the click that leaves a menu does not fire -- and the wheel neither walks
+ * the left stick nor latches WheelUp/WheelDown but is read by
+ * xbox_KbmMenuWheel: notches since the last call, up positive. */
+static volatile LONG kbm_menu_wheel;
+
+int xbox_KbmMenuWheel(void)
+{
+    return (int)InterlockedExchange(&kbm_menu_wheel, 0);
+}
+
 static void kbm_parse_map(const char *variable, struct kbm_bind *binds, int *listed)
 {
     char *spec = getenv(variable);
@@ -467,13 +492,22 @@ static void kbm_load_map(void)
  * so each direction reads as held for a beat after it. */
 static DWORD kbm_wheel_up_until, kbm_wheel_down_until;
 
+static BOOL kbm_mouse_button(int which)
+{
+    static int held_over[3];
+    int down = xbox_FramebufferMouseButton(which);
+    if (xbox_FramebufferMenuPointer()) held_over[which] = 1;
+    else if (!down) held_over[which] = 0;
+    return down && !held_over[which];
+}
+
 static BOOL kbm_input_down(int vk)
 {
     switch (vk) {
     case 0:              return FALSE;
-    case KBM_MOUSE_L:    return xbox_FramebufferMouseButton(0) != 0;
-    case KBM_MOUSE_R:    return xbox_FramebufferMouseButton(1) != 0;
-    case KBM_MOUSE_M:    return xbox_FramebufferMouseButton(2) != 0;
+    case KBM_MOUSE_L:    return kbm_mouse_button(0);
+    case KBM_MOUSE_R:    return kbm_mouse_button(1);
+    case KBM_MOUSE_M:    return kbm_mouse_button(2);
     case KBM_WHEEL_UP:   return (long)(GetTickCount() - kbm_wheel_up_until) < 0;
     case KBM_WHEEL_DOWN: return (long)(GetTickCount() - kbm_wheel_down_until) < 0;
     default:             return key_down(vk);
@@ -483,6 +517,7 @@ static BOOL kbm_input_down(int vk)
 static BOOL kbm_down(int target)
 {
     const int *vk = kbm_menu_active && kbm_menu_listed[target] ? kbm_menu_binds[target].vk : kbm_binds[target].vk;
+    if ((long)(GetTickCount() - (DWORD)kbm_pulse_until[target]) < 0) return TRUE;
     return kbm_input_down(vk[0]) || kbm_input_down(vk[1]) || kbm_input_down(vk[2]);
 }
 
@@ -754,7 +789,11 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     /* Wheel notches latch WheelUp/WheelDown; with WHEEL_MOVE they also push
      * the left stick forward/back for the same beat. */
     wheel = xbox_FramebufferMouseWheel();
-    if (wheel > 0)      { wheel_dir =  1; kbm_wheel_up_until = GetTickCount() + 150; }
+    if (xbox_FramebufferMenuPointer()) {
+        InterlockedExchangeAdd(&kbm_menu_wheel, wheel);
+        wheel_dir = 0;
+    }
+    else if (wheel > 0) { wheel_dir =  1; kbm_wheel_up_until = GetTickCount() + 150; }
     else if (wheel < 0) { wheel_dir = -1; kbm_wheel_down_until = GetTickCount() + 150; }
     if (wheel_move && wheel_dir &&
             (long)(GetTickCount() - (wheel_dir > 0 ? kbm_wheel_up_until : kbm_wheel_down_until)) < 0)

@@ -22,6 +22,9 @@ int nv2a_gpu_present_surface(void *window, const void *presented, uint32_t pitch
                              uint32_t aspect_w, uint32_t aspect_h, int interval);
 int nv2a_gpu_present_pixels(void *window, const uint32_t *pixels, uint32_t width, uint32_t height,
                             int interval);
+/* The shape of the last frame shown, width over height, letterboxed in the
+ * window's client area (0 before the first). */
+float nv2a_gpu_presented_aspect(void);
 /* Render at `scale` times the title's size (1 to 8; 0 matches the monitor, as
  * RECOMP_RENDER_SCALE=auto) from the next flip on. Any thread. */
 void nv2a_gpu_set_render_scale(float scale);

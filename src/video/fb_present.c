@@ -389,6 +389,7 @@ static void fb_inject_poll(void)
 static volatile LONG s_mouse_dx, s_mouse_dy, s_mouse_wheel;
 static volatile unsigned char s_mouse_btn[3];   /* 0=L, 1=R, 2=M */
 static int s_mouse_x, s_mouse_y, s_mouse_have;
+static int s_mouse_inside;   /* s_mouse_x/y is where the free cursor last was */
 static int s_mouse_capture, s_cursor_hidden;
 static int s_mouse_raw;      /* WM_INPUT deltas are authoritative when set */
 static HWND s_fb_hwnd;
@@ -521,6 +522,7 @@ void xbox_FramebufferMouseCapture(int on)
     if (on == s_mouse_capture)
         return;
     s_mouse_capture = on;
+    s_mouse_inside = 0;
     if (on) {
         RECT c, clip;
         POINT tl = { 0, 0 }, br, centre;
@@ -559,6 +561,94 @@ void xbox_FramebufferMouseCapture(int on)
         ClipCursor(NULL);
         if (s_cursor_hidden) { ShowCursor(TRUE); s_cursor_hidden = 0; }
     }
+}
+
+/* ---- menu pointer ----------------------------------------------------------
+ *
+ * In a menu (xbox_FramebufferSetMenuPointer) the mouse is a pointer, not a
+ * look device: the grab is let go, a click no longer takes it, and the title
+ * reads where the cursor is over the window (xbox_FramebufferPointer). Leaving
+ * the menu takes the grab back if the window is the one in front. The cursor
+ * over the client area is the title's own picture when it gives one
+ * (xbox_FramebufferSetCursorImage). */
+#define FB_MENU_POINTER (WM_APP + 3)
+static volatile LONG s_menu_pointer;
+static HCURSOR s_cursor_image;
+
+void xbox_FramebufferSetMenuPointer(int on)
+{
+    on = on != 0;
+    if (InterlockedExchange(&s_menu_pointer, on) != on && s_fb_hwnd)
+        PostMessageA(s_fb_hwnd, FB_MENU_POINTER, (WPARAM)on, 0);
+}
+
+int xbox_FramebufferMenuPointer(void)
+{
+    return s_menu_pointer != 0;
+}
+
+/* The cursor's last position over the client area and the client's size; 0
+ * while the mouse is grabbed or before it has moved over the window. */
+int xbox_FramebufferPointer(int *x, int *y, int *width, int *height)
+{
+    RECT c;
+    if (!s_fb_hwnd || s_mouse_capture || !s_mouse_inside || !GetClientRect(s_fb_hwnd, &c))
+        return 0;
+    *x = s_mouse_x; *y = s_mouse_y;
+    *width = c.right - c.left; *height = c.bottom - c.top;
+    return *width > 0 && *height > 0;
+}
+
+/* A cursor from a BGRA picture with its hot spot, drawn at the system's
+ * cursor size. */
+void xbox_FramebufferSetCursorImage(const uint32_t *bgra, int width, int height, int hot_x, int hot_y)
+{
+    int size = GetSystemMetrics(SM_CXCURSOR), x, y;
+    BITMAPV5HEADER bi;
+    void *bits = NULL;
+    HDC dc;
+    HBITMAP color, mask;
+    ICONINFO info;
+    if (!bgra || width <= 0 || height <= 0) return;
+    if (size <= 0) size = 32;
+    memset(&bi, 0, sizeof bi);
+    bi.bV5Size = sizeof bi;
+    bi.bV5Width = size; bi.bV5Height = -size;
+    bi.bV5Planes = 1; bi.bV5BitCount = 32; bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000; bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF; bi.bV5AlphaMask = 0xFF000000;
+    dc = GetDC(NULL);
+    color = CreateDIBSection(dc, (BITMAPINFO *)&bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    ReleaseDC(NULL, dc);
+    if (!color) return;
+    /* Box-filter down to the cursor size, premultiplying as the blend wants. */
+    for (y = 0; y < size; y++)
+        for (x = 0; x < size; x++) {
+            int x0 = x * width / size, x1 = (x + 1) * width / size;
+            int y0 = y * height / size, y1 = (y + 1) * height / size, sx, sy;
+            unsigned sum[4] = {0, 0, 0, 0}, n = 0, a;
+            if (x1 <= x0) x1 = x0 + 1;
+            if (y1 <= y0) y1 = y0 + 1;
+            for (sy = y0; sy < y1; sy++)
+                for (sx = x0; sx < x1; sx++) {
+                    uint32_t p = bgra[sy * width + sx];
+                    unsigned pa = p >> 24;
+                    sum[0] += (p & 0xFF) * pa; sum[1] += ((p >> 8) & 0xFF) * pa;
+                    sum[2] += ((p >> 16) & 0xFF) * pa; sum[3] += pa; n++;
+                }
+            a = sum[3] / n;
+            ((uint32_t *)bits)[y * size + x] = a << 24 |
+                (sum[2] / n / 255) << 16 | (sum[1] / n / 255) << 8 | (sum[0] / n / 255);
+        }
+    mask = CreateBitmap(size, size, 1, 1, NULL);
+    memset(&info, 0, sizeof info);
+    info.fIcon = FALSE;
+    info.xHotspot = (DWORD)(hot_x * size / width);
+    info.yHotspot = (DWORD)(hot_y * size / height);
+    info.hbmMask = mask; info.hbmColor = color;
+    s_cursor_image = CreateIconIndirect(&info);
+    DeleteObject(color);
+    DeleteObject(mask);
 }
 
 /* ---- input recording and replay ------------------------------------------
@@ -744,6 +834,24 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             fb_window_direct(h);
         return 0;
 
+    case FB_MENU_POINTER:
+        if (w) {
+            xbox_FramebufferMouseCapture(0);
+        } else if (getenv("RECOMP_KBM") && GetForegroundWindow() == h) {
+            const char *nf = getenv("RECOMP_NO_FOCUS");
+            if (!(nf && *nf && *nf != '0'))
+                xbox_FramebufferMouseCapture(1);
+        }
+        return 0;
+
+    case WM_SETCURSOR:
+        if (LOWORD(l) == HTCLIENT && s_cursor_image && !s_mouse_capture) {
+            SetCursor(s_cursor_image);
+            return TRUE;
+        }
+        break;
+
+
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
         rec_event("k %x 1", (unsigned)w);
@@ -848,6 +956,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 }
             }
         } else {
+            s_mouse_inside = 1;
             if (s_mouse_have) {
                 if (x != s_mouse_x || y != s_mouse_y)
                     rec_event("m %d %d", x - s_mouse_x, y - s_mouse_y);
@@ -885,8 +994,8 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_LBUTTONDOWN:
         /* Clicking into the game grabs the mouse for mouse-look; Esc releases
-         * it again so the window can be dragged. */
-        if (getenv("RECOMP_KBM"))
+         * it again so the window can be dragged. A menu's pointer clicks. */
+        if (getenv("RECOMP_KBM") && !s_menu_pointer)
             xbox_FramebufferMouseCapture(1);
         rec_event("b 0 1");
         s_mouse_btn[0] = 1;
@@ -1352,4 +1461,9 @@ void xbox_FramebufferFrameShown(void) {}
 void xbox_FramebufferSetFullscreen(int on) { (void)on; }
 void xbox_FramebufferSetWindowAspect(float aspect) { (void)aspect; }
 int xbox_FramebufferFullscreen(void) { return 0; }
+void xbox_FramebufferSetMenuPointer(int on) { (void)on; }
+int xbox_FramebufferMenuPointer(void) { return 0; }
+int xbox_FramebufferPointer(int *x, int *y, int *width, int *height) { (void)x; (void)y; (void)width; (void)height; return 0; }
+void xbox_FramebufferSetCursorImage(const uint32_t *bgra, int width, int height, int hot_x, int hot_y)
+{ (void)bgra; (void)width; (void)height; (void)hot_x; (void)hot_y; }
 #endif

@@ -2530,6 +2530,14 @@ static bool presenter_ready(HWND window)
     return true;
 }
 
+/* The shape of the last frame shown, width over height (0 before one). */
+static volatile float presented_aspect;
+
+extern "C" float nv2a_gpu_presented_aspect(void)
+{
+    return presented_aspect;
+}
+
 /* Draw `view` (its top-left u x v of the texture) letterboxed at `aspect`,
  * then present. */
 static bool present_view(ID3D11ShaderResourceView *view, float u, float v, float aspect, int interval)
@@ -2539,6 +2547,7 @@ static bool present_view(ID3D11ShaderResourceView *view, float u, float v, float
     context->ClearRenderTargetView(target, black);
     float width = (float)presenter.width, height = (float)presenter.height;
     float shown_width = width, shown_height = width / aspect;
+    presented_aspect = aspect;
     if (shown_height > height) { shown_height = height; shown_width = height * aspect; }
     D3D11_VIEWPORT viewport = {(width - shown_width) * 0.5f, (height - shown_height) * 0.5f,
                                shown_width, shown_height, 0.0f, 1.0f};
