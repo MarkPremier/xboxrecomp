@@ -37,6 +37,10 @@ void nv2a_gpu_set_projection_registers(const int *registers, int count);
 void nv2a_gpu_replace_texture(uint64_t hash, const uint32_t *bgra, uint32_t width, uint32_t height);
 /* Replacements drawn (the default) or not, from the next flip; any thread. */
 void nv2a_gpu_set_texture_replacements(int on);
+/* Anisotropic filtering for mipmapped textures, 1 (the title's) to 16; MSAA
+ * samples for the screen's targets, 1 (off) to 8, from the next flip. Any thread. */
+void nv2a_gpu_set_anisotropy(int level);
+void nv2a_gpu_set_msaa(int samples);
 void nv2a_gpu_surface_modified(const void *addr, size_t bytes);
 void nv2a_gpu_surface_publish(const void *addr, size_t bytes);
 void nv2a_gpu_invalidate(void);

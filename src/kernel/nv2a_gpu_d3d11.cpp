@@ -354,6 +354,12 @@ struct Surface {
     ComPtr<ID3D11Texture2D> texture, staging;
     ComPtr<ID3D11RenderTargetView> target;
     ComPtr<ID3D11ShaderResourceView> view;
+    /* MSAA (nv2a_gpu_set_msaa): draws go to the multisampled twin; `texture`
+     * is resolved from it before anything reads it (ms_newer), and drawn back
+     * into it after anything else writes `texture` (ms_stale). */
+    ComPtr<ID3D11Texture2D> ms_texture;
+    ComPtr<ID3D11RenderTargetView> ms_target;
+    bool ms_newer, ms_stale;
 };
 
 struct CachedTexture {
@@ -384,6 +390,10 @@ struct DepthSurface {
     ComPtr<ID3D11Texture2D> texture, staging;
     ComPtr<ID3D11DepthStencilView> view;
     ComPtr<ID3D11ShaderResourceView> sample_view;   /* depth as a texture: shadow-map stages */
+    ComPtr<ID3D11Texture2D> ms_texture;             /* as Surface */
+    ComPtr<ID3D11DepthStencilView> ms_view;
+    ComPtr<ID3D11ShaderResourceView> ms_sample_view;
+    bool ms_newer, ms_stale;
 };
 
 /* RECOMP_RENDER_SCALE=<n> (1 to 8, may be fractional): colour targets, and
@@ -449,6 +459,10 @@ static float render_scale()
  * A frame with no 3D draw on the screen (a loading screen, a menu) is a 2D
  * picture made for 4:3: two in a row and the targets go back to 4:3 until a
  * 3D draw comes back. */
+/* MSAA: samples per pixel of the screen-shaped targets, 1 for none. */
+static UINT msaa_samples = 1;
+static std::atomic<int> pending_msaa{-1};
+
 static float wide_factor = 1.0f;
 static std::atomic<float> pending_wide_factor{-1.0f};
 static bool wide_frames = true;             /* this frame's targets are wide */
@@ -1197,6 +1211,11 @@ static bool scale_blit(ID3D11ShaderResourceView *source, ID3D11RenderTargetView 
     return true;
 }
 
+/* MSAA twins (with get_depth below). */
+static bool create_ms_color(Surface &surface);
+static void resolve_color(Surface &surface);
+static void resolve_depth(DepthSurface &surface);
+
 /* A box of guest pixels as the scaled texture's pixels, rounded outward. */
 template<typename Target>
 static D3D11_BOX texture_box(const Target &target, const D3D11_BOX &box)
@@ -1212,6 +1231,8 @@ static D3D11_BOX texture_box(const Target &target, const D3D11_BOX &box)
 /* Guest RAM's pixels (`box` of them, or all) into a colour target. */
 static void upload_surface(Surface &surface, const D3D11_BOX *box, const void *data, UINT row_pitch)
 {
+    resolve_color(surface);      /* a partial upload keeps the rest */
+    if (surface.ms_texture) surface.ms_stale = true;
     if (!is_scaled(surface)) {
         context->UpdateSubresource(surface.texture.Get(), 0, box, data, row_pitch, 0);
         return;
@@ -1227,6 +1248,7 @@ static void upload_surface(Surface &surface, const D3D11_BOX *box, const void *d
  * one its resolve, drawn down from the texture first. */
 static ID3D11Texture2D *publish_source(Surface &surface)
 {
+    resolve_color(surface);
     if (!is_scaled(surface)) return surface.texture.Get();
     scale_blit(surface.view.Get(), surface.resolve_target.Get(), nullptr, surface.width, surface.height);
     return surface.resolve.Get();
@@ -1234,6 +1256,7 @@ static ID3D11Texture2D *publish_source(Surface &surface)
 
 static ID3D11Texture2D *publish_source(DepthSurface &surface)
 {
+    resolve_depth(surface);
     if (!is_scaled(surface)) return surface.texture.Get();
     scale_blit(surface.sample_view.Get(), nullptr, surface.resolve_view.Get(), surface.width, surface.height);
     return surface.resolve.Get();
@@ -1316,6 +1339,7 @@ static bool refresh_depth(DepthSurface &surface)
         encode_depth_row(surface.format, source, destination, surface.width);
     }
     context->Unmap(surface.staging.Get(), 0);
+    if (surface.ms_texture) { surface.ms_newer = false; surface.ms_stale = true; }
     if (is_scaled(surface)) {
         context->CopyResource(surface.upload.Get(), surface.staging.Get());
         scale_blit(surface.upload_view.Get(), nullptr, surface.view.Get(), surface.texture_width, surface.texture_height);
@@ -1368,7 +1392,7 @@ static Surface *get_surface(const Nv2aGpuDraw &state, bool preserve = true, Targ
     surface.last_used = ++surface_use_serial;
     bool scaled = is_scaled(surface);
     D3D11_SUBRESOURCE_DATA data = {state.color, state.pitch, 0};
-    if (!create_color_textures(surface, preserve ? &data : nullptr)) return nullptr;
+    if (!create_color_textures(surface, preserve ? &data : nullptr) || !create_ms_color(surface)) return nullptr;
     D3D11_TEXTURE2D_DESC description = {};
     description.Width = extent.width; description.Height = extent.height;
     description.MipLevels = description.ArraySize = 1;
@@ -1415,6 +1439,152 @@ static bool create_depth_textures(DepthSurface &surface)
            target_operation_succeeded("depth", "create upload view", device->CreateShaderResourceView(surface.upload.Get(), &sample, &surface.upload_view));
 }
 
+/* The multisampled twins, for a screen-shaped target drawn with colour when
+ * MSAA is on; none otherwise. A new twin is stale: `texture` is drawn into it
+ * before the first draw. */
+static bool create_ms_color(Surface &surface)
+{
+    surface.ms_texture.Reset(); surface.ms_target.Reset();
+    surface.ms_newer = surface.ms_stale = false;
+    if (msaa_samples <= 1 || !screen_shaped(surface.width, surface.height)) return true;
+    D3D11_TEXTURE2D_DESC description = {};
+    description.Width = surface.texture_width; description.Height = surface.texture_height;
+    description.MipLevels = description.ArraySize = 1;
+    description.Format = DXGI_FORMAT_B8G8R8A8_UNORM; description.SampleDesc.Count = msaa_samples;
+    description.BindFlags = D3D11_BIND_RENDER_TARGET;
+    D3D11_RENDER_TARGET_VIEW_DESC view = {};
+    view.Format = description.Format; view.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMS;
+    if (!target_operation_succeeded("color", "create MSAA texture", device->CreateTexture2D(&description, nullptr, &surface.ms_texture)) ||
+        !target_operation_succeeded("color", "create MSAA view", device->CreateRenderTargetView(surface.ms_texture.Get(), &view, &surface.ms_target))) {
+        surface.ms_texture.Reset(); surface.ms_target.Reset();
+        return false;
+    }
+    surface.ms_stale = true;
+    return true;
+}
+
+static bool create_ms_depth(DepthSurface &surface)
+{
+    surface.ms_texture.Reset(); surface.ms_view.Reset(); surface.ms_sample_view.Reset();
+    surface.ms_newer = surface.ms_stale = false;
+    if (msaa_samples <= 1 || !depth_scaled(surface.memory) || !screen_shaped(surface.width, surface.height)) return true;
+    bool wide = surface.format != 1;
+    D3D11_TEXTURE2D_DESC description = {};
+    description.Width = surface.texture_width; description.Height = surface.texture_height;
+    description.MipLevels = description.ArraySize = 1; description.SampleDesc.Count = msaa_samples;
+    description.Format = wide ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_R16_TYPELESS;
+    description.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    D3D11_DEPTH_STENCIL_VIEW_DESC view = {};
+    view.Format = wide ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D16_UNORM; view.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sample = {};
+    sample.Format = wide ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : DXGI_FORMAT_R16_UNORM;
+    sample.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
+    if (!target_operation_succeeded("depth", "create MSAA texture", device->CreateTexture2D(&description, nullptr, &surface.ms_texture)) ||
+        !target_operation_succeeded("depth", "create MSAA view", device->CreateDepthStencilView(surface.ms_texture.Get(), &view, &surface.ms_view)) ||
+        !target_operation_succeeded("depth", "create MSAA sample view", device->CreateShaderResourceView(surface.ms_texture.Get(), &sample, &surface.ms_sample_view))) {
+        surface.ms_texture.Reset(); surface.ms_view.Reset(); surface.ms_sample_view.Reset();
+        return false;
+    }
+    surface.ms_stale = true;
+    return true;
+}
+
+/* `texture` up to date with what was drawn into the twin. */
+static void resolve_color(Surface &surface)
+{
+    if (!surface.ms_texture || !surface.ms_newer) return;
+    context->ResolveSubresource(surface.texture.Get(), 0, surface.ms_texture.Get(), 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+    surface.ms_newer = false;
+}
+
+/* Depth has no ResolveSubresource: the first sample of each pixel, drawn as
+ * SV_Depth into the single-sampled view. Stencil is not carried. */
+static void resolve_depth(DepthSurface &surface)
+{
+    static ComPtr<ID3D11VertexShader> vertex;
+    static ComPtr<ID3D11PixelShader> pixel;
+    static ComPtr<ID3D11DepthStencilState> write;
+    static ComPtr<ID3D11RasterizerState> raster;
+    static bool failed;
+    if (!surface.ms_texture || !surface.ms_newer || failed) return;
+    if (!pixel) {
+        static const char text[] =
+            "Texture2DMS<float> image:register(t0);"
+            "float4 vs(uint id:SV_VertexID):SV_Position{float2 t=float2((id<<1)&2,id&2);return float4(t*float2(2,-2)+float2(-1,1),0,1);}"
+            "float ps(float4 p:SV_Position):SV_Depth{return image.Load(int2(p.xy),0);}";
+        ComPtr<ID3DBlob> vs, ps, errors;
+        HRESULT result = D3DCompile(text, sizeof text - 1, "MSAA depth resolve", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, &errors);
+        if (SUCCEEDED(result)) result = D3DCompile(text, sizeof text - 1, "MSAA depth resolve", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, &errors);
+        if (SUCCEEDED(result)) result = device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &vertex);
+        if (SUCCEEDED(result)) result = device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &pixel);
+        D3D11_DEPTH_STENCIL_DESC depth = {};
+        depth.DepthEnable = TRUE; depth.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL; depth.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        if (SUCCEEDED(result)) result = device->CreateDepthStencilState(&depth, &write);
+        D3D11_RASTERIZER_DESC rasterizer = {};
+        rasterizer.FillMode = D3D11_FILL_SOLID; rasterizer.CullMode = D3D11_CULL_NONE;
+        if (SUCCEEDED(result)) result = device->CreateRasterizerState(&rasterizer, &raster);
+        if (FAILED(result)) {
+            std::fprintf(stderr, "[GPU-D3D11] MSAA depth resolve unavailable: 0x%08X\n", (unsigned)result);
+            failed = true; pixel.Reset();
+            return;
+        }
+    }
+    ID3D11ShaderResourceView *none[12] = {}, *source = surface.ms_sample_view.Get();
+    context->PSSetShaderResources(0, 12, none);
+    context->OMSetRenderTargets(0, nullptr, surface.view.Get());
+    context->OMSetDepthStencilState(write.Get(), 0);
+    context->IASetInputLayout(nullptr);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->VSSetShader(vertex.Get(), nullptr, 0);
+    context->GSSetShader(nullptr, nullptr, 0);
+    context->PSSetShader(pixel.Get(), nullptr, 0);
+    context->PSSetShaderResources(0, 1, &source);
+    context->RSSetState(raster.Get());
+    D3D11_VIEWPORT viewport = {0, 0, (float)surface.texture_width, (float)surface.texture_height, 0, 1};
+    D3D11_RECT clip = {0, 0, (LONG)surface.texture_width, (LONG)surface.texture_height};
+    context->RSSetViewports(1, &viewport);
+    context->RSSetScissorRects(1, &clip);
+    context->Draw(3, 0);
+    context->PSSetShaderResources(0, 1, none);
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    surface.ms_newer = false;
+}
+
+/* Before drawing into the twins: what was written to `texture` since. */
+static void refresh_ms_color(Surface &surface)
+{
+    if (!surface.ms_texture || !surface.ms_stale) return;
+    scale_blit(surface.view.Get(), surface.ms_target.Get(), nullptr, surface.texture_width, surface.texture_height);
+    surface.ms_stale = false;
+}
+
+static void refresh_ms_depth(DepthSurface &surface)
+{
+    if (!surface.ms_texture || !surface.ms_stale) return;
+    context->ClearDepthStencilView(surface.ms_view.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+    scale_blit(surface.sample_view.Get(), nullptr, surface.ms_view.Get(), surface.texture_width, surface.texture_height);
+    surface.ms_stale = false;
+}
+
+/* The views a draw writes: both twins when every target it has has one;
+ * otherwise the single-sampled textures, brought up to date first. */
+static void bind_draw_targets(Surface *surface, DepthSurface *depth, ID3D11RenderTargetView *&color, ID3D11DepthStencilView *&depth_view)
+{
+    bool multisampled = (surface && surface->ms_texture) || (depth && depth->ms_texture);
+    if (multisampled && ((surface && !surface->ms_texture) || (depth && !depth->ms_texture))) multisampled = false;
+    if (multisampled) {
+        if (surface) { refresh_ms_color(*surface); surface->ms_newer = true; }
+        if (depth) { refresh_ms_depth(*depth); depth->ms_newer = true; }
+        color = surface ? surface->ms_target.Get() : nullptr;
+        depth_view = depth ? depth->ms_view.Get() : nullptr;
+        return;
+    }
+    if (surface) { resolve_color(*surface); if (surface->ms_texture) surface->ms_stale = true; }
+    if (depth) { resolve_depth(*depth); if (depth->ms_texture) depth->ms_stale = true; }
+    color = surface ? surface->target.Get() : nullptr;
+    depth_view = depth ? depth->view.Get() : nullptr;
+}
+
 static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, TargetExtent extent = {})
 {
     if (!extent.width) extent = {state.width, state.height};
@@ -1443,7 +1613,7 @@ static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, T
     surface.memory = state.depth; surface.width = extent.width; surface.height = extent.height; surface.pitch = state.depth_pitch; surface.format = state.depth_format;
     surface.texture_width = texture_width; surface.texture_height = texture_height;
     surface.last_used = ++surface_use_serial;
-    if (!create_depth_textures(surface)) return nullptr;
+    if (!create_depth_textures(surface) || !create_ms_depth(surface)) return nullptr;
     D3D11_TEXTURE2D_DESC description = {};
     description.Width = extent.width; description.Height = extent.height;
     description.MipLevels = description.ArraySize = 1; description.SampleDesc.Count = 1;
@@ -1469,9 +1639,11 @@ static void resize_targets(const char *why)
         UINT width, height;
         texture_size(surface.width, surface.height, true, width, height);
         if (width == surface.texture_width && height == surface.texture_height) { index++; continue; }
+        resolve_color(surface);
         ComPtr<ID3D11ShaderResourceView> old = surface.view;
         surface.texture_width = width; surface.texture_height = height;
-        if (create_color_textures(surface, nullptr) && scale_blit(old.Get(), surface.target.Get(), nullptr, width, height)) {
+        if (create_color_textures(surface, nullptr) && scale_blit(old.Get(), surface.target.Get(), nullptr, width, height) &&
+                create_ms_color(surface)) {
             colors++; index++;
         } else {
             surfaces.erase(surfaces.begin() + (ptrdiff_t)index);
@@ -1483,9 +1655,10 @@ static void resize_targets(const char *why)
         UINT width, height;
         texture_size(surface.width, surface.height, scaled, width, height);
         if (width == surface.texture_width && height == surface.texture_height) { index++; continue; }
+        resolve_depth(surface);
         ComPtr<ID3D11ShaderResourceView> old = surface.sample_view;
         surface.texture_width = width; surface.texture_height = height;
-        bool made = create_depth_textures(surface);
+        bool made = create_depth_textures(surface) && create_ms_depth(surface);
         /* Depth carries over; stencil starts clear. */
         if (made) context->ClearDepthStencilView(surface.view.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
         if (made && scale_blit(old.Get(), nullptr, surface.view.Get(), width, height)) {
@@ -1516,6 +1689,19 @@ static void apply_target_sizes()
                       *why ? ", " : "", wide_factor, requested);
         wide_factor = requested;
     }
+    int samples = pending_msaa.exchange(-1);
+    if (samples > 0 && (UINT)samples != msaa_samples) {
+        UINT quality = 0;
+        while (samples > 1 && (FAILED(device->CheckMultisampleQualityLevels(DXGI_FORMAT_B8G8R8A8_UNORM, samples, &quality)) ||
+                               !quality || FAILED(device->CheckMultisampleQualityLevels(DXGI_FORMAT_R24G8_TYPELESS, samples, &quality)) ||
+                               !quality)) samples /= 2;
+        for (auto &surface : surfaces) resolve_color(surface);
+        for (auto &surface : depth_surfaces) resolve_depth(surface);
+        std::fprintf(stderr, "[GPU-D3D11] MSAA %ux -> %dx\n", msaa_samples, samples);
+        msaa_samples = (UINT)samples;
+        for (auto &surface : surfaces) create_ms_color(surface);
+        for (auto &surface : depth_surfaces) create_ms_depth(surface);
+    }
     frames_without_3d = screen_3d_draws ? 0 : frames_without_3d + 1;
     screen_3d_draws = 0;
     bool wide = frames_without_3d < 2;
@@ -1526,6 +1712,13 @@ static void apply_target_sizes()
                           *why ? ", " : "", wide ? "3D frames, wide" : "2D frames, 4:3");
     }
     if (*why) resize_targets(why);
+}
+
+/* Samples per pixel of the screen's targets: 1 (off), 2, 4 or 8, from the next
+ * flip; fewer if the adapter cannot. Any thread. */
+extern "C" void nv2a_gpu_set_msaa(int samples)
+{
+    pending_msaa.store(samples >= 8 ? 8 : samples >= 4 ? 4 : samples >= 2 ? 2 : 1);
 }
 
 extern "C" void nv2a_gpu_set_render_scale(float scale)
@@ -2402,6 +2595,7 @@ extern "C" int nv2a_gpu_present_surface(void *window, const void *presented, uin
     /* Written by the CPU since the GPU last drew it (a loading screen): take
      * guest RAM's copy first, as a texture use would. */
     refresh_surface(*shown);
+    resolve_color(*shown);
     uint32_t height = rows && rows < shown->height ? rows : shown->height;
     /* A widescreen target is wider than the title's aspect by its own shape. */
     float aspect = (float)aspect_w / (float)aspect_h *
@@ -2618,6 +2812,10 @@ extern "C" int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t
         const float rgba[] = {(float)((color >> 16) & 255u) / 255.0f, (float)((color >> 8) & 255u) / 255.0f,
                               (float)(color & 255u) / 255.0f, (float)(color >> 24) / 255.0f};
         context->ClearRenderTargetView(surface->target.Get(), rgba);
+        if (surface->ms_texture) {
+            context->ClearRenderTargetView(surface->ms_target.Get(), rgba);
+            surface->ms_newer = surface->ms_stale = false;
+        }
     }
     if (depth && !partial) {
         UINT clear_flags = (clear_depth ? D3D11_CLEAR_DEPTH : 0u) | (clear_stencil ? D3D11_CLEAR_STENCIL : 0u);
@@ -2627,6 +2825,17 @@ extern "C" int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t
         float normalized = state->depth_format == 1 ? (float)(depth_value & 65535u) / 65535.0f :
             (float)(depth_value >> 8) / 16777215.0f;
         context->ClearDepthStencilView(depth->view.Get(), clear_flags, normalized, (UINT8)depth_value);
+        if (depth->ms_texture) {
+            /* Both, if both parts were cleared; else the twin is behind. */
+            bool whole = (clear_depth && clear_stencil) || depth->format == 1;
+            resolve_depth(*depth);
+            context->ClearDepthStencilView(depth->view.Get(), clear_flags, normalized, (UINT8)depth_value);
+            if (whole) {
+                context->ClearDepthStencilView(depth->ms_view.Get(), clear_flags, normalized, (UINT8)depth_value);
+                depth->ms_newer = depth->ms_stale = false;
+            }
+            else depth->ms_stale = true;
+        }
     }
     if (surface) {
         mark_written_region(*surface, region);
@@ -2762,6 +2971,7 @@ static ID3D11ShaderResourceView *get_feedback_texture(const Surface &destination
         if (FAILED(device->CreateTexture2D(&desc, nullptr, &feedback_texture))) return nullptr;
         if (FAILED(device->CreateShaderResourceView(feedback_texture.Get(), nullptr, &feedback_view))) return nullptr;
     }
+    resolve_color(const_cast<Surface &>(destination));
     context->CopyResource(feedback_texture.Get(), destination.texture.Get());
     return feedback_view.Get();
 }
@@ -2861,6 +3071,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                     surface.height == binding.height && surface.pitch == binding.pitch) {
                 if (!surface.dirty && !refresh_depth(surface)) return nullptr;
                 surface.last_used = ++surface_use_serial;
+                resolve_depth(surface);
                 return surface.sample_view.Get();
             }
         return nullptr;
@@ -2962,9 +3173,12 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
             direct->needs_refresh = true;
             refresh_surface(*direct);
             if (direct->alias_copy_serial != alias_serial) {
-                for (const auto &surface : surfaces) {
+                for (auto &surface : surfaces) {
                     if (&surface == direct || !surface.dirty || surface.memory != direct->memory ||
                         surface.pitch != direct->pitch) continue;
+                    resolve_color(surface);
+                    resolve_color(*direct);
+                    if (direct->ms_texture) direct->ms_stale = true;
                     D3D11_BOX region = surface.written_region;
                     region.right = std::min(region.right, direct->width);
                     region.bottom = std::min(region.bottom, direct->height);
@@ -3037,6 +3251,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
          * GPU stale data -- see RECOMP_SYNC_LIGHT. */
         if (!direct->dirty)
             refresh_surface(*direct);
+        resolve_color(*direct);
         return direct->view.Get();
     }
     CachedTexture *refresh = nullptr;
@@ -3343,6 +3558,14 @@ static D3D11_TEXTURE_ADDRESS_MODE texture_address(uint32_t address)
     }
 }
 
+static std::atomic<UINT> forced_anisotropy{1};
+
+/* Anisotropic filtering, 1 (the title's own) to 16; any thread. */
+extern "C" void nv2a_gpu_set_anisotropy(int level)
+{
+    forced_anisotropy.store(level >= 16 ? 16u : level >= 8 ? 8u : level >= 4 ? 4u : level >= 2 ? 2u : 1u);
+}
+
 static bool make_sampler(const Nv2aGpuTexture &binding, ComPtr<ID3D11SamplerState> &result)
 {
     uint32_t minimum = (binding.filter >> 16) & 255u, maximum = (binding.filter >> 24) & 15u;
@@ -3371,6 +3594,10 @@ static bool make_sampler(const Nv2aGpuTexture &binding, ComPtr<ID3D11SamplerStat
     description.MipLODBias = (float)bias / 256.0f;
     if (description.MipLODBias > D3D11_MIP_LOD_BIAS_MAX) return false;
     description.MaxAnisotropy = binding.control0_valid ? 1u << ((binding.control0 >> 4) & 3u) : 1u;
+    /* Anisotropic filtering asked for by the player (nv2a_gpu_set_anisotropy),
+     * on mipmapped, linearly filtered textures: the title's, not its 2D. */
+    UINT forced = forced_anisotropy.load();
+    if (forced > description.MaxAnisotropy && maximum == 2 && minimum == 6) description.MaxAnisotropy = forced;
     if (description.MaxAnisotropy > 1) {
         if (maximum != 2 || (minimum != 2 && minimum != 6)) return false;
         description.Filter = D3D11_FILTER_ANISOTROPIC;
@@ -3571,8 +3798,10 @@ static bool clear_target_rectangle(const Nv2aGpuDraw &state, Surface *surface, D
     context->Unmap(pipeline.constants.Get(), 0);
     ID3D11ShaderResourceView *empty[12] = {};
     context->PSSetShaderResources(0, 12, empty);
-    ID3D11RenderTargetView *target = surface ? surface->target.Get() : nullptr;
-    context->OMSetRenderTargets(surface ? 1 : 0, surface ? &target : nullptr, depth ? depth->view.Get() : nullptr);
+    ID3D11RenderTargetView *target = nullptr;
+    ID3D11DepthStencilView *depth_target = nullptr;
+    bind_draw_targets(surface, depth, target, depth_target);
+    context->OMSetRenderTargets(surface ? 1 : 0, surface ? &target : nullptr, depth_target);
     context->OMSetBlendState(pipeline.blend[surface ? 1 : 0].Get(), nullptr, UINT_MAX);
     context->OMSetDepthStencilState(pipeline.depth[(clear_depth ? 1 : 0) | (clear_stencil ? 2 : 0)].Get(), depth_value & 255u);
     context->IASetInputLayout(nullptr);
@@ -4089,14 +4318,16 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     UINT stride = vertex_stride, offset = vertex_offset;
     ID3D11Buffer *buffers[] = {vertex_stream.buffer.Get()}, *constants_buffer[] = {constant_buffer.Get()};
     ID3D11Buffer *constant_ring_buffer = constant_stream.buffer.Get();
-    ID3D11RenderTargetView *target = surface ? surface->target.Get() : nullptr;
+    ID3D11RenderTargetView *target = nullptr;
+    ID3D11DepthStencilView *depth_target = nullptr;
+    bind_draw_targets(surface, depth, target, depth_target);
     ID3D11ShaderResourceView *resources[12] = {}; ID3D11SamplerState *sampler_states[4];
     for (uint32_t stage = 0; stage < 4; stage++) {
         resources[state->textures[stage].depth ? stage + 8 : state->textures[stage].cube ? stage + 4 : stage] = views[stage].Get();
         sampler_states[stage] = samplers[stage].Get();
     }
     float blend_color[4]; nv_cpu_unpack_argb(state->blend_constant, blend_color);
-    context->OMSetRenderTargets(1, &target, depth ? depth->view.Get() : nullptr);
+    context->OMSetRenderTargets(1, &target, depth_target);
     context->OMSetDepthStencilState(depth_state.Get(), state->stencil_reference & 255u); context->OMSetBlendState(blending.Get(), blend_color, ~0u);
     context->IASetInputLayout(guest_vertex ? guest_vertex->layout.Get() : input_layout.Get()); context->IASetVertexBuffers(0, 1, buffers, &stride, &offset);
     context->IASetPrimitiveTopology(state->topology == NV2A_GPU_TOPOLOGY_LINES ? D3D11_PRIMITIVE_TOPOLOGY_LINELIST :
