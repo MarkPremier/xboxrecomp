@@ -93,6 +93,13 @@ float4 guest_multiply(float4 left,float4 right) {
  return float4(left.x==0||right.x==0?0:left.x*right.x,left.y==0||right.y==0?0:left.y*right.y,
                left.z==0||right.z==0?0:left.z*right.z,left.w==0||right.w==0?0:left.w*right.w);
 }
+/* The projective divide as the NV2A does it: s*(1/q), where zero times
+ * anything is zero. Turok's shadow vertex program writes (0,0,0,0) for a
+ * face turned from the light; that is a lookup at the map's corner with a
+ * zero reference, not 0/0. */
+float3 guest_project(float4 coordinate) {
+ return guest_multiply(float4(coordinate.xyz,0),(1/coordinate.w).xxxx).xyz;
+}
 float guest_clip_w(float value) {
  if(!isfinite(value))return value;
  float magnitude=clamp(abs(value),5.421010862427522e-20,1.8446744073709552e19);
@@ -472,7 +479,7 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
    }
   }
   if(mode==2 && (textureFlags&64)) {
-   float3 uvw=coordinate.xyz/coordinate.w;
+   float3 uvw=guest_project(coordinate);
    float2 uv=uvw.xy;
    if(textureInfo[stage].z!=0)uv/=textureInfo[stage].xy;
    float maxDepth=(textureFlags&128)?16777215.0:65535.0;
@@ -496,13 +503,11 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
               func==4?depth>reference:func==5?depth!=reference:func==6?depth>=reference:func==7)?1:0;
    }
    float2 blend=frac(uv*size-0.5);   /* gather order: x (0,1) y (1,1) z (1,0) w (0,0) */
-   /* Outside the light's projection (w <= 0) the coordinate is not finite;
-    * the compares still give 0 or 1, but NaN weights blackened whole faces. */
-   if(!all(isfinite(blend)))blend=0;
+   if(!all(isfinite(blend)))blend=0;   /* q == 0 with a nonzero s or t */
    value=lerp(lerp(lit.w,lit.z,blend.x),lerp(lit.x,lit.y,blend.x),blend.y);
   }
   else if(mode==2) {
-   float3 uvw=coordinate.xyz/coordinate.w;
+   float3 uvw=guest_project(coordinate);
    float3 gradientX=ddx(uvw),gradientY=ddy(uvw);
    if(textureFlags&4)uvw.x=saturate(uvw.x);
    if(textureFlags&8)uvw.y=saturate(uvw.y);

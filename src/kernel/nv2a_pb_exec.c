@@ -3402,6 +3402,34 @@ static void raster_batch(void)
                 }
                 fprintf(info_out, "[BINFO]   screen %.0f,%.0f-%.0f,%.0f ofog %.3f..%.3f (%u of %u in front)\n",
                         x0, y0, x1, y1, f0, f1, seen, s_gpu.idx_count);
+                {
+                    /* The program (once per capture) and the constants it
+                     * reads, so a vertex program can be disassembled offline. */
+                    static uint32_t dumped[64], dumped_count, dumped_capture;
+                    uint32_t slot, hash = 2166136261u, end = s_gpu.vp_start, i;
+                    uint8_t used[192] = {0};
+                    if (dumped_capture != capture_seq) { dumped_capture = capture_seq; dumped_count = 0; }
+                    for (slot = s_gpu.vp_start; slot < 136; slot++) {
+                        const uint32_t *w = s_gpu.vp_program[slot];
+                        for (i = 0; i < 4; i++) hash = (hash ^ w[i]) * 16777619u;
+                        used[(w[1] >> 13) & 255u] = 1;
+                        end = slot;
+                        if (w[3] & 1u) break;
+                    }
+                    fprintf(info_out, "[BINFO]   vp start %u end %u hash %08X\n", s_gpu.vp_start, end, hash);
+                    for (i = 0; i < dumped_count && dumped[i] != hash; i++) {}
+                    if (i == dumped_count && dumped_count < 64) {
+                        dumped[dumped_count++] = hash;
+                        for (slot = s_gpu.vp_start; slot <= end; slot++)
+                            fprintf(info_out, "[VPROG] %08X %3u %08X %08X %08X %08X\n", hash, slot,
+                                    s_gpu.vp_program[slot][0], s_gpu.vp_program[slot][1],
+                                    s_gpu.vp_program[slot][2], s_gpu.vp_program[slot][3]);
+                    }
+                    for (i = 0; i < 192; i++)
+                        if (used[i])
+                            fprintf(info_out, "[BINFO]   c%u %g,%g,%g,%g\n", i, s_gpu.vp_constants[i][0],
+                                    s_gpu.vp_constants[i][1], s_gpu.vp_constants[i][2], s_gpu.vp_constants[i][3]);
+                }
             }
         }
         if (lo >= 0 && ((int)index < lo || (int)index > hi)) {
