@@ -3196,10 +3196,12 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             (binding.address_u == 5 ? 4u : 0u) | (binding.address_v == 5 ? 8u : 0u) |
             (binding.control0_valid && (binding.control0 & 4u) ? 16u : 0u) |
             (binding.address_w == 5 ? 32u : 0u) |
-            /* shadow compare: 64, 128 for a 24-bit depth, function in 8..10 */
+            /* shadow compare: 64, 128 for a 24-bit depth, function in 8..10,
+             * 2048 for a linear magnification filter (four-tap PCF) */
             (binding.shadow ? 64u | ((shadow_func & 7u) << 8) |
                 (binding.format == 0x2A || binding.format == 0x2B || binding.format == 0x2E ||
-                 binding.format == 0x2F ? 128u : 0u) : 0u));
+                 binding.format == 0x2F ? 128u : 0u) |
+                (((binding.filter >> 24) & 15u) == 2u ? 2048u : 0u) : 0u));
         if (sign_mask) signed_texture_stages++;
         switch (binding.format) {
         case 0x01: case 0x16: case 0x17: case 0x1A: case 0x1B: case 0x20: case 0x28: case 0x29:

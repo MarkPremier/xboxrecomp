@@ -475,20 +475,28 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
    float3 uvw=coordinate.xyz/coordinate.w;
    float2 uv=uvw.xy;
    if(textureInfo[stage].z!=0)uv/=textureInfo[stage].xy;
-   float stored;
-   switch(stage) {
-   case 0:stored=image0.SampleLevel(sampler0,uv,0).r;break;
-   case 1:stored=image1.SampleLevel(sampler1,uv,0).r;break;
-   case 2:stored=image2.SampleLevel(sampler2,uv,0).r;break;
-   default:stored=image3.SampleLevel(sampler3,uv,0).r;break;
-   }
    float maxDepth=(textureFlags&128)?16777215.0:65535.0;
-   stored*=maxDepth;
    float reference=clamp(uvw.z,0,maxDepth);   /* stored OP reference, as xemu does */
    uint func=(textureFlags>>8)&7;
-   bool lit=func==1?stored<reference:func==2?stored==reference:func==3?stored<=reference:
-            func==4?stored>reference:func==5?stored!=reference:func==6?stored>=reference:func==7;
-   value=lit?1:0;
+   /* A linear filter compares the four texels of the bilinear footprint and
+    * blends the results (percentage-closer filtering), as the NV2A does;
+    * point sampling compares one texel. */
+   float4 stored; float2 size;
+   switch(stage) {
+   case 0:image0.GetDimensions(size.x,size.y);stored=(textureFlags&2048)?image0.GatherRed(sampler0,uv):image0.SampleLevel(sampler0,uv,0).rrrr;break;
+   case 1:image1.GetDimensions(size.x,size.y);stored=(textureFlags&2048)?image1.GatherRed(sampler1,uv):image1.SampleLevel(sampler1,uv,0).rrrr;break;
+   case 2:image2.GetDimensions(size.x,size.y);stored=(textureFlags&2048)?image2.GatherRed(sampler2,uv):image2.SampleLevel(sampler2,uv,0).rrrr;break;
+   default:image3.GetDimensions(size.x,size.y);stored=(textureFlags&2048)?image3.GatherRed(sampler3,uv):image3.SampleLevel(sampler3,uv,0).rrrr;break;
+   }
+   stored*=maxDepth;
+   float4 lit;
+   [unroll]for(uint tap=0;tap<4;tap++) {
+    float depth=stored[tap];
+    lit[tap]=(func==1?depth<reference:func==2?depth==reference:func==3?depth<=reference:
+              func==4?depth>reference:func==5?depth!=reference:func==6?depth>=reference:func==7)?1:0;
+   }
+   float2 blend=frac(uv*size-0.5);   /* gather order: x (0,1) y (1,1) z (1,0) w (0,0) */
+   value=lerp(lerp(lit.w,lit.z,blend.x),lerp(lit.x,lit.y,blend.x),blend.y);
   }
   else if(mode==2) {
    float3 uvw=coordinate.xyz/coordinate.w;
