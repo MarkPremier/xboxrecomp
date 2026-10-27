@@ -496,6 +496,9 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
               func==4?depth>reference:func==5?depth!=reference:func==6?depth>=reference:func==7)?1:0;
    }
    float2 blend=frac(uv*size-0.5);   /* gather order: x (0,1) y (1,1) z (1,0) w (0,0) */
+   /* Outside the light's projection (w <= 0) the coordinate is not finite;
+    * the compares still give 0 or 1, but NaN weights blackened whole faces. */
+   if(!all(isfinite(blend)))blend=0;
    value=lerp(lerp(lit.w,lit.z,blend.x),lerp(lit.x,lit.y,blend.x),blend.y);
   }
   else if(mode==2) {
