@@ -420,6 +420,16 @@ void xbox_KbmSetMenuMode(int on)
     InterlockedExchange(&kbm_menu_requested, on != 0);
 }
 
+/* Raw mouse look: the title reads xbox_FramebufferMouseDelta itself (turning
+ * the camera by the counts, not at a stick's rate), so the mouse no longer
+ * moves the right stick. */
+static volatile LONG kbm_raw_mouse;
+
+void xbox_KbmSetRawMouse(int on)
+{
+    InterlockedExchange(&kbm_raw_mouse, on != 0);
+}
+
 static void kbm_parse_map(const char *variable, struct kbm_bind *binds, int *listed)
 {
     char *spec = getenv(variable);
@@ -552,8 +562,11 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
 
     /* Right stick: the mouse delta scaled straight to the stick. Clamp each
      * poll's delta so a focus change or a stuck cursor cannot slam it to full,
-     * while real flicks still scale; the inlet deadzone drops sub-count noise. */
-    xbox_FramebufferMouseDelta(&dx, &dy);
+     * while real flicks still scale; the inlet deadzone drops sub-count noise.
+     * With raw mouse look (xbox_KbmSetRawMouse) the title takes the deltas
+     * itself and the stick is left to the keys. */
+    dx = dy = 0;
+    if (!kbm_raw_mouse) xbox_FramebufferMouseDelta(&dx, &dy);
     if (dx >  (int)maxdelta) dx =  (int)maxdelta;
     if (dx < -(int)maxdelta) dx = -(int)maxdelta;
     if (dy >  (int)maxdelta) dy =  (int)maxdelta;
