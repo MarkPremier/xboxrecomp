@@ -16,6 +16,7 @@
 #include <chrono>
 #include <algorithm>
 #include <set>
+#include <atomic>
 #include <unordered_map>
 #if defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #include <emmintrin.h>
@@ -394,24 +395,40 @@ struct DepthSurface {
  *
  * Unset or "auto": the whole multiple of 480 lines that covers the primary
  * monitor's height (3 on 1440p), so the frame is rendered at least at the
- * screen's own resolution. */
+ * screen's own resolution.
+ *
+ * nv2a_gpu_set_render_scale changes it while the title runs; the change waits
+ * for the next flip, where every target is redrawn at the new size. */
+static float automatic_render_scale()
+{
+    DEVMODEA mode = {};
+    mode.dmSize = sizeof mode;
+    if (!EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) || !mode.dmPelsHeight) return 1.0f;
+    float automatic = (float)std::min<DWORD>((mode.dmPelsHeight + 479) / 480, 4);
+    std::fprintf(stderr, "[GPU-D3D11] render scale %gx (monitor %lux%lu)\n", automatic,
+                 mode.dmPelsWidth, mode.dmPelsHeight);
+    return automatic;
+}
+
+static float requested_render_scale(float requested)
+{
+    if (requested == 0.0f) return automatic_render_scale();
+    return requested >= 1.0f && requested <= 8.0f ? requested : 1.0f;
+}
+
+static float current_render_scale;
+/* Set by any thread, taken at a flip: the scale asked for (0 automatic), or -1
+ * for no change. */
+static std::atomic<float> pending_render_scale{-1.0f};
+
 static float render_scale()
 {
-    static const float scale = []() {
+    if (current_render_scale == 0.0f) {
         const char *value = std::getenv("RECOMP_RENDER_SCALE");
-        if (!value || !*value || !_stricmp(value, "auto")) {
-            DEVMODEA mode = {};
-            mode.dmSize = sizeof mode;
-            if (!EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) || !mode.dmPelsHeight) return 1.0f;
-            float automatic = (float)std::min<DWORD>((mode.dmPelsHeight + 479) / 480, 4);
-            std::fprintf(stderr, "[GPU-D3D11] render scale %gx (monitor %lux%lu)\n", automatic,
-                         mode.dmPelsWidth, mode.dmPelsHeight);
-            return automatic;
-        }
-        float requested = (float)std::atof(value);
-        return requested >= 1.0f && requested <= 8.0f ? requested : 1.0f;
-    }();
-    return scale;
+        current_render_scale = requested_render_scale(
+            !value || !*value || !_stricmp(value, "auto") ? 0.0f : (float)std::atof(value));
+    }
+    return current_render_scale;
 }
 
 static UINT scaled_extent(uint32_t size, bool scaled)
@@ -1236,6 +1253,29 @@ static bool refresh_depth(DepthSurface &surface)
     return true;
 }
 
+/* A colour target's texture at its texture size, and for a scaled one the
+ * guest-size resolve and upload; `data` fills an unscaled texture. */
+static bool create_color_textures(Surface &surface, const D3D11_SUBRESOURCE_DATA *data)
+{
+    surface.texture.Reset(); surface.target.Reset(); surface.view.Reset();
+    surface.resolve.Reset(); surface.resolve_target.Reset(); surface.upload.Reset(); surface.upload_view.Reset();
+    bool scaled = is_scaled(surface);
+    D3D11_TEXTURE2D_DESC description = {};
+    description.Width = surface.texture_width; description.Height = surface.texture_height;
+    description.MipLevels = description.ArraySize = 1;
+    description.Format = DXGI_FORMAT_B8G8R8A8_UNORM; description.SampleDesc.Count = 1;
+    description.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (!target_operation_succeeded("color", "create texture", device->CreateTexture2D(&description, scaled ? nullptr : data, &surface.texture)) ||
+        !target_operation_succeeded("color", "create view", device->CreateRenderTargetView(surface.texture.Get(), nullptr, &surface.target)) ||
+        !target_operation_succeeded("color", "create sample view", device->CreateShaderResourceView(surface.texture.Get(), nullptr, &surface.view))) return false;
+    if (!scaled) return true;
+    description.Width = surface.width; description.Height = surface.height;
+    return target_operation_succeeded("color", "create resolve", device->CreateTexture2D(&description, nullptr, &surface.resolve)) &&
+           target_operation_succeeded("color", "create resolve view", device->CreateRenderTargetView(surface.resolve.Get(), nullptr, &surface.resolve_target)) &&
+           target_operation_succeeded("color", "create upload", device->CreateTexture2D(&description, nullptr, &surface.upload)) &&
+           target_operation_succeeded("color", "create upload view", device->CreateShaderResourceView(surface.upload.Get(), nullptr, &surface.upload_view));
+}
+
 static Surface *get_surface(const Nv2aGpuDraw &state, bool preserve = true, TargetExtent extent = {})
 {
     if (!extent.width) extent = {state.width, state.height};
@@ -1246,29 +1286,19 @@ static Surface *get_surface(const Nv2aGpuDraw &state, bool preserve = true, Targ
             else surface.needs_refresh = false;
             return &surface;
         }
-    D3D11_TEXTURE2D_DESC description = {};
     Surface surface = {};
     surface.memory = state.color; surface.width = extent.width; surface.height = extent.height; surface.pitch = state.pitch;
     surface.texture_width = scaled_extent(extent.width, true);
     surface.texture_height = scaled_extent(extent.height, true);
     surface.last_used = ++surface_use_serial;
     bool scaled = is_scaled(surface);
-    description.Width = surface.texture_width; description.Height = surface.texture_height;
+    D3D11_SUBRESOURCE_DATA data = {state.color, state.pitch, 0};
+    if (!create_color_textures(surface, preserve ? &data : nullptr)) return nullptr;
+    D3D11_TEXTURE2D_DESC description = {};
+    description.Width = extent.width; description.Height = extent.height;
     description.MipLevels = description.ArraySize = 1;
     description.Format = DXGI_FORMAT_B8G8R8A8_UNORM; description.SampleDesc.Count = 1;
-    description.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA data = {state.color, state.pitch, 0};
-    if (!target_operation_succeeded("color", "create texture", device->CreateTexture2D(&description, preserve && !scaled ? &data : nullptr, &surface.texture)) ||
-        !target_operation_succeeded("color", "create view", device->CreateRenderTargetView(surface.texture.Get(), nullptr, &surface.target)) ||
-        !target_operation_succeeded("color", "create sample view", device->CreateShaderResourceView(surface.texture.Get(), nullptr, &surface.view))) return nullptr;
-    description.Width = extent.width; description.Height = extent.height;
-    if (scaled) {
-        if (!target_operation_succeeded("color", "create resolve", device->CreateTexture2D(&description, nullptr, &surface.resolve)) ||
-            !target_operation_succeeded("color", "create resolve view", device->CreateRenderTargetView(surface.resolve.Get(), nullptr, &surface.resolve_target)) ||
-            !target_operation_succeeded("color", "create upload", device->CreateTexture2D(&description, nullptr, &surface.upload)) ||
-            !target_operation_succeeded("color", "create upload view", device->CreateShaderResourceView(surface.upload.Get(), nullptr, &surface.upload_view))) return nullptr;
-    }
-    description.BindFlags = 0; description.Usage = D3D11_USAGE_STAGING; description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    description.Usage = D3D11_USAGE_STAGING; description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     if (!target_operation_succeeded("color", "create staging", device->CreateTexture2D(&description, nullptr, &surface.staging))) return nullptr;
     surfaces.push_back(std::move(surface));
     gpu_timing.color_created++;
@@ -1278,6 +1308,36 @@ static Surface *get_surface(const Nv2aGpuDraw &state, bool preserve = true, Targ
         refresh_surface(created);
     }
     return &created;
+}
+
+/* A depth target's texture, its depth and sample views, and for a scaled one
+ * the guest-size resolve and upload. */
+static bool create_depth_textures(DepthSurface &surface)
+{
+    surface.texture.Reset(); surface.view.Reset(); surface.sample_view.Reset();
+    surface.resolve.Reset(); surface.resolve_view.Reset(); surface.upload.Reset(); surface.upload_view.Reset();
+    bool wide = surface.format != 1;
+    D3D11_TEXTURE2D_DESC description = {};
+    description.Width = surface.texture_width; description.Height = surface.texture_height;
+    description.MipLevels = description.ArraySize = 1; description.SampleDesc.Count = 1;
+    description.Format = wide ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_R16_TYPELESS;
+    description.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    D3D11_DEPTH_STENCIL_VIEW_DESC view = {};
+    view.Format = wide ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D16_UNORM; view.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sample = {};
+    sample.Format = wide ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : DXGI_FORMAT_R16_UNORM;
+    sample.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sample.Texture2D.MipLevels = 1;
+    if (!target_operation_succeeded("depth", "create texture", device->CreateTexture2D(&description, nullptr, &surface.texture)) ||
+        !target_operation_succeeded("depth", "create view", device->CreateDepthStencilView(surface.texture.Get(), &view, &surface.view)) ||
+        !target_operation_succeeded("depth", "create sample view", device->CreateShaderResourceView(surface.texture.Get(), &sample, &surface.sample_view))) return false;
+    if (!is_scaled(surface)) return true;
+    description.Width = surface.width; description.Height = surface.height;
+    description.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    if (!target_operation_succeeded("depth", "create resolve", device->CreateTexture2D(&description, nullptr, &surface.resolve)) ||
+        !target_operation_succeeded("depth", "create resolve view", device->CreateDepthStencilView(surface.resolve.Get(), &view, &surface.resolve_view))) return false;
+    description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    return target_operation_succeeded("depth", "create upload", device->CreateTexture2D(&description, nullptr, &surface.upload)) &&
+           target_operation_succeeded("depth", "create upload view", device->CreateShaderResourceView(surface.upload.Get(), &sample, &surface.upload_view));
 }
 
 static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, TargetExtent extent = {})
@@ -1304,39 +1364,72 @@ static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, T
             if (!preserve) { surface.needs_refresh = false; return &surface; }
             return refresh_depth(surface) ? &surface : nullptr;
         }
-    D3D11_TEXTURE2D_DESC description = {};
-    description.Width = texture_width; description.Height = texture_height;
-    description.MipLevels = description.ArraySize = 1; description.SampleDesc.Count = 1;
-    description.Format = bytes == 2 ? DXGI_FORMAT_R16_TYPELESS : DXGI_FORMAT_R24G8_TYPELESS;
-    description.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
     DepthSurface surface = {};
     surface.memory = state.depth; surface.width = extent.width; surface.height = extent.height; surface.pitch = state.depth_pitch; surface.format = state.depth_format;
     surface.texture_width = texture_width; surface.texture_height = texture_height;
     surface.last_used = ++surface_use_serial;
-    D3D11_DEPTH_STENCIL_VIEW_DESC view = {};
-    view.Format = bytes == 2 ? DXGI_FORMAT_D16_UNORM : DXGI_FORMAT_D24_UNORM_S8_UINT; view.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
-    D3D11_SHADER_RESOURCE_VIEW_DESC sample = {};
-    sample.Format = bytes == 2 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-    sample.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sample.Texture2D.MipLevels = 1;
-    if (!target_operation_succeeded("depth", "create texture", device->CreateTexture2D(&description, nullptr, &surface.texture)) ||
-        !target_operation_succeeded("depth", "create view", device->CreateDepthStencilView(surface.texture.Get(), &view, &surface.view)) ||
-        !target_operation_succeeded("depth", "create sample view", device->CreateShaderResourceView(surface.texture.Get(), &sample, &surface.sample_view))) return nullptr;
+    if (!create_depth_textures(surface)) return nullptr;
+    D3D11_TEXTURE2D_DESC description = {};
     description.Width = extent.width; description.Height = extent.height;
-    if (is_scaled(surface)) {
-        description.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-        if (!target_operation_succeeded("depth", "create resolve", device->CreateTexture2D(&description, nullptr, &surface.resolve)) ||
-            !target_operation_succeeded("depth", "create resolve view", device->CreateDepthStencilView(surface.resolve.Get(), &view, &surface.resolve_view))) return nullptr;
-        description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (!target_operation_succeeded("depth", "create upload", device->CreateTexture2D(&description, nullptr, &surface.upload)) ||
-            !target_operation_succeeded("depth", "create upload view", device->CreateShaderResourceView(surface.upload.Get(), &sample, &surface.upload_view))) return nullptr;
-    }
-    description.Usage = D3D11_USAGE_STAGING; description.BindFlags = 0; description.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+    description.MipLevels = description.ArraySize = 1; description.SampleDesc.Count = 1;
+    description.Format = bytes == 2 ? DXGI_FORMAT_R16_TYPELESS : DXGI_FORMAT_R24G8_TYPELESS;
+    description.Usage = D3D11_USAGE_STAGING; description.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
     if (!target_operation_succeeded("depth", "create staging", device->CreateTexture2D(&description, nullptr, &surface.staging))) return nullptr;
     // Creation-data uploads can round D24 values; use the bit-preserving refresh path.
     surface.needs_refresh = preserve;
     if (preserve && !refresh_depth(surface)) return nullptr;
     depth_surfaces.push_back(std::move(surface)); gpu_timing.depth_surface_created++;
     return &depth_surfaces.back();
+}
+
+/* A scale asked for by nv2a_gpu_set_render_scale, between frames: each target
+ * is drawn into a texture of its new size, so what it holds -- a frame not yet
+ * published, a texture the title renders once -- carries over. A target whose
+ * new texture cannot be made is dropped and comes back from guest RAM. */
+static void apply_render_scale()
+{
+    float requested = pending_render_scale.exchange(-1.0f);
+    if (requested < 0.0f) return;
+    float previous = render_scale(), scale = requested_render_scale(requested);
+    if (scale == previous) return;
+    current_render_scale = scale;
+    unsigned colors = 0, depths = 0;
+    for (size_t index = 0; index < surfaces.size();) {
+        Surface &surface = surfaces[index];
+        UINT width = scaled_extent(surface.width, true), height = scaled_extent(surface.height, true);
+        if (width == surface.texture_width && height == surface.texture_height) { index++; continue; }
+        ComPtr<ID3D11ShaderResourceView> old = surface.view;
+        surface.texture_width = width; surface.texture_height = height;
+        if (create_color_textures(surface, nullptr) && scale_blit(old.Get(), surface.target.Get(), nullptr, width, height)) {
+            colors++; index++;
+        } else {
+            surfaces.erase(surfaces.begin() + (ptrdiff_t)index);
+        }
+    }
+    for (size_t index = 0; index < depth_surfaces.size();) {
+        DepthSurface &surface = depth_surfaces[index];
+        bool scaled = depth_scaled(surface.memory);
+        UINT width = scaled_extent(surface.width, scaled), height = scaled_extent(surface.height, scaled);
+        if (width == surface.texture_width && height == surface.texture_height) { index++; continue; }
+        ComPtr<ID3D11ShaderResourceView> old = surface.sample_view;
+        surface.texture_width = width; surface.texture_height = height;
+        bool made = create_depth_textures(surface);
+        /* Depth carries over; stencil starts clear. */
+        if (made) context->ClearDepthStencilView(surface.view.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+        if (made && scale_blit(old.Get(), nullptr, surface.view.Get(), width, height)) {
+            surface.clear_value_valid = false;
+            depths++; index++;
+        } else {
+            depth_surfaces.erase(depth_surfaces.begin() + (ptrdiff_t)index);
+        }
+    }
+    std::fprintf(stderr, "[GPU-D3D11] render scale %gx -> %gx: %u colour and %u depth targets redrawn\n",
+                 previous, scale, colors, depths);
+}
+
+extern "C" void nv2a_gpu_set_render_scale(float scale)
+{
+    pending_render_scale.store(scale > 0.0f ? scale : 0.0f);
 }
 
 static void readback_failed(const char *kind, HRESULT result, const char *operation = "map")
@@ -1934,6 +2027,7 @@ static bool stage_flip(const void *presented, size_t bytes, uint32_t va, uint32_
 /* What a flip does to the caches, whether the frame was published or not. */
 static void flip_bookkeeping()
 {
+    apply_render_scale();
     /* Draws unmap their own streams; this only guards against a stray Map. */
     for (auto &stream : vertex_streams) release_stream(stream);
     release_stream(constant_stream);
@@ -3416,7 +3510,8 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     for (uint32_t vertex = 0; !state->vertex_program && !state->fixed_transform && vertex < count; vertex++)
         if (!nv_cpu_finite(vertices[vertex].position[0]) || !nv_cpu_finite(vertices[vertex].position[1]) ||
             !nv_cpu_finite(vertices[vertex].position[2]) || !nv_cpu_finite(vertices[vertex].position[3])) return 0;
-    if (render_scale() != 1.0f && state->depth && (state->depth_enable || state->stencil_enable)) {
+    /* Kept at every scale, so a change of scale knows which to leave alone. */
+    if (state->depth && (state->depth_enable || state->stencil_enable)) {
         if (depth_only) depth_only_targets.insert(state->depth);
         else depth_only_targets.erase(state->depth);
     }

@@ -428,6 +428,23 @@ static void fb_toggle_fullscreen(HWND h)
     }
 }
 
+/* The window thread owns the window: a settings change posts it there. One
+ * made before the swap chain shows the frames waits for it. */
+#define FB_SET_FULLSCREEN (WM_APP + 1)
+static volatile LONG s_want_fullscreen;
+
+void xbox_FramebufferSetFullscreen(int on)
+{
+    InterlockedExchange(&s_want_fullscreen, on != 0);
+    if (s_fb_hwnd)
+        PostMessageA(s_fb_hwnd, FB_SET_FULLSCREEN, (WPARAM)(on != 0), 0);
+}
+
+int xbox_FramebufferFullscreen(void)
+{
+    return s_fullscreen;
+}
+
 /* The swap chain scales, so the window need not be the frame's size: give it
  * a maximise box and the largest whole multiple of the frame that fits the
  * monitor's work area, centred there. */
@@ -703,6 +720,11 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         InterlockedExchange(&s_fb_running, 0);
         return 0;
 
+    case FB_SET_FULLSCREEN:
+        if (s_direct_present && (int)w != s_fullscreen)
+            fb_toggle_fullscreen(h);
+        return 0;
+
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
         rec_event("k %x 1", (unsigned)w);
@@ -711,8 +733,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         if (w == VK_RETURN && (l & (1 << 29)) && s_direct_present) {
-            if (!(l & (1 << 30)))      /* not the auto-repeat */
+            if (!(l & (1 << 30))) {    /* not the auto-repeat */
                 fb_toggle_fullscreen(h);
+                InterlockedExchange(&s_want_fullscreen, s_fullscreen);
+            }
             return 0;
         }
         if (w == VK_F12) {
@@ -1225,6 +1249,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (!direct_seen) {
                 direct_seen = 1;
                 fb_window_direct(hwnd);
+                if (s_want_fullscreen && !s_fullscreen)
+                    fb_toggle_fullscreen(hwnd);
             }
         } else if (s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
@@ -1304,4 +1330,6 @@ const uint32_t *xbox_FramebufferPixels(uint32_t *width, uint32_t *height) { *wid
 int xbox_FramebufferWantsPixels(void) { return 0; }
 void xbox_FramebufferSetDirectPresent(void) {}
 void xbox_FramebufferFrameShown(void) {}
+void xbox_FramebufferSetFullscreen(int on) { (void)on; }
+int xbox_FramebufferFullscreen(void) { return 0; }
 #endif

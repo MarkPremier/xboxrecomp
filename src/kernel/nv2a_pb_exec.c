@@ -137,16 +137,22 @@ static void *present_window(void)
 }
 
 /* RECOMP_VSYNC=<n>: present on every nth monitor refresh; 0 (the default)
- * presents at once and leaves the pacing to the emulated vblank. */
+ * presents at once and leaves the pacing to the emulated vblank.
+ * xbox_SetPresentInterval changes it while the title runs. */
+static volatile int s_present_interval = -1;
+
+void xbox_SetPresentInterval(int interval)
+{
+    s_present_interval = interval >= 0 && interval <= 4 ? interval : 0;
+}
+
 static int present_interval(void)
 {
-    static int interval = -1;
-    if (interval < 0) {
+    if (s_present_interval < 0) {
         const char *e = getenv("RECOMP_VSYNC");
-        interval = e ? atoi(e) : 0;
-        if (interval < 0 || interval > 4) interval = 0;
+        xbox_SetPresentInterval(e ? atoi(e) : 0);
     }
-    return interval;
+    return s_present_interval;
 }
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
