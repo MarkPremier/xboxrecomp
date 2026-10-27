@@ -196,6 +196,23 @@ int xbox_FramebufferKeyDown(int vk)
  * place the keyboard model can be driven without the foreground. The file
  * holds whitespace-separated hex VK codes (e.g. "20 57" = Space + W); path is
  * RECOMP_INPUT_FILE (default C:\recomp-input.txt). */
+static void fb_inject_poll(void);
+
+/* F11: the GPU executor writes the next whole frame's batch state to
+ * capture_<n>.txt beside the exe; the frame on screen goes to capture_<n>.bmp. */
+static void fb_request_gpu_capture(void)
+{
+    extern volatile LONG g_nv2a_capture_request;
+    static unsigned seq;
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
+    snprintf(path + n, sizeof path - n, "capture_%u.bmp", ++seq);
+    if (xbox_FramebufferDumpBmp(path) != 0)
+        fprintf(stderr, "[FBWIN] failed to capture framebuffer to %s\n", path);
+    InterlockedExchange(&g_nv2a_capture_request, 1);
+}
+
 static void fb_inject_poll(void)
 {
     static int enabled = -1;
@@ -243,6 +260,8 @@ static void fb_inject_poll(void)
             continue;
         held[i] = next[i];
         s_key_down[i] = next[i];
+        if (next[i] && i == VK_F11)
+            fb_request_gpu_capture();
         if (next[i] && i == VK_F12) {
             const char *cap = getenv("RECOMP_FB_CAPTURE");
             if (!cap || !cap[0])
@@ -522,6 +541,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
         rec_event("k %x 1", (unsigned)w);
+        if (w == VK_F11) {
+            fb_request_gpu_capture();
+            return 0;
+        }
         if (w == VK_F12) {
             const char *path = getenv("RECOMP_FB_CAPTURE");
             if (!path || !path[0]) path = "framebuffer.bmp";

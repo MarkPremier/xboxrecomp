@@ -3257,6 +3257,10 @@ static int gpu_submit_chunk(Nv2aGpuDraw *state, uint32_t *count)
 }
 #endif
 
+/* Set by the window (F11) to write the next whole frame's batch state to
+ * capture_<n>.txt beside the exe. */
+volatile LONG g_nv2a_capture_request;
+
 static void raster_batch(void)
 {
 #ifndef _WIN32
@@ -3304,6 +3308,9 @@ static void raster_batch(void)
         }
         static int info_sec = -2, info_lo, info_hi, info_state;   /* 0 wait, 1 this frame, 2 done */
         static ULONGLONG info_start;
+        static FILE *info_out;
+        static unsigned capture_seq;
+        if (!info_out) info_out = stderr;
         if (info_sec == -2) {
             const char *e = getenv("RECOMP_BATCH_INFO");   /* <sec>:<first>-<last> */
             info_sec = -1;
@@ -3316,40 +3323,86 @@ static void raster_batch(void)
         }
         if (frame_flips != s_gpu.flips) {
             frame_flips = s_gpu.flips; index = 0;
-            if (info_state == 1) info_state = 2;
+            if (info_state == 1) {
+                info_state = 2;
+                if (info_out != stderr) {
+                    fclose(info_out);
+                    info_out = stderr;
+                    fprintf(stderr, "[BINFO] capture %u written\n", capture_seq);
+                }
+            }
             if (info_sec >= 0 && info_state == 0 &&
                     GetTickCount64() - info_start >= (ULONGLONG)info_sec * 1000u) info_state = 1;
+            /* F11 in the window: the whole next frame, to a file beside the exe. */
+            if (info_state != 1 && InterlockedExchange(&g_nv2a_capture_request, 0)) {
+                char path[MAX_PATH];
+                DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+                while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
+                snprintf(path + n, sizeof path - n, "capture_%u.txt", ++capture_seq);
+                FILE *f = fopen(path, "w");
+                if (f) {
+                    info_out = f;
+                    info_lo = 1; info_hi = 0x7FFFFFFF; info_state = 1;
+                    fprintf(stderr, "[BINFO] capture %u -> %s\n", capture_seq, path);
+                }
+            }
         }
         index++;
         if (info_state == 1 && (int)index >= info_lo && (int)index <= info_hi) {
             uint32_t st, n = s_gpu.combiners.control & 255u;
             float in[4] = {0};
             if (s_gpu.idx_count) fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], in);
-            fprintf(stderr, "[BINFO] b%u prim %u n %u surf %06X stages %X tm %X in %.3f,%.3f,%.3f,%.3f\n",
+            fprintf(info_out, "[BINFO] b%u prim %u n %u surf %06X stages %X tm %X in %.3f,%.3f,%.3f,%.3f\n",
                     index, s_gpu.prim, s_gpu.idx_count, s_gpu.color_offset & 0x0FFFFFFFu,
                     s_gpu.shader_stage_program, s_gpu.transform_execution_mode, in[0], in[1], in[2], in[3]);
             for (st = 0; st < 4; st++) {
                 const Texture *t = st ? &s_gpu.extra_tex[st - 1] : &s_gpu.tex;
-                fprintf(stderr, "[BINFO]   tex%u valid %d off %08X raw %08X %ux%u ctl0 %08X filt %08X addr %u/%u/%u\n",
+                fprintf(info_out, "[BINFO]   tex%u valid %d off %08X raw %08X %ux%u ctl0 %08X filt %08X addr %u/%u/%u\n",
                         st, t->valid, t->offset, t->raw_format, t->width, t->height, t->control0,
                         t->filter, t->addr_u, t->addr_v, t->addr_w);
             }
-            fprintf(stderr, "[BINFO]   combiner control %08X final %08X %08X\n", s_gpu.combiners.control,
+            fprintf(info_out, "[BINFO]   combiner control %08X final %08X %08X\n", s_gpu.combiners.control,
                     s_gpu.combiners.final_input[0], s_gpu.combiners.final_input[1]);
             for (st = 0; st < n && st < 8; st++)
-                fprintf(stderr, "[BINFO]   cs%u rgb in %08X out %08X alpha in %08X out %08X f0 %.2f,%.2f,%.2f,%.2f f1 %.2f,%.2f,%.2f,%.2f\n",
+                fprintf(info_out, "[BINFO]   cs%u rgb in %08X out %08X alpha in %08X out %08X f0 %.2f,%.2f,%.2f,%.2f f1 %.2f,%.2f,%.2f,%.2f\n",
                         st, s_gpu.combiners.rgb_input[st], s_gpu.combiners.rgb_output[st],
                         s_gpu.combiners.alpha_input[st], s_gpu.combiners.alpha_output[st],
                         s_gpu.combiners.factors[st][0][0], s_gpu.combiners.factors[st][0][1],
                         s_gpu.combiners.factors[st][0][2], s_gpu.combiners.factors[st][0][3],
                         s_gpu.combiners.factors[st][1][0], s_gpu.combiners.factors[st][1][1],
                         s_gpu.combiners.factors[st][1][2], s_gpu.combiners.factors[st][1][3]);
-            fprintf(stderr, "[BINFO]   depth %u/%X/%u blend %u/%X/%X alpha %u/%X/%X fog %u/%X %.2f,%.2f,%.2f cull %u/%X\n",
+            fprintf(info_out, "[BINFO]   depth %u/%X/%u blend %u/%X/%X alpha %u/%X/%X fog %u/%X/%u %g,%g,%g col %.2f,%.2f,%.2f cull %u/%X\n",
                     s_gpu.depth_enable, s_gpu.depth_func, s_gpu.depth_mask, s_gpu.blend_enable,
                     s_gpu.blend_sfactor, s_gpu.blend_dfactor, s_gpu.alpha_enable, s_gpu.alpha_func,
-                    s_gpu.alpha_ref, s_gpu.fog_enable, s_gpu.fog_mode, s_gpu.combiners.fog_color[0],
+                    s_gpu.alpha_ref, s_gpu.fog_enable, s_gpu.fog_mode, s_gpu.fog_gen_mode,
+                    s_gpu.fog_parameters[0], s_gpu.fog_parameters[1], s_gpu.fog_parameters[2], s_gpu.combiners.fog_color[0],
                     s_gpu.combiners.fog_color[1], s_gpu.combiners.fog_color[2], s_gpu.cull_enable,
                     s_gpu.cull_face);
+            fprintf(info_out, "[BINFO]   stencil %u/%X ref %X mask %X/%X ops %X/%X/%X offset %X %g,%g cmask %08X zeta %06X\n",
+                    s_gpu.stencil_enable, s_gpu.stencil_func,
+                    s_gpu.stencil_ref, s_gpu.stencil_read_mask, s_gpu.stencil_write_mask,
+                    s_gpu.stencil_fail, s_gpu.stencil_depth_fail, s_gpu.stencil_pass,
+                    s_gpu.polygon_offset_enable, s_gpu.polygon_offset_scale, s_gpu.polygon_offset_bias,
+                    s_gpu.color_mask, s_gpu.depth_offset & 0x0FFFFFFFu);
+            if ((s_gpu.transform_execution_mode & 3u) == 2u) {
+                /* Where the batch lands (logical pixels) and the oFog its
+                 * vertex program wrote, from the CPU interpreter. */
+                float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f, f0 = 1e30f, f1 = -1e30f;
+                uint32_t v, seen = 0;
+                for (v = 0; v < s_gpu.idx_count && v < 65536u; v++) {
+                    Nv2aCpuVertex cv;
+                    if (!fetch_shader_vertex(s_gpu.idx[v], &cv) || !(cv.output[0][3] > 0)) continue;
+                    seen++;
+                    if (cv.output[0][0] < x0) x0 = cv.output[0][0];
+                    if (cv.output[0][0] > x1) x1 = cv.output[0][0];
+                    if (cv.output[0][1] < y0) y0 = cv.output[0][1];
+                    if (cv.output[0][1] > y1) y1 = cv.output[0][1];
+                    if (cv.output[5][0] < f0) f0 = cv.output[5][0];
+                    if (cv.output[5][0] > f1) f1 = cv.output[5][0];
+                }
+                fprintf(info_out, "[BINFO]   screen %.0f,%.0f-%.0f,%.0f ofog %.3f..%.3f (%u of %u in front)\n",
+                        x0, y0, x1, y1, f0, f1, seen, s_gpu.idx_count);
+            }
         }
         if (lo >= 0 && ((int)index < lo || (int)index > hi)) {
             uint32_t scan_pitch = 0;
