@@ -3361,8 +3361,12 @@ static void raster_batch(void)
                         st, t->valid, t->offset, t->raw_format, t->width, t->height, t->control0,
                         t->filter, t->addr_u, t->addr_v, t->addr_w);
             }
-            fprintf(info_out, "[BINFO]   combiner control %08X final %08X %08X\n", s_gpu.combiners.control,
-                    s_gpu.combiners.final_input[0], s_gpu.combiners.final_input[1]);
+            fprintf(info_out, "[BINFO]   combiner control %08X final %08X %08X c0 %.2f,%.2f,%.2f,%.2f c1 %.2f,%.2f,%.2f,%.2f\n",
+                    s_gpu.combiners.control, s_gpu.combiners.final_input[0], s_gpu.combiners.final_input[1],
+                    s_gpu.combiners.factors[8][0][0], s_gpu.combiners.factors[8][0][1],
+                    s_gpu.combiners.factors[8][0][2], s_gpu.combiners.factors[8][0][3],
+                    s_gpu.combiners.factors[8][1][0], s_gpu.combiners.factors[8][1][1],
+                    s_gpu.combiners.factors[8][1][2], s_gpu.combiners.factors[8][1][3]);
             for (st = 0; st < n && st < 8; st++)
                 fprintf(info_out, "[BINFO]   cs%u rgb in %08X out %08X alpha in %08X out %08X f0 %.2f,%.2f,%.2f,%.2f f1 %.2f,%.2f,%.2f,%.2f\n",
                         st, s_gpu.combiners.rgb_input[st], s_gpu.combiners.rgb_output[st],
