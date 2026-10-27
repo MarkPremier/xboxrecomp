@@ -12,6 +12,7 @@
 
 #include "xinput_xbox.h"
 #include <stdlib.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -357,55 +358,99 @@ static void kbm_cam_setf(uint32_t camera, uint32_t offset, float v)
 /* Face/triggers, matching what the build actually does (not what the docs
  * guess): A is jump, B is use, X is melee, LT is crouch. So jump is on Space,
  * melee on F, crouch on Control. A pad is expected to be the primary device,
- * so this is the "there is no pad" scheme. Y is the right mouse button (no
- * key); left stick click is R; right stick click is the middle mouse button.
- * Override any key binding with
- *   RECOMP_KBM_MAP="A=Return,B=E,X=Space,BLACK=Shift,WHITE=G,LT=Control,START=Tab,BACK=Escape,LTHUMB=R" */
-static int k_a = VK_SPACE, k_b = 'E', k_x = 'F', k_y = 0,
-           k_black = VK_SHIFT, k_white = 'G', k_lt = VK_CONTROL,
-           k_start = VK_TAB, k_back = VK_ESCAPE,
-           k_lthumb = 'R', k_rthumb = 0;
+ * so this is the "there is no pad" scheme. Y is the right mouse button; left
+ * stick click is R; right stick click is the middle mouse button; the wheel
+ * steps the d-pad.
+ *
+ * Every pad input takes up to three keys or mouse inputs. Override any of
+ * them with
+ *   RECOMP_KBM_MAP="A=Space|Return,RT=MouseL,Y=WheelUp|Q,BACK=None"
+ * Key names: a letter or digit, Space Return Tab Escape Back Shift Control
+ * Alt Up Down Left Right, MouseL MouseR MouseM WheelUp WheelDown, or None.
+ * A listed target loses its default keys. */
+#define KBM_MOUSE_L    0x101
+#define KBM_MOUSE_R    0x102
+#define KBM_MOUSE_M    0x103
+#define KBM_WHEEL_UP   0x104
+#define KBM_WHEEL_DOWN 0x105
 
-struct kbm_bind { const char *name; int *vk; };
-static struct kbm_bind kbm_binds[] = {
-    { "A", &k_a }, { "B", &k_b }, { "X", &k_x }, { "Y", &k_y },
-    { "BLACK", &k_black }, { "WHITE", &k_white }, { "LT", &k_lt },
-    { "START", &k_start }, { "BACK", &k_back },
-    { "LTHUMB", &k_lthumb }, { "RTHUMB", &k_rthumb },
+enum { KB_A, KB_B, KB_X, KB_Y, KB_BLACK, KB_WHITE, KB_LT, KB_RT, KB_START, KB_BACK,
+       KB_LTHUMB, KB_RTHUMB, KB_UP, KB_DOWN, KB_LEFT, KB_RIGHT, KB_COUNT };
+
+struct kbm_bind { const char *name; int vk[3]; };
+static struct kbm_bind kbm_binds[KB_COUNT] = {
+    { "A", { VK_SPACE } }, { "B", { 'E' } }, { "X", { 'F' } }, { "Y", { KBM_MOUSE_R } },
+    { "BLACK", { VK_SHIFT } }, { "WHITE", { 'G' } }, { "LT", { VK_CONTROL } },
+    { "RT", { KBM_MOUSE_L } }, { "START", { VK_TAB } }, { "BACK", { VK_ESCAPE, VK_BACK } },
+    { "LTHUMB", { 'R' } }, { "RTHUMB", { KBM_MOUSE_M } },
+    { "UP", { VK_UP, '1', KBM_WHEEL_UP } }, { "DOWN", { VK_DOWN, '2', KBM_WHEEL_DOWN } },
+    { "LEFT", { VK_LEFT, '3' } }, { "RIGHT", { VK_RIGHT, '4' } },
 };
 
 static int kbm_vk_name(const char *name)
 {
-    if (!strcmp(name, "Return"))  return VK_RETURN;
-    if (!strcmp(name, "Space"))   return VK_SPACE;
-    if (!strcmp(name, "Tab"))     return VK_TAB;
-    if (!strcmp(name, "Escape"))  return VK_ESCAPE;
-    if (!strcmp(name, "Back"))    return VK_BACK;
-    if (!strcmp(name, "Shift"))   return VK_SHIFT;
-    if (!strcmp(name, "Control")) return VK_CONTROL;
-    if (!strcmp(name, "Alt"))     return VK_MENU;
-    if (name[0] && !name[1])      return (unsigned char)name[0];
+    static const struct { const char *name; int vk; } names[] = {
+        { "Return", VK_RETURN }, { "Enter", VK_RETURN }, { "Space", VK_SPACE },
+        { "Tab", VK_TAB }, { "Escape", VK_ESCAPE }, { "Back", VK_BACK },
+        { "Shift", VK_SHIFT }, { "Control", VK_CONTROL }, { "Alt", VK_MENU },
+        { "Up", VK_UP }, { "Down", VK_DOWN }, { "Left", VK_LEFT }, { "Right", VK_RIGHT },
+        { "MouseL", KBM_MOUSE_L }, { "MouseR", KBM_MOUSE_R }, { "MouseM", KBM_MOUSE_M },
+        { "WheelUp", KBM_WHEEL_UP }, { "WheelDown", KBM_WHEEL_DOWN },
+    };
+    unsigned i;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (!strcmp(name, names[i].name)) return names[i].vk;
+    if (name[0] && !name[1])
+        return (unsigned char)toupper((unsigned char)name[0]);
     return 0;
 }
 
 static void kbm_load_map(void)
 {
     char *spec = getenv("RECOMP_KBM_MAP");
-    char *tok;
+    char *tok, *save = NULL;
     if (!spec || !*spec) return;
     spec = strdup(spec);
-    for (tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
-        char *eq = strchr(tok, '=');
-        unsigned i;
-        int vk;
+    for (tok = strtok_s(spec, ",", &save); tok; tok = strtok_s(NULL, ",", &save)) {
+        char *eq = strchr(tok, '='), *key, *save_key = NULL;
+        unsigned i, n = 0;
+        int vk[3] = { 0, 0, 0 };
         if (!eq) continue;
         *eq = '\0';
-        vk = kbm_vk_name(eq + 1);
-        if (!vk) continue;
-        for (i = 0; i < sizeof(kbm_binds) / sizeof(kbm_binds[0]); i++)
-            if (!strcmp(kbm_binds[i].name, tok)) *kbm_binds[i].vk = vk;
+        for (key = strtok_s(eq + 1, "|", &save_key); key && n < 3;
+             key = strtok_s(NULL, "|", &save_key)) {
+            if (!strcmp(key, "None")) continue;
+            if ((vk[n] = kbm_vk_name(key)) != 0) n++;
+            else fprintf(stderr, "[KBM] unknown key \"%s\" for %s\n", key, tok);
+        }
+        for (i = 0; i < KB_COUNT; i++)
+            if (!strcmp(kbm_binds[i].name, tok))
+                memcpy(kbm_binds[i].vk, vk, sizeof vk);
     }
     free(spec);
+}
+
+/* A wheel notch is one poll, which the title's per-frame input barely sees,
+ * so each direction reads as held for a beat after it. */
+static DWORD kbm_wheel_up_until, kbm_wheel_down_until;
+
+static BOOL kbm_input_down(int vk)
+{
+    switch (vk) {
+    case 0:              return FALSE;
+    case KBM_MOUSE_L:    return xbox_FramebufferMouseButton(0) != 0;
+    case KBM_MOUSE_R:    return xbox_FramebufferMouseButton(1) != 0;
+    case KBM_MOUSE_M:    return xbox_FramebufferMouseButton(2) != 0;
+    case KBM_WHEEL_UP:   return (long)(GetTickCount() - kbm_wheel_up_until) < 0;
+    case KBM_WHEEL_DOWN: return (long)(GetTickCount() - kbm_wheel_down_until) < 0;
+    default:             return key_down(vk);
+    }
+}
+
+static BOOL kbm_down(int target)
+{
+    const int *vk = kbm_binds[target].vk;
+    return kbm_input_down(vk[0]) || kbm_input_down(vk[1]) || kbm_input_down(vk[2]);
 }
 
 static void kbm_state(XBOX_INPUT_STATE *pState)
@@ -413,14 +458,12 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     static DWORD packet;
     static int configured;
     static unsigned deadzone, invert_y, maxdelta, stick_deadzone, sens, ratio;
-    static unsigned look_direct, look_trace;
+    static unsigned look_direct, look_trace, wheel_move;
     static float look_gain, look_gain_y;
     static float dbg_last_pitch, dbg_last_yaw;
     static int dbg_have;
-    /* Scroll -> left-stick alias: a notch is a single poll, which the title's
-     * per-frame integration barely sees, so hold the deflection for a beat. */
+    /* Scroll -> left-stick alias (RECOMP_KBM_WHEEL_MOVE, default on). */
     static int wheel_dir;
-    static DWORD wheel_until;
     WORD b = 0;
     int dx, dy, wheel;
 
@@ -449,16 +492,21 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
         look_trace  = kbm_number("RECOMP_KBM_LOOK_TRACE", 1, 0);
         look_gain   = (float)kbm_number("RECOMP_KBM_LOOK_GAIN",   1000000, 100) / 1000.0f;
         look_gain_y = (float)kbm_number("RECOMP_KBM_LOOK_GAIN_Y", 1000000, 100) / 1000.0f;
+        wheel_move  = kbm_number("RECOMP_KBM_WHEEL_MOVE", 1, 1);
         kbm_load_map();
         configured = 1;
         fprintf(stderr, "[KBM] profile: deadzone=%u stick_deadzone=%u invert_y=%u maxdelta=%u "
-                "sens=%u ratio=%u look_direct=%u look_gain=%.4f look_gain_y=%.4f "
-                "A=%d B=%d X=%d Y=%d BLACK=%d WHITE=%d LT=%d START=%d BACK=%d "
-                "LTHUMB=%d RTHUMB=%d\n",
+                "sens=%u ratio=%u look_direct=%u look_gain=%.4f look_gain_y=%.4f wheel_move=%u\n",
                 deadzone, stick_deadzone, invert_y, maxdelta, sens, ratio,
-                look_direct, look_gain, look_gain_y,
-                k_a, k_b, k_x, k_y, k_black, k_white, k_lt, k_start, k_back,
-                k_lthumb, k_rthumb);
+                look_direct, look_gain, look_gain_y, wheel_move);
+        {
+            unsigned i;
+            fprintf(stderr, "[KBM] keys:");
+            for (i = 0; i < KB_COUNT; i++)
+                fprintf(stderr, " %s=%X/%X/%X", kbm_binds[i].name, kbm_binds[i].vk[0],
+                        kbm_binds[i].vk[1], kbm_binds[i].vk[2]);
+            fprintf(stderr, "\n");
+        }
     }
 
     memset(pState, 0, sizeof(*pState));
@@ -655,42 +703,33 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
         }
     }
 
-    /* Digital: d-pad on the arrows (and 1-4); Start/Back from the map. */
-    if (key_down(VK_UP)    || key_down('1')) b |= XBOX_GAMEPAD_DPAD_UP;
-    if (key_down(VK_DOWN)  || key_down('2')) b |= XBOX_GAMEPAD_DPAD_DOWN;
-    if (key_down(VK_LEFT)  || key_down('3')) b |= XBOX_GAMEPAD_DPAD_LEFT;
-    if (key_down(VK_RIGHT) || key_down('4')) b |= XBOX_GAMEPAD_DPAD_RIGHT;
+    /* Wheel notches latch WheelUp/WheelDown; with WHEEL_MOVE they also push
+     * the left stick forward/back for the same beat. */
     wheel = xbox_FramebufferMouseWheel();
-    if (wheel > 0) b |= XBOX_GAMEPAD_DPAD_UP;
-    if (wheel < 0) b |= XBOX_GAMEPAD_DPAD_DOWN;
-    /* Scroll also aliases the left stick's up/down (forward/back). */
-    if (wheel > 0)      { wheel_dir =  1; wheel_until = GetTickCount() + 150; }
-    else if (wheel < 0) { wheel_dir = -1; wheel_until = GetTickCount() + 150; }
-    if (wheel_dir && (long)(GetTickCount() - wheel_until) < 0)
+    if (wheel > 0)      { wheel_dir =  1; kbm_wheel_up_until = GetTickCount() + 150; }
+    else if (wheel < 0) { wheel_dir = -1; kbm_wheel_down_until = GetTickCount() + 150; }
+    if (wheel_move && wheel_dir &&
+            (long)(GetTickCount() - (wheel_dir > 0 ? kbm_wheel_up_until : kbm_wheel_down_until)) < 0)
         pState->Gamepad.sThumbLY = wheel_dir > 0 ? 32767 : -32767;
-    if (key_down(k_start)) b |= XBOX_GAMEPAD_START;
-    /* BackSpace stays a Back alias regardless of the configured Back key. */
-    if (key_down(k_back) || key_down(VK_BACK)) b |= XBOX_GAMEPAD_BACK;
-    /* Stick clicks: left on a key, right on the middle mouse button. */
-    if (key_down(k_lthumb)) b |= XBOX_GAMEPAD_LEFT_THUMB;
-    if (key_down(k_rthumb) || xbox_FramebufferMouseButton(2))
-        b |= XBOX_GAMEPAD_RIGHT_THUMB;
+
+    if (kbm_down(KB_UP))     b |= XBOX_GAMEPAD_DPAD_UP;
+    if (kbm_down(KB_DOWN))   b |= XBOX_GAMEPAD_DPAD_DOWN;
+    if (kbm_down(KB_LEFT))   b |= XBOX_GAMEPAD_DPAD_LEFT;
+    if (kbm_down(KB_RIGHT))  b |= XBOX_GAMEPAD_DPAD_RIGHT;
+    if (kbm_down(KB_START))  b |= XBOX_GAMEPAD_START;
+    if (kbm_down(KB_BACK))   b |= XBOX_GAMEPAD_BACK;
+    if (kbm_down(KB_LTHUMB)) b |= XBOX_GAMEPAD_LEFT_THUMB;
+    if (kbm_down(KB_RTHUMB)) b |= XBOX_GAMEPAD_RIGHT_THUMB;
     pState->Gamepad.wButtons = b;
 
-    /* Analog face buttons and triggers. Y is the right mouse button; White
-     * (the old right-mouse action) is on G; crouch lives on the LT button,
-     * which the map puts on Control. */
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]     = key_down(k_a) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]     = key_down(k_b) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]     = key_down(k_x) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
-        (key_down(k_y) || xbox_FramebufferMouseButton(1)) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] = key_down(k_black) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] = key_down(k_white) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] =
-        key_down(k_lt) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] =
-        xbox_FramebufferMouseButton(0) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = kbm_down(KB_A) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = kbm_down(KB_B) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = kbm_down(KB_X) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = kbm_down(KB_Y) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = kbm_down(KB_BLACK) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = kbm_down(KB_WHITE) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = kbm_down(KB_LT) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = kbm_down(KB_RT) ? 255 : 0;
 
     pState->dwPacketNumber = ++packet;
 }
