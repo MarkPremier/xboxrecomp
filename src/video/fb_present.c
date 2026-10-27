@@ -431,6 +431,10 @@ static void fb_toggle_fullscreen(HWND h)
 /* The window thread owns the window: a settings change posts it there. One
  * made before the swap chain shows the frames waits for it. */
 #define FB_SET_FULLSCREEN (WM_APP + 1)
+#define FB_FIT_WINDOW (WM_APP + 2)
+/* The shape the window opens at, width over height (xbox_FramebufferSetWindowAspect);
+ * 0 for the frame's own. */
+static float s_window_aspect;
 static volatile LONG s_want_fullscreen;
 
 void xbox_FramebufferSetFullscreen(int on)
@@ -445,14 +449,24 @@ int xbox_FramebufferFullscreen(void)
     return s_fullscreen;
 }
 
+/* The window's shape, width over height (widescreen), from now on: a window
+ * already showing frames, neither fullscreen nor maximised, is refitted. */
+void xbox_FramebufferSetWindowAspect(float aspect)
+{
+    s_window_aspect = aspect;
+    if (s_fb_hwnd)
+        PostMessageA(s_fb_hwnd, FB_FIT_WINDOW, 0, 0);
+}
+
 /* The swap chain scales, so the window need not be the frame's size: give it
- * a maximise box and the largest whole multiple of the frame that fits the
- * monitor's work area, centred there. */
+ * a maximise box and the largest whole multiple of the frame's height that
+ * fits the monitor's work area, at the window's shape, centred there. */
 static void fb_window_direct(HWND h)
 {
     MONITORINFO mi;
     RECT r;
     LONG work_w, work_h, scale = 1;
+    float aspect = s_window_aspect > 0 ? s_window_aspect : (float)s_fb_width / (float)s_fb_height;
     mi.cbSize = sizeof mi;
     SetWindowLongA(h, GWL_STYLE, GetWindowLongA(h, GWL_STYLE) | WS_MAXIMIZEBOX);
     if (!GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
@@ -461,14 +475,14 @@ static void fb_window_direct(HWND h)
     work_h = mi.rcWork.bottom - mi.rcWork.top;
     for (;;) {
         r.left = 0; r.top = 0;
-        r.right = (LONG)s_fb_width * (scale + 1); r.bottom = (LONG)s_fb_height * (scale + 1);
+        r.bottom = (LONG)s_fb_height * (scale + 1); r.right = (LONG)(r.bottom * aspect + 0.5f);
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
         if (r.right - r.left > work_w || r.bottom - r.top > work_h)
             break;
         scale++;
     }
     r.left = 0; r.top = 0;
-    r.right = (LONG)s_fb_width * scale; r.bottom = (LONG)s_fb_height * scale;
+    r.bottom = (LONG)s_fb_height * scale; r.right = (LONG)(r.bottom * aspect + 0.5f);
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     SetWindowPos(h, NULL, mi.rcWork.left + (work_w - (r.right - r.left)) / 2,
                  mi.rcWork.top + (work_h - (r.bottom - r.top)) / 2,
@@ -723,6 +737,11 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case FB_SET_FULLSCREEN:
         if (s_direct_present && (int)w != s_fullscreen)
             fb_toggle_fullscreen(h);
+        return 0;
+
+    case FB_FIT_WINDOW:
+        if (s_direct_present && !s_fullscreen && !IsZoomed(h))
+            fb_window_direct(h);
         return 0;
 
     case WM_KEYDOWN:
@@ -1331,5 +1350,6 @@ int xbox_FramebufferWantsPixels(void) { return 0; }
 void xbox_FramebufferSetDirectPresent(void) {}
 void xbox_FramebufferFrameShown(void) {}
 void xbox_FramebufferSetFullscreen(int on) { (void)on; }
+void xbox_FramebufferSetWindowAspect(float aspect) { (void)aspect; }
 int xbox_FramebufferFullscreen(void) { return 0; }
 #endif

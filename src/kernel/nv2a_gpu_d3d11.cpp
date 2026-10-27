@@ -431,10 +431,52 @@ static float render_scale()
     return current_render_scale;
 }
 
-static UINT scaled_extent(uint32_t size, bool scaled)
+/* Widescreen (nv2a_gpu_set_wide_factor): screen-shaped targets -- the
+ * display mode's size, or twice it on an axis for an anti-aliased surface --
+ * are wider than the title made them by `wide_factor` (16:9 is 4/3 of 4:3).
+ * Positions still arrive in the title's 4:3 pixels, so the picture is
+ * stretched across the target; the draw undoes the stretch:
+ *
+ *   - a 3D draw has the x row of its projection divided by the factor, which
+ *     widens the view instead (Hor+). Turok's rigid programs project through
+ *     c[96], its skinned ones through c[187] (their bone palette is at
+ *     c[96] + a0), and the fixed-function transform through c[0];
+ *   - a 2D draw (a program that projects through neither) is squeezed back to
+ *     the middle 4:3 by the geometry shader, triangle by triangle, unless the
+ *     triangle reaches the left or right edge: backdrops, fades and edge
+ *     effects span the screen, the HUD and text keep their shape.
+ *
+ * A frame with no 3D draw on the screen (a loading screen, a menu) is a 2D
+ * picture made for 4:3: two in a row and the targets go back to 4:3 until a
+ * 3D draw comes back. */
+static float wide_factor = 1.0f;
+static std::atomic<float> pending_wide_factor{-1.0f};
+static bool wide_frames = true;             /* this frame's targets are wide */
+static unsigned frames_without_3d, screen_3d_draws;
+
+extern "C" void xbox_FramebufferSize(uint32_t *width, uint32_t *height);
+
+static bool screen_shaped(uint32_t width, uint32_t height)
 {
-    if (!scaled || render_scale() == 1.0f) return size;
-    return std::min<UINT>((UINT)((float)size * render_scale() + 0.5f), D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
+    uint32_t screen_width = 640, screen_height = 480;
+    xbox_FramebufferSize(&screen_width, &screen_height);
+    return screen_height && (height == screen_height || height == 2 * screen_height) &&
+           (width == screen_width || width == 2 * screen_width);
+}
+
+static UINT extent_at(uint32_t size, float factor)
+{
+    if (factor == 1.0f) return size;
+    return std::min<UINT>((UINT)((float)size * factor + 0.5f), D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
+}
+
+/* A target's texture size: `scaled` false for a depth-only target. */
+static void texture_size(uint32_t width, uint32_t height, bool scaled, UINT &texture_width, UINT &texture_height)
+{
+    float scale = scaled ? render_scale() : 1.0f;
+    float wide = scaled && wide_frames && screen_shaped(width, height) ? wide_factor : 1.0f;
+    texture_width = extent_at(width, scale * wide);
+    texture_height = extent_at(height, scale);
 }
 
 template<typename Target>
@@ -448,7 +490,7 @@ static std::set<const uint8_t *> depth_only_targets;
 
 static bool depth_scaled(const uint8_t *memory)
 {
-    return render_scale() != 1.0f && !depth_only_targets.count(memory);
+    return !depth_only_targets.count(memory);
 }
 
 /* One edge of a rectangle, from one target's pixels to another's. */
@@ -728,6 +770,40 @@ static std::string vertex_program_source(const std::vector<uint32_t> &key, bool 
     if (state_program) source += "}\n";
     else source += "Vertex bridge=(Vertex)0; bridge.position=outputs[0]; bridge.diffuse=saturate(outputs[3]); bridge.specular=saturate(outputs[4]); bridge.tex0=outputs[9]; bridge.tex1=outputs[10]; bridge.tex2=outputs[11]; bridge.tex3=outputs[12]; bridge.fogCoordinate=outputs[5].x; Pixel result=vs_main(bridge); result.fog=fog_factor(outputs[5].x); return result; }\n";
     return source;
+}
+
+/* The title's projection registers, most specific first
+ * (nv2a_gpu_set_projection_registers): D3D's c0 by default. */
+static int projection_registers[4] = {96};
+static int projection_register_count = 1;
+
+extern "C" void nv2a_gpu_set_projection_registers(const int *registers, int count)
+{
+    projection_register_count = 0;
+    for (int index = 0; index < count && index < 4; index++)
+        if (registers[index] >= 0 && registers[index] < 192)
+            projection_registers[projection_register_count++] = registers[index];
+}
+
+/* The register a draw projects x through, read directly (not through a0): -1
+ * for a draw in screen space. The fixed-function transform's is c[0]. */
+static int projection_register(const Nv2aGpuDraw &state)
+{
+    if (!state.vertex_program) return state.fixed_transform ? 0 : -1;
+    uint32_t words = vertex_program_word_count(state), found = 0;
+    for (uint32_t slot = state.vertex_start; slot < state.vertex_start + words / 4; slot++) {
+        const uint32_t *word = state.vertex_program[slot];
+        if (word[3] & 2) continue;
+        uint32_t usage = nv_cpu_vp_operand_usage((word[1] >> 21) & 15, (word[1] >> 25) & 7);
+        bool reads = (usage & 1 && ((word[2] >> 26) & 3) == 3) || (usage & 2 && ((word[2] >> 11) & 3) == 3) ||
+                     (usage & 4 && ((word[3] >> 28) & 3) == 3);
+        uint32_t constant = (word[1] >> 13) & 255;
+        for (int index = 0; reads && index < projection_register_count; index++)
+            if ((int)constant == projection_registers[index]) found |= 1u << index;
+    }
+    for (int index = 0; index < projection_register_count; index++)
+        if (found & (1u << index)) return projection_registers[index];
+    return -1;
 }
 
 static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state)
@@ -1288,8 +1364,7 @@ static Surface *get_surface(const Nv2aGpuDraw &state, bool preserve = true, Targ
         }
     Surface surface = {};
     surface.memory = state.color; surface.width = extent.width; surface.height = extent.height; surface.pitch = state.pitch;
-    surface.texture_width = scaled_extent(extent.width, true);
-    surface.texture_height = scaled_extent(extent.height, true);
+    texture_size(extent.width, extent.height, true, surface.texture_width, surface.texture_height);
     surface.last_used = ++surface_use_serial;
     bool scaled = is_scaled(surface);
     D3D11_SUBRESOURCE_DATA data = {state.color, state.pitch, 0};
@@ -1354,8 +1429,8 @@ static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, T
                      state.depth_pitch, extent.width, state.depth_format);
         return nullptr;
     }
-    UINT texture_width = scaled_extent(extent.width, depth_scaled(state.depth));
-    UINT texture_height = scaled_extent(extent.height, depth_scaled(state.depth));
+    UINT texture_width, texture_height;
+    texture_size(extent.width, extent.height, depth_scaled(state.depth), texture_width, texture_height);
     for (auto &surface : depth_surfaces)
         if (surface.memory == state.depth && surface.width == extent.width && surface.height == extent.height &&
             surface.pitch == state.depth_pitch && surface.format == state.depth_format &&
@@ -1382,21 +1457,17 @@ static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, T
     return &depth_surfaces.back();
 }
 
-/* A scale asked for by nv2a_gpu_set_render_scale, between frames: each target
- * is drawn into a texture of its new size, so what it holds -- a frame not yet
+/* Every target at the size the scale and widescreen now give it: each is
+ * drawn into a texture of its new size, so what it holds -- a frame not yet
  * published, a texture the title renders once -- carries over. A target whose
  * new texture cannot be made is dropped and comes back from guest RAM. */
-static void apply_render_scale()
+static void resize_targets(const char *why)
 {
-    float requested = pending_render_scale.exchange(-1.0f);
-    if (requested < 0.0f) return;
-    float previous = render_scale(), scale = requested_render_scale(requested);
-    if (scale == previous) return;
-    current_render_scale = scale;
     unsigned colors = 0, depths = 0;
     for (size_t index = 0; index < surfaces.size();) {
         Surface &surface = surfaces[index];
-        UINT width = scaled_extent(surface.width, true), height = scaled_extent(surface.height, true);
+        UINT width, height;
+        texture_size(surface.width, surface.height, true, width, height);
         if (width == surface.texture_width && height == surface.texture_height) { index++; continue; }
         ComPtr<ID3D11ShaderResourceView> old = surface.view;
         surface.texture_width = width; surface.texture_height = height;
@@ -1409,7 +1480,8 @@ static void apply_render_scale()
     for (size_t index = 0; index < depth_surfaces.size();) {
         DepthSurface &surface = depth_surfaces[index];
         bool scaled = depth_scaled(surface.memory);
-        UINT width = scaled_extent(surface.width, scaled), height = scaled_extent(surface.height, scaled);
+        UINT width, height;
+        texture_size(surface.width, surface.height, scaled, width, height);
         if (width == surface.texture_width && height == surface.texture_height) { index++; continue; }
         ComPtr<ID3D11ShaderResourceView> old = surface.sample_view;
         surface.texture_width = width; surface.texture_height = height;
@@ -1423,13 +1495,49 @@ static void apply_render_scale()
             depth_surfaces.erase(depth_surfaces.begin() + (ptrdiff_t)index);
         }
     }
-    std::fprintf(stderr, "[GPU-D3D11] render scale %gx -> %gx: %u colour and %u depth targets redrawn\n",
-                 previous, scale, colors, depths);
+    std::fprintf(stderr, "[GPU-D3D11] %s: %u colour and %u depth targets redrawn\n", why, colors, depths);
+}
+
+/* Between frames: a scale or widescreen asked for, and the 2D-frame test. */
+static void apply_target_sizes()
+{
+    char why[96] = "";
+    float requested = pending_render_scale.exchange(-1.0f);
+    if (requested >= 0.0f) {
+        float previous = render_scale(), scale = requested_render_scale(requested);
+        if (scale != previous) {
+            current_render_scale = scale;
+            std::snprintf(why, sizeof why, "render scale %gx -> %gx", previous, scale);
+        }
+    }
+    requested = pending_wide_factor.exchange(-1.0f);
+    if (requested > 0.0f && requested != wide_factor) {
+        std::snprintf(why + std::strlen(why), sizeof why - std::strlen(why), "%swidescreen %.3g -> %.3g",
+                      *why ? ", " : "", wide_factor, requested);
+        wide_factor = requested;
+    }
+    frames_without_3d = screen_3d_draws ? 0 : frames_without_3d + 1;
+    screen_3d_draws = 0;
+    bool wide = frames_without_3d < 2;
+    if (wide != wide_frames) {
+        wide_frames = wide;
+        if (wide_factor != 1.0f)
+            std::snprintf(why + std::strlen(why), sizeof why - std::strlen(why), "%s%s",
+                          *why ? ", " : "", wide ? "3D frames, wide" : "2D frames, 4:3");
+    }
+    if (*why) resize_targets(why);
 }
 
 extern "C" void nv2a_gpu_set_render_scale(float scale)
 {
     pending_render_scale.store(scale > 0.0f ? scale : 0.0f);
+}
+
+/* The width of the screen's targets over 4:3's: 1 for 4:3, 4/3 for 16:9.
+ * From the next flip; any thread. */
+extern "C" void nv2a_gpu_set_wide_factor(float factor)
+{
+    pending_wide_factor.store(factor >= 1.0f && factor <= 4.0f ? factor : 1.0f);
 }
 
 static void readback_failed(const char *kind, HRESULT result, const char *operation = "map")
@@ -2025,9 +2133,12 @@ static bool stage_flip(const void *presented, size_t bytes, uint32_t va, uint32_
 }
 
 /* What a flip does to the caches, whether the frame was published or not. */
+static void apply_texture_replacements();
+
 static void flip_bookkeeping()
 {
-    apply_render_scale();
+    apply_target_sizes();
+    apply_texture_replacements();
     /* Draws unmap their own streams; this only guards against a stray Map. */
     for (auto &stream : vertex_streams) release_stream(stream);
     release_stream(constant_stream);
@@ -2292,8 +2403,10 @@ extern "C" int nv2a_gpu_present_surface(void *window, const void *presented, uin
      * guest RAM's copy first, as a texture use would. */
     refresh_surface(*shown);
     uint32_t height = rows && rows < shown->height ? rows : shown->height;
-    if (!present_view(shown->view.Get(), 1.0f, (float)height / (float)shown->height,
-                      (float)aspect_w / (float)aspect_h, interval))
+    /* A widescreen target is wider than the title's aspect by its own shape. */
+    float aspect = (float)aspect_w / (float)aspect_h *
+                   ((float)shown->texture_width / (float)shown->width) / ((float)shown->texture_height / (float)shown->height);
+    if (!present_view(shown->view.Get(), 1.0f, (float)height / (float)shown->height, aspect, interval))
         return 0;
     /* RECOMP_ASYNC_FLIP staged an earlier frame for the guest-RAM route;
      * resolving it now would show that old frame on the next such flip. */
@@ -2362,9 +2475,11 @@ static bool matches_color_target(const Surface &surface, const Nv2aGpuDraw &stat
 
 static bool matches_depth_target(const DepthSurface &surface, const Nv2aGpuDraw &state, TargetExtent extent)
 {
+    UINT texture_width, texture_height;
+    texture_size(extent.width, extent.height, depth_scaled(state.depth), texture_width, texture_height);
     return surface.memory == state.depth && surface.width == extent.width &&
         surface.height == extent.height && surface.pitch == state.depth_pitch && surface.format == state.depth_format &&
-        surface.texture_width == scaled_extent(extent.width, depth_scaled(state.depth));
+        surface.texture_width == texture_width && surface.texture_height == texture_height;
 }
 
 static TargetExtent reusable_target_extent(const Nv2aGpuDraw &state)
@@ -2666,6 +2781,69 @@ static ID3D11ShaderResourceView *default_white_view()
     if (FAILED(device->CreateTexture2D(&desc, &data, &texture)) ||
         FAILED(device->CreateShaderResourceView(texture.Get(), nullptr, &view))) return nullptr;
     return view.Get();
+}
+
+/* Texture replacement: an image of the title's, known by a hash of its bytes
+ * in guest memory, drawn as another (a PC version's button icon, say). */
+struct TextureReplacement {
+    uint32_t width, height;
+    std::vector<uint32_t> pixels;   /* B8G8R8A8 */
+};
+static std::unordered_map<uint64_t, TextureReplacement> texture_replacements;
+static bool replacements_on = true;
+static std::atomic<int> pending_replacements_on{-1};
+
+static uint64_t texture_hash(const void *source, size_t bytes)
+{
+    const uint8_t *data = (const uint8_t *)source;
+    uint64_t hash = 0xCBF29CE484222325ull;
+    for (size_t index = 0; index < bytes; index++) hash = (hash ^ data[index]) * 0x100000001B3ull;
+    return hash;
+}
+
+/* Before the title draws: not safe against a draw in progress. */
+extern "C" void nv2a_gpu_replace_texture(uint64_t hash, const uint32_t *bgra, uint32_t width, uint32_t height)
+{
+    TextureReplacement replacement = {width, height, std::vector<uint32_t>(bgra, bgra + (size_t)width * height)};
+    texture_replacements[hash] = std::move(replacement);
+}
+
+/* Replacements in use or not, from the next flip; any thread. */
+extern "C" void nv2a_gpu_set_texture_replacements(int on)
+{
+    pending_replacements_on.store(on != 0);
+}
+
+/* At a flip: a switch drops the cached images it changes, to be made again. */
+static void apply_texture_replacements()
+{
+    int on = pending_replacements_on.exchange(-1);
+    if (on < 0 || (on != 0) == replacements_on) return;
+    replacements_on = on != 0;
+    for (size_t index = textures.size(); index-- > 0;) {
+        const CachedTexture &texture = textures[index];
+        if (texture.cube || texture.depth || texture.width > 256 || texture.height > 256) continue;
+        if (texture_replacements.count(texture_hash(texture.source_snapshot.data(), texture.source_snapshot.size())))
+            textures.erase(textures.begin() + (ptrdiff_t)index);
+    }
+    texture_index_count = (size_t)-1;
+}
+
+/* DIAG RECOMP_TEXTURE_DUMP=<dir>: each texture up to 256x256, the first time
+ * its bytes are seen, as <hash>_<format>_<w>x<h>[_l].bin -- the guest bytes,
+ * for finding a replacement's hash. */
+static void dump_texture(const Nv2aGpuTexture &binding, uint64_t hash)
+{
+    static const char *directory = std::getenv("RECOMP_TEXTURE_DUMP");
+    static std::set<uint64_t> dumped;
+    if (!directory || binding.width > 256 || binding.height > 256 || !dumped.insert(hash).second) return;
+    char path[MAX_PATH];
+    std::snprintf(path, sizeof path, "%s\\%016llX_%02X_%ux%u%s.bin", directory, (unsigned long long)hash,
+                  binding.format, binding.width, binding.height, binding.linear ? "_l" : "");
+    if (FILE *file = std::fopen(path, "wb")) {
+        std::fwrite(binding.source, 1, binding.source_bytes, file);
+        std::fclose(file);
+    }
 }
 
 static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, const Surface &destination)
@@ -3033,6 +3211,20 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
     description.MipLevels = levels; description.ArraySize = faces; description.Format = format;
     description.MiscFlags = binding.cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
     description.SampleDesc.Count = 1; description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    /* A replacement for this image (nv2a_gpu_replace_texture): drawn instead,
+     * at its own size. */
+    const TextureReplacement *replacement = nullptr;
+    if (!binding.cube && !binding.depth) {
+        uint64_t hash = texture_hash(binding.source, binding.source_bytes);
+        auto found = texture_replacements.find(hash);
+        if (replacements_on && found != texture_replacements.end()) {
+            replacement = &found->second;
+            description.Width = replacement->width; description.Height = replacement->height;
+            description.MipLevels = 1; description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            data[0].pSysMem = replacement->pixels.data(); data[0].SysMemPitch = replacement->width * 4;
+        }
+        dump_texture(binding, hash);
+    }
     ComPtr<ID3D11Texture2D> texture;
     CachedTexture entry = {};
     entry.source = binding.source; entry.width = binding.width; entry.height = binding.height; entry.format = binding.format;
@@ -3657,6 +3849,20 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     constants.viewport[0] = (float)state->width / (float)(state->aa_scale_x ? state->aa_scale_x : 1u);
     constants.viewport[1] = (float)state->height / (float)(state->aa_scale_y ? state->aa_scale_y : 1u);
     constants.viewport[2] = state->depth_format == 1 ? 65535.0f : 16777215.0f;
+    /* Widescreen (see wide_factor): a 3D draw widens its view, a 2D one is
+     * squeezed back (viewport.w, in gs_main). */
+    int projection = projection_register(*state);
+    if (projection >= 0 && surface && screen_shaped(surface->width, surface->height)) screen_3d_draws++;
+    float widened = ((float)target_width / (float)guest_width) / ((float)target_height / (float)guest_height);
+    bool squeeze_2d = false;
+    if (widened > 1.001f) {
+        if (projection >= 0)
+            for (int component = 0; component < 4; component++) constants.vertex_constants[projection][component] /= widened;
+        else {
+            constants.viewport[3] = 1.0f / widened;
+            squeeze_2d = true;
+        }
+    }
     constants.depth_range[0] = depth_clip_min; constants.depth_range[1] = depth_clip_max;
     constants.depth_range[2] = (float)depth_clamp;
     if (front_offset || back_offset) {
@@ -3899,7 +4105,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     context->VSSetShader(guest_vertex ? guest_vertex->shader.Get() : vertex_shader.Get(), nullptr, 0);
     ID3D11GeometryShader *geometry = state->topology == NV2A_GPU_TOPOLOGY_LINES ? line_geometry_shader.Get() :
         state->topology == NV2A_GPU_TOPOLOGY_POINTS ? point_geometry_shader.Get() :
-        guest_vertex || state->fixed_transform || state->flat_shading ? geometry_shader.Get() : nullptr;
+        guest_vertex || state->fixed_transform || state->flat_shading || squeeze_2d ? geometry_shader.Get() : nullptr;
     context->GSSetShader(geometry, nullptr, 0);
     context->PSSetShader(program, nullptr, 0);
     if (constants_ring && context1) {

@@ -25,6 +25,18 @@ int nv2a_gpu_present_pixels(void *window, const uint32_t *pixels, uint32_t width
 /* Render at `scale` times the title's size (1 to 8; 0 matches the monitor, as
  * RECOMP_RENDER_SCALE=auto) from the next flip on. Any thread. */
 void nv2a_gpu_set_render_scale(float scale);
+/* Widescreen: the screen's targets `factor` times as wide as 4:3 (4/3 for
+ * 16:9, 1 for off), 3D draws widened through the title's projection
+ * registers (most specific first; D3D's c0, c[96], by default) and 2D draws
+ * kept at 4:3. From the next flip; any thread. */
+void nv2a_gpu_set_wide_factor(float factor);
+void nv2a_gpu_set_projection_registers(const int *registers, int count);
+/* Draw `bgra` (width x height, B8G8R8A8) wherever the title binds a texture
+ * whose bytes in guest memory hash (FNV-1a 64) to `hash`. Before the title
+ * starts drawing. RECOMP_TEXTURE_DUMP=<dir> writes textures with their hashes. */
+void nv2a_gpu_replace_texture(uint64_t hash, const uint32_t *bgra, uint32_t width, uint32_t height);
+/* Replacements drawn (the default) or not, from the next flip; any thread. */
+void nv2a_gpu_set_texture_replacements(int on);
 void nv2a_gpu_surface_modified(const void *addr, size_t bytes);
 void nv2a_gpu_surface_publish(const void *addr, size_t bytes);
 void nv2a_gpu_invalidate(void);

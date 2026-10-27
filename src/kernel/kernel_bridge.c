@@ -2445,13 +2445,26 @@ static DWORD kernel_vblank_wait_ms(void)
     return left > 10 ? 10 : (DWORD)left;
 }
 
+/* Blanks a second asked for by xbox_Nv2aSetVblankRate, in thousandths; 0 for
+ * no change. */
+static volatile LONG g_vblank_rate_request;
+
+/* Blanks per second from now on (59.94 until set): with RECOMP_FPS_CAP=vblank
+ * the frame rate. Any thread; the timer thread takes it at its next tick. */
+void xbox_Nv2aSetVblankRate(double hz)
+{
+    if (hz >= 10.0 && hz <= 1000.0)
+        InterlockedExchange(&g_vblank_rate_request, (LONG)(hz * 1000.0 + 0.5));
+}
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
+    static LARGE_INTEGER freq;
     LARGE_INTEGER now;
+    LONG rate;
 
     if (enabled < 0) {
-        LARGE_INTEGER freq;
         enabled = getenv("RECOMP_VBLANK") != NULL;
         if (enabled && QueryPerformanceFrequency(&freq))
             g_vblank_period = freq.QuadPart * 1001 / 60000;   /* 59.94 Hz */
@@ -2460,6 +2473,13 @@ static void kernel_vblank_tick(void)
         return;
 
     QueryPerformanceCounter(&now);
+    rate = InterlockedExchange(&g_vblank_rate_request, 0);
+    if (rate) {
+        /* A new schedule, starting now. */
+        g_vblank_period = freq.QuadPart * 1000 / rate;
+        g_vblank_epoch = now.QuadPart;
+        g_vblank_due = now.QuadPart + g_vblank_period;
+    }
     if (!g_vblank_epoch)
         g_vblank_epoch = now.QuadPart;
     if (InterlockedExchange(&g_vblank_flip_request, 0)) {

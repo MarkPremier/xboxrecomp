@@ -405,9 +405,24 @@ static int kbm_vk_name(const char *name)
     return 0;
 }
 
-static void kbm_load_map(void)
+/* Menu bindings: RECOMP_KBM_MENU_MAP, in RECOMP_KBM_MAP's form, gives the
+ * targets it lists other keys while the title says it is in a menu
+ * (xbox_KbmSetMenuMode) -- Escape as Back there and as Start in play, say. A
+ * change waits until every key either set names for those targets is up, so
+ * the Escape that opened a menu is not also its Back. */
+static struct kbm_bind kbm_menu_binds[KB_COUNT];
+static int kbm_menu_listed[KB_COUNT];
+static volatile LONG kbm_menu_requested;
+static int kbm_menu_active;
+
+void xbox_KbmSetMenuMode(int on)
 {
-    char *spec = getenv("RECOMP_KBM_MAP");
+    InterlockedExchange(&kbm_menu_requested, on != 0);
+}
+
+static void kbm_parse_map(const char *variable, struct kbm_bind *binds, int *listed)
+{
+    char *spec = getenv(variable);
     char *tok, *save = NULL;
     if (!spec || !*spec) return;
     spec = strdup(spec);
@@ -424,10 +439,18 @@ static void kbm_load_map(void)
             else fprintf(stderr, "[KBM] unknown key \"%s\" for %s\n", key, tok);
         }
         for (i = 0; i < KB_COUNT; i++)
-            if (!strcmp(kbm_binds[i].name, tok))
-                memcpy(kbm_binds[i].vk, vk, sizeof vk);
+            if (!strcmp(kbm_binds[i].name, tok)) {
+                memcpy(binds[i].vk, vk, sizeof vk);
+                if (listed) listed[i] = 1;
+            }
     }
     free(spec);
+}
+
+static void kbm_load_map(void)
+{
+    kbm_parse_map("RECOMP_KBM_MAP", kbm_binds, NULL);
+    kbm_parse_map("RECOMP_KBM_MENU_MAP", kbm_menu_binds, kbm_menu_listed);
 }
 
 /* A wheel notch is one poll, which the title's per-frame input barely sees,
@@ -449,8 +472,19 @@ static BOOL kbm_input_down(int vk)
 
 static BOOL kbm_down(int target)
 {
-    const int *vk = kbm_binds[target].vk;
+    const int *vk = kbm_menu_active && kbm_menu_listed[target] ? kbm_menu_binds[target].vk : kbm_binds[target].vk;
     return kbm_input_down(vk[0]) || kbm_input_down(vk[1]) || kbm_input_down(vk[2]);
+}
+
+/* Into or out of the menu bindings, once their keys are all up. */
+static void kbm_follow_menu_mode(void)
+{
+    int target, k;
+    if (kbm_menu_requested == kbm_menu_active) return;
+    for (target = 0; target < KB_COUNT; target++)
+        for (k = 0; kbm_menu_listed[target] && k < 3; k++)
+            if (kbm_input_down(kbm_binds[target].vk[k]) || kbm_input_down(kbm_menu_binds[target].vk[k])) return;
+    kbm_menu_active = kbm_menu_requested;
 }
 
 static void kbm_state(XBOX_INPUT_STATE *pState)
@@ -510,6 +544,7 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     }
 
     memset(pState, 0, sizeof(*pState));
+    kbm_follow_menu_mode();
 
     /* Left stick: WASD, full deflection. */
     pState->Gamepad.sThumbLX = axis_from_keys('A', 'D');

@@ -261,8 +261,18 @@ void gs_main(triangle Pixel vertices[3],inout TriangleStream<Pixel> stream) {
   if(plane.z!=0)slope=max(abs(plane.x),abs(plane.y))/abs(plane.z);
   if(!isfinite(slope))slope=0;
  }
+ /* Widescreen, a 2D draw: back to the middle 4:3 unless it reaches the
+    screen's left or right edge. */
+ float squeeze=1;
+ if(viewport.w>0 && viewport.w<1) {
+  bool edge=false;
+  [unroll]for(uint vertex=0;vertex<3;vertex++)
+   if(vertices[vertex].position.w!=0 && abs(vertices[vertex].position.x/vertices[vertex].position.w)>=0.98)edge=true;
+  if(!edge)squeeze=viewport.w;
+ }
  [unroll]for(uint vertex=0;vertex<3;vertex++) {
   Pixel result=vertices[vertex];
+  result.position.x*=squeeze;
   result.depthSlope=slope;
   if(misc.w!=0) {result.diffuse=vertices[2].diffuse;result.specular=vertices[2].specular;}
   stream.Append(result);

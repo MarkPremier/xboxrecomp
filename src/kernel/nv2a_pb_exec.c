@@ -1351,6 +1351,14 @@ static uint64_t fps_cap_now_ns(void)
  * falls between two blanks. Waiting for the blank counter to move past the
  * value the previous flip saw locks the two. A frame that took longer than a
  * blank finds the counter already moved and flips at once. */
+/* xbox_SetFlipUnlimited: flips go at once, each still raising its blank. */
+static volatile int s_flip_unlimited;
+
+void xbox_SetFlipUnlimited(int on)
+{
+    s_flip_unlimited = on != 0;
+}
+
 static void flip_wait_vblank(HANDLE timer)
 {
     /* The blank schedule, not the blank counter: the counter is advanced by
@@ -1376,7 +1384,7 @@ static void flip_wait_vblank(HANDLE timer)
     }
     (void)count;
     boundary = epoch + ((last_flip - epoch) / period + 1) * period;
-    if (now.QuadPart < boundary) {
+    if (now.QuadPart < boundary && !s_flip_unlimited) {
         long long left = boundary - now.QuadPart;
         long long half_ms = freq.QuadPart / 2000;
         if (timer && left > half_ms) {
