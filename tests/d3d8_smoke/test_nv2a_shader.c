@@ -80,6 +80,12 @@ void xbox_Nv2aVblankAtFlip(void) {}
 void xbox_FramebufferWindowSet(uint32_t address, uint32_t pitch) { (void)address; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowPresent(uint32_t address, uint32_t pitch) { (void)address; (void)pitch; }
+void *xbox_FramebufferWindowHandle(void) { return NULL; }
+void xbox_FramebufferSize(uint32_t *width, uint32_t *height) { *width = 640; *height = 480; }
+const uint32_t *xbox_FramebufferPixels(uint32_t *width, uint32_t *height) { *width = *height = 0; return NULL; }
+int xbox_FramebufferWantsPixels(void) { return 0; }
+void xbox_FramebufferSetDirectPresent(void) {}
+void xbox_FramebufferFrameShown(void) {}
 void xbox_Nv2aFrameCounterFlip(void) {}
 
 typedef struct TestVertex {

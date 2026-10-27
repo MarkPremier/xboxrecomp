@@ -51,28 +51,19 @@ static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
 static DECLSPEC_ALIGN(8) volatile LONG64 s_present_frame;
 
-void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
+/* Set once the GPU backend has shown a frame through its swap chain
+ * (nv2a_gpu_present_*): from then on the window is the swap chain's, so it
+ * paints nothing itself and may be resized, maximised and made fullscreen. */
+static volatile LONG s_direct_present;
+/* F11/F12 while the swap chain shows frames: the frame on screen was never
+ * converted on the CPU, so the next flip takes the CPU route and the capture
+ * is written from it (xbox_FramebufferWindowPresent). */
+static volatile LONG s_capture_pending;
+static char          s_capture_path[MAX_PATH];
+static void fb_frame_shown(void);
+
+static void fb_frame_shown(void)
 {
-    /* RECOMP_FB_VA pins the window to one guest address instead of following
-     * whichever surface is being drawn into. A black window cannot distinguish
-     * "the read path is broken" from "the title rendered black", and pointing
-     * it at memory known to have content settles that. */
-    const char *pin = getenv("RECOMP_FB_VA");
-
-    s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
-    if (pitch)
-        s_fb_pitch = pitch;
-}
-
-/* Called by the pushbuffer executor when the title flips. */
-void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
-{
-    const uint8_t *src;
-    LONG next;
-    uint32_t bpp, x, y;
-
-    if (!s_fb_running || !fb_va || !pitch)
-        return;
     InterlockedIncrement64(&s_present_frame);
     {
         /* RECOMP_HITCH_MS=<n>: log every flip that came more than n ms after
@@ -102,6 +93,82 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
             last = now;
         }
     }
+}
+
+/* A flip the GPU backend showed straight from its surface. */
+void xbox_FramebufferFrameShown(void)
+{
+    if (s_fb_running)
+        fb_frame_shown();
+}
+
+void xbox_FramebufferSetDirectPresent(void)
+{
+    InterlockedExchange(&s_direct_present, 1);
+}
+
+void *xbox_FramebufferWindowHandle(void);
+
+void xbox_FramebufferSize(uint32_t *width, uint32_t *height)
+{
+    *width = s_fb_width;
+    *height = s_fb_height;
+}
+
+/* The last frame converted on the CPU, for the swap chain to show. */
+const uint32_t *xbox_FramebufferPixels(uint32_t *width, uint32_t *height)
+{
+    LONG idx = s_present_idx;
+    *width = s_fb_width;
+    *height = s_fb_height;
+    return idx >= 0 ? s_present[idx] : NULL;
+}
+
+/* Whether the next flip must be converted on the CPU: a capture is waiting,
+ * or a diagnostic reads the converted frames. */
+int xbox_FramebufferWantsPixels(void)
+{
+    static int always = -1;
+    if (always < 0)
+        always = getenv("RECOMP_FLIP_DUMP_DIR") != NULL || getenv("RECOMP_FB_VA") != NULL;
+    return always || s_capture_pending;
+}
+
+/* F12/F11: write `path` from the frame on screen. Through the swap chain that
+ * frame exists only on the GPU, so it is deferred to the next flip. */
+static void fb_capture(const char *path)
+{
+    if (s_direct_present) {
+        snprintf(s_capture_path, sizeof s_capture_path, "%s", path);
+        InterlockedExchange(&s_capture_pending, 1);
+    } else if (xbox_FramebufferDumpBmp(path) != 0) {
+        fprintf(stderr, "[FBWIN] failed to capture framebuffer to %s\n", path);
+    }
+}
+
+void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
+{
+    /* RECOMP_FB_VA pins the window to one guest address instead of following
+     * whichever surface is being drawn into. A black window cannot distinguish
+     * "the read path is broken" from "the title rendered black", and pointing
+     * it at memory known to have content settles that. */
+    const char *pin = getenv("RECOMP_FB_VA");
+
+    s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
+    if (pitch)
+        s_fb_pitch = pitch;
+}
+
+/* Called by the pushbuffer executor when the title flips. */
+void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+{
+    const uint8_t *src;
+    LONG next;
+    uint32_t bpp, x, y;
+
+    if (!s_fb_running || !fb_va || !pitch)
+        return;
+    fb_frame_shown();
     if (getenv("RECOMP_FB_VA"))
         return;                       /* pinned: leave the old path alone */
     next = (s_present_idx == 0) ? 1 : 0;
@@ -186,6 +253,12 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     }
     /* Published only once it is whole. */
     InterlockedExchange(&s_present_idx, next);
+    if (s_capture_pending && s_rgb) {
+        memcpy(s_rgb, s_present[next], (size_t)s_fb_width * s_fb_height * 4);
+        if (xbox_FramebufferDumpBmp(s_capture_path) != 0)
+            fprintf(stderr, "[FBWIN] failed to capture framebuffer to %s\n", s_capture_path);
+        InterlockedExchange(&s_capture_pending, 0);
+    }
 }
 
 /* Which keys are down, for the pad stand-in in src/input.
@@ -236,8 +309,7 @@ static void fb_request_gpu_capture(void)
     DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
     while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
     snprintf(path + n, sizeof path - n, "capture_%u.bmp", ++seq);
-    if (xbox_FramebufferDumpBmp(path) != 0)
-        fprintf(stderr, "[FBWIN] failed to capture framebuffer to %s\n", path);
+    fb_capture(path);
     InterlockedExchange(&g_nv2a_capture_request, 1);
 }
 
@@ -294,8 +366,7 @@ static void fb_inject_poll(void)
             const char *cap = getenv("RECOMP_FB_CAPTURE");
             if (!cap || !cap[0])
                 cap = "framebuffer.bmp";
-            if (xbox_FramebufferDumpBmp(cap) != 0)
-                fprintf(stderr, "[FBWIN] failed to capture framebuffer to %s\n", cap);
+            fb_capture(cap);
         }
         if (getenv("RECOMP_KEY_TRACE"))
             fprintf(stderr, "  [KEY] inject %s vk=0x%02X\n",
@@ -321,6 +392,72 @@ static int s_mouse_x, s_mouse_y, s_mouse_have;
 static int s_mouse_capture, s_cursor_hidden;
 static int s_mouse_raw;      /* WM_INPUT deltas are authoritative when set */
 static HWND s_fb_hwnd;
+
+void *xbox_FramebufferWindowHandle(void)
+{
+    return s_fb_hwnd;
+}
+
+/* Alt+Enter, once the swap chain shows the frames: borderless fullscreen on
+ * the window's monitor, and back to the window as it was. */
+static WINDOWPLACEMENT s_windowed_placement;
+static LONG s_windowed_style;
+static int s_fullscreen;
+
+static void fb_toggle_fullscreen(HWND h)
+{
+    if (!s_fullscreen) {
+        MONITORINFO mi;
+        mi.cbSize = sizeof mi;
+        s_windowed_placement.length = sizeof s_windowed_placement;
+        if (!GetWindowPlacement(h, &s_windowed_placement) ||
+                !GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
+            return;
+        s_windowed_style = GetWindowLongA(h, GWL_STYLE);
+        SetWindowLongA(h, GWL_STYLE, (s_windowed_style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        s_fullscreen = 1;
+    } else {
+        SetWindowLongA(h, GWL_STYLE, s_windowed_style);
+        SetWindowPlacement(h, &s_windowed_placement);
+        SetWindowPos(h, NULL, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        s_fullscreen = 0;
+    }
+}
+
+/* The swap chain scales, so the window need not be the frame's size: give it
+ * a maximise box and the largest whole multiple of the frame that fits the
+ * monitor's work area, centred there. */
+static void fb_window_direct(HWND h)
+{
+    MONITORINFO mi;
+    RECT r;
+    LONG work_w, work_h, scale = 1;
+    mi.cbSize = sizeof mi;
+    SetWindowLongA(h, GWL_STYLE, GetWindowLongA(h, GWL_STYLE) | WS_MAXIMIZEBOX);
+    if (!GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
+        return;
+    work_w = mi.rcWork.right - mi.rcWork.left;
+    work_h = mi.rcWork.bottom - mi.rcWork.top;
+    for (;;) {
+        r.left = 0; r.top = 0;
+        r.right = (LONG)s_fb_width * (scale + 1); r.bottom = (LONG)s_fb_height * (scale + 1);
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+        if (r.right - r.left > work_w || r.bottom - r.top > work_h)
+            break;
+        scale++;
+    }
+    r.left = 0; r.top = 0;
+    r.right = (LONG)s_fb_width * scale; r.bottom = (LONG)s_fb_height * scale;
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    SetWindowPos(h, NULL, mi.rcWork.left + (work_w - (r.right - r.left)) / 2,
+                 mi.rcWork.top + (work_h - (r.bottom - r.top)) / 2,
+                 r.right - r.left, r.bottom - r.top,
+                 SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+}
 
 int xbox_FramebufferMouseDelta(int *dx, int *dy)
 {
@@ -573,11 +710,15 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             fb_request_gpu_capture();
             return 0;
         }
+        if (w == VK_RETURN && (l & (1 << 29)) && s_direct_present) {
+            if (!(l & (1 << 30)))      /* not the auto-repeat */
+                fb_toggle_fullscreen(h);
+            return 0;
+        }
         if (w == VK_F12) {
             const char *path = getenv("RECOMP_FB_CAPTURE");
             if (!path || !path[0]) path = "framebuffer.bmp";
-            if (xbox_FramebufferDumpBmp(path) != 0)
-                fprintf(stderr, "[FBWIN] failed to capture framebuffer to %s\n", path);
+            fb_capture(path);
             return 0;
         }
         /* Alt+Esc releases the mouse so the window can be moved or the desktop
@@ -736,6 +877,8 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mmi = (MINMAXINFO *)l;
         RECT r;
+        if (s_direct_present)
+            break;                  /* the swap chain scales: any size */
         r.left = 0; r.top = 0;
         r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, FALSE);
@@ -745,12 +888,12 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
 
     case WM_SIZE:
-        if (IsZoomed(h))
+        if (IsZoomed(h) && !s_direct_present)
             ShowWindow(h, SW_RESTORE);
         return 0;
 
     case WM_SYSCOMMAND:
-        if ((w & 0xFFF0) == SC_MAXIMIZE)
+        if ((w & 0xFFF0) == SC_MAXIMIZE && !s_direct_present)
             return 0;
         break;
     }
@@ -1046,6 +1189,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             s_fb_width, s_fb_height);
 
     long last_drawn = -2;
+    int direct_seen = 0;
     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
         MSG msg;
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -1076,7 +1220,13 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 title_frame = frame;
             }
         }
-        if (s_present_idx >= 0 && s_rgb) {
+        if (s_direct_present) {
+            /* The swap chain shows the frames; GDI would only fight it. */
+            if (!direct_seen) {
+                direct_seen = 1;
+                fb_window_direct(hwnd);
+            }
+        } else if (s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */
@@ -1148,4 +1298,10 @@ int xbox_FramebufferMouseDelta(int *dx, int *dy) { if (dx) *dx = 0; if (dy) *dy 
 int xbox_FramebufferMouseButton(int which) { (void)which; return 0; }
 int xbox_FramebufferMouseWheel(void) { return 0; }
 void xbox_FramebufferMouseCapture(int on) { (void)on; }
+void *xbox_FramebufferWindowHandle(void) { return NULL; }
+void xbox_FramebufferSize(uint32_t *width, uint32_t *height) { *width = 640; *height = 480; }
+const uint32_t *xbox_FramebufferPixels(uint32_t *width, uint32_t *height) { *width = *height = 0; return NULL; }
+int xbox_FramebufferWantsPixels(void) { return 0; }
+void xbox_FramebufferSetDirectPresent(void) {}
+void xbox_FramebufferFrameShown(void) {}
 #endif

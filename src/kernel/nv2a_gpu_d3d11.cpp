@@ -1,6 +1,7 @@
 #include "nv2a_gpu.h"
 #include <d3d11.h>
 #include <d3d11_1.h>
+#include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <cstdio>
 #include <cstdlib>
@@ -1695,6 +1696,19 @@ static bool stage_flip(const void *presented, size_t bytes, uint32_t va, uint32_
     return true;
 }
 
+/* What a flip does to the caches, whether the frame was published or not. */
+static void flip_bookkeeping()
+{
+    /* Draws unmap their own streams; this only guards against a stray Map. */
+    for (auto &stream : vertex_streams) release_stream(stream);
+    release_stream(constant_stream);
+    s_texture_validate_serial++;
+    for (auto &surface : surfaces)
+        if (!surface.dirty) surface.needs_refresh = true;
+    for (auto &surface : depth_surfaces)
+        if (!surface.dirty) surface.needs_refresh = true;
+}
+
 /* Returns the guest VA the caller should display this flip. In the default
  * (synchronous) path that is the buffer just published; with RECOMP_ASYNC_FLIP
  * it is the previous frame's buffer, resolved without a GPU wait. */
@@ -1749,15 +1763,239 @@ extern "C" uint32_t nv2a_gpu_flip(const void *presented, size_t bytes, uint32_t 
     } else {
         gpu_sync_impl(true, presented, bytes);
     }
-    /* Draws unmap their own streams; this only guards against a stray Map. */
-    for (auto &stream : vertex_streams) release_stream(stream);
-    release_stream(constant_stream);
-    s_texture_validate_serial++;
-    for (auto &surface : surfaces)
-        if (!surface.dirty) surface.needs_refresh = true;
-    for (auto &surface : depth_surfaces)
-        if (!surface.dirty) surface.needs_refresh = true;
+    flip_bookkeeping();
     return show;
+}
+
+/* ── Window presentation ──────────────────────────────────────────────────
+ *
+ * A flip reaches the window through a flip-model swap chain on the window
+ * fb_present opened: drawn from the presented surface's own texture, scaled
+ * into the window at the frame's shape. The other route -- publish the surface
+ * to guest RAM, convert it on the CPU, StretchDIBits it -- waits for the GPU
+ * and reads the frame back every flip, and pins the window to 640x480. It
+ * stays for frames whose pixels have to be in guest RAM (the movie overlay,
+ * captures), which come here as CPU pixels instead. */
+struct Presenter {
+    HWND window = nullptr;
+    ComPtr<IDXGISwapChain1> chain;
+    ComPtr<ID3D11RenderTargetView> target;
+    UINT width = 0, height = 0;
+    ComPtr<ID3D11VertexShader> vertex;
+    ComPtr<ID3D11PixelShader> pixel;
+    ComPtr<ID3D11SamplerState> sampler;
+    ComPtr<ID3D11RasterizerState> raster;
+    ComPtr<ID3D11BlendState> blend;
+    ComPtr<ID3D11DepthStencilState> depth;
+    ComPtr<ID3D11Buffer> constants;
+    ComPtr<ID3D11Texture2D> pixels;
+    ComPtr<ID3D11ShaderResourceView> pixels_view;
+    UINT pixels_width = 0, pixels_height = 0;
+    bool failed = false;
+};
+static Presenter presenter;
+
+static bool presenter_failed(const char *what, HRESULT result)
+{
+    std::fprintf(stderr, "[GPU-D3D11] window presentation unavailable: %s 0x%08X\n", what, (unsigned)result);
+    presenter = Presenter{};
+    presenter.failed = true;
+    return false;
+}
+
+static bool presenter_target()
+{
+    ComPtr<ID3D11Texture2D> buffer;
+    HRESULT result = presenter.chain->GetBuffer(0, IID_PPV_ARGS(&buffer));
+    if (SUCCEEDED(result)) result = device->CreateRenderTargetView(buffer.Get(), nullptr, &presenter.target);
+    return SUCCEEDED(result) || presenter_failed("back buffer", result);
+}
+
+static bool presenter_ready(HWND window)
+{
+    if (presenter.failed || !device || !context) return false;
+    if (presenter.chain && presenter.window == window) {
+        RECT client = {};
+        GetClientRect(window, &client);
+        UINT width = (UINT)std::max<LONG>(client.right - client.left, 0);
+        UINT height = (UINT)std::max<LONG>(client.bottom - client.top, 0);
+        if (!width || !height) return false;   /* minimised: nothing to show */
+        if (width != presenter.width || height != presenter.height) {
+            presenter.target.Reset();   /* unbound after every present */
+            HRESULT result = presenter.chain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+            if (FAILED(result)) return presenter_failed("resize", result);
+            presenter.width = width; presenter.height = height;
+            if (!presenter_target()) return false;
+        }
+        return true;
+    }
+    RECT client = {};
+    GetClientRect(window, &client);
+    presenter.width = (UINT)std::max<LONG>(client.right - client.left, 1);
+    presenter.height = (UINT)std::max<LONG>(client.bottom - client.top, 1);
+    ComPtr<IDXGIDevice1> dxgi_device;
+    ComPtr<IDXGIAdapter> adapter;
+    ComPtr<IDXGIFactory2> factory;
+    HRESULT result = device.As(&dxgi_device);
+    if (SUCCEEDED(result)) result = dxgi_device->GetAdapter(&adapter);
+    if (SUCCEEDED(result)) result = adapter->GetParent(IID_PPV_ARGS(&factory));
+    if (FAILED(result)) return presenter_failed("DXGI factory", result);
+    dxgi_device->SetMaximumFrameLatency(1);
+    DXGI_SWAP_CHAIN_DESC1 description = {};
+    description.Width = presenter.width; description.Height = presenter.height;
+    description.Format = DXGI_FORMAT_B8G8R8A8_UNORM; description.SampleDesc.Count = 1;
+    description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; description.BufferCount = 2;
+    description.Scaling = DXGI_SCALING_STRETCH; description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    description.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    result = factory->CreateSwapChainForHwnd(device.Get(), window, &description, nullptr, nullptr, &presenter.chain);
+    if (FAILED(result)) return presenter_failed("swap chain", result);
+    /* The window toggles its own borderless fullscreen (fb_present, Alt+Enter);
+     * DXGI's exclusive-mode switch would fight it. */
+    factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+
+    static const char source[] =
+        "cbuffer PresentConstants:register(b0){float4 extent;};"
+        "Texture2D<float4> image:register(t0);SamplerState smooth:register(s0);"
+        "struct V{float4 position:SV_Position;float2 uv:TEXCOORD0;};"
+        "V vs(uint id:SV_VertexID){V v;float2 t=float2((id<<1)&2,id&2);"
+        "v.position=float4(t*float2(2,-2)+float2(-1,1),0,1);v.uv=t*extent.xy;return v;}"
+        "float4 ps(V v):SV_Target{return float4(image.SampleLevel(smooth,v.uv,0).rgb,1);}";
+    ComPtr<ID3DBlob> vertex, pixel, errors;
+    result = D3DCompile(source, sizeof source - 1, "NV2A present", nullptr, nullptr, "vs", "vs_5_0",
+                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vertex, &errors);
+    if (SUCCEEDED(result))
+        result = D3DCompile(source, sizeof source - 1, "NV2A present", nullptr, nullptr, "ps", "ps_5_0",
+                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pixel, &errors);
+    if (FAILED(result)) {
+        std::fprintf(stderr, "[GPU-D3D11] present shader compile: %s\n",
+                     errors ? (const char *)errors->GetBufferPointer() : "");
+        return presenter_failed("shader compile", result);
+    }
+    result = device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(), nullptr, &presenter.vertex);
+    if (SUCCEEDED(result))
+        result = device->CreatePixelShader(pixel->GetBufferPointer(), pixel->GetBufferSize(), nullptr, &presenter.pixel);
+    D3D11_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler.MaxLOD = D3D11_FLOAT32_MAX;
+    if (SUCCEEDED(result)) result = device->CreateSamplerState(&sampler, &presenter.sampler);
+    D3D11_RASTERIZER_DESC raster = {};
+    raster.FillMode = D3D11_FILL_SOLID; raster.CullMode = D3D11_CULL_NONE;
+    if (SUCCEEDED(result)) result = device->CreateRasterizerState(&raster, &presenter.raster);
+    D3D11_BLEND_DESC blend = {};
+    blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (SUCCEEDED(result)) result = device->CreateBlendState(&blend, &presenter.blend);
+    D3D11_DEPTH_STENCIL_DESC depth = {};
+    if (SUCCEEDED(result)) result = device->CreateDepthStencilState(&depth, &presenter.depth);
+    D3D11_BUFFER_DESC constants = {};
+    constants.ByteWidth = 16; constants.Usage = D3D11_USAGE_DEFAULT; constants.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    if (SUCCEEDED(result)) result = device->CreateBuffer(&constants, nullptr, &presenter.constants);
+    if (FAILED(result)) return presenter_failed("pipeline", result);
+    presenter.window = window;
+    if (!presenter_target()) return false;
+    std::fprintf(stderr, "[GPU-D3D11] window presentation: swap chain %ux%u\n", presenter.width, presenter.height);
+    return true;
+}
+
+/* Draw `view` (its top-left u x v of the texture) letterboxed at `aspect`,
+ * then present. */
+static bool present_view(ID3D11ShaderResourceView *view, float u, float v, float aspect, int interval)
+{
+    ID3D11RenderTargetView *target = presenter.target.Get();
+    const float black[4] = {0, 0, 0, 1};
+    context->ClearRenderTargetView(target, black);
+    float width = (float)presenter.width, height = (float)presenter.height;
+    float shown_width = width, shown_height = width / aspect;
+    if (shown_height > height) { shown_height = height; shown_width = height * aspect; }
+    D3D11_VIEWPORT viewport = {(width - shown_width) * 0.5f, (height - shown_height) * 0.5f,
+                               shown_width, shown_height, 0.0f, 1.0f};
+    const float extent[4] = {u, v, 0, 0};
+    context->UpdateSubresource(presenter.constants.Get(), 0, nullptr, extent, 0, 0);
+    context->OMSetRenderTargets(1, &target, nullptr);
+    context->OMSetBlendState(presenter.blend.Get(), nullptr, UINT_MAX);
+    context->OMSetDepthStencilState(presenter.depth.Get(), 0);
+    context->IASetInputLayout(nullptr);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->VSSetShader(presenter.vertex.Get(), nullptr, 0);
+    context->GSSetShader(nullptr, nullptr, 0);
+    context->PSSetShader(presenter.pixel.Get(), nullptr, 0);
+    ID3D11Buffer *buffer = presenter.constants.Get();
+    context->VSSetConstantBuffers(0, 1, &buffer);
+    context->PSSetShaderResources(0, 1, &view);
+    ID3D11SamplerState *sampler = presenter.sampler.Get();
+    context->PSSetSamplers(0, 1, &sampler);
+    context->RSSetState(presenter.raster.Get());
+    context->RSSetViewports(1, &viewport);
+    context->Draw(3, 0);
+    /* The next draw binds its own state; the surface just sampled may be its
+     * render target. */
+    ID3D11ShaderResourceView *no_view = nullptr;
+    ID3D11RenderTargetView *no_target = nullptr;
+    context->PSSetShaderResources(0, 1, &no_view);
+    context->OMSetRenderTargets(1, &no_target, nullptr);
+    HRESULT result = presenter.chain->Present(interval > 0 ? (UINT)interval : 0, 0);
+    if (result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET)
+        return presenter_failed("present", result);
+    return true;
+}
+
+extern "C" int nv2a_gpu_present_surface(void *window, const void *presented, uint32_t pitch, uint32_t rows,
+                                        uint32_t aspect_w, uint32_t aspect_h, int interval)
+{
+    if (!window || !presented || !aspect_w || !aspect_h) return 0;
+    Surface *shown = nullptr;
+    for (auto &surface : surfaces)
+        if (surface.memory == presented && surface.pitch == pitch && surface.view &&
+                (!shown || surface.last_used > shown->last_used))
+            shown = &surface;
+    if (!shown) {
+        static unsigned misses;
+        if (misses++ < 4) {
+            std::fprintf(stderr, "[GPU-D3D11] present: no surface at %p pitch %u; surfaces:", presented, pitch);
+            for (auto &surface : surfaces)
+                std::fprintf(stderr, " %p/%u/%ux%u", (void *)surface.memory, surface.pitch, surface.width, surface.height);
+            std::fprintf(stderr, "\n");
+        }
+        return 0;
+    }
+    if (!presenter_ready((HWND)window)) return 0;
+    /* Written by the CPU since the GPU last drew it (a loading screen): take
+     * guest RAM's copy first, as a texture use would. */
+    refresh_surface(*shown);
+    uint32_t height = rows && rows < shown->height ? rows : shown->height;
+    if (!present_view(shown->view.Get(), 1.0f, (float)height / (float)shown->height,
+                      (float)aspect_w / (float)aspect_h, interval))
+        return 0;
+    /* RECOMP_ASYNC_FLIP staged an earlier frame for the guest-RAM route;
+     * resolving it now would show that old frame on the next such flip. */
+    s_pending_flip.valid = false;
+    flip_bookkeeping();
+    return 1;
+}
+
+extern "C" int nv2a_gpu_present_pixels(void *window, const uint32_t *pixels, uint32_t width, uint32_t height,
+                                       int interval)
+{
+    if (!window || !pixels || !width || !height || !presenter_ready((HWND)window)) return 0;
+    if (!presenter.pixels || presenter.pixels_width != width || presenter.pixels_height != height) {
+        presenter.pixels.Reset(); presenter.pixels_view.Reset();
+        D3D11_TEXTURE2D_DESC description = {};
+        description.Width = width; description.Height = height;
+        description.MipLevels = description.ArraySize = 1;
+        description.Format = DXGI_FORMAT_B8G8R8A8_UNORM; description.SampleDesc.Count = 1;
+        description.Usage = D3D11_USAGE_DYNAMIC; description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        description.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        HRESULT result = device->CreateTexture2D(&description, nullptr, &presenter.pixels);
+        if (SUCCEEDED(result)) result = device->CreateShaderResourceView(presenter.pixels.Get(), nullptr, &presenter.pixels_view);
+        if (FAILED(result)) return presenter_failed("frame texture", result);
+        presenter.pixels_width = width; presenter.pixels_height = height;
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(context->Map(presenter.pixels.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return 0;
+    for (uint32_t y = 0; y < height; y++)
+        std::memcpy((uint8_t *)mapped.pData + (size_t)y * mapped.RowPitch, pixels + (size_t)y * width, (size_t)width * 4);
+    context->Unmap(presenter.pixels.Get(), 0);
+    return present_view(presenter.pixels_view.Get(), 1.0f, 1.0f, (float)width / (float)height, interval) ? 1 : 0;
 }
 
 /* A GPU-engine blit wrote guest RAM a cached surface mirrors. Refresh only the

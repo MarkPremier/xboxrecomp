@@ -14,6 +14,14 @@ void nv2a_gpu_sync(void);
 void nv2a_gpu_wait(void);
 void nv2a_gpu_flush(void);
 uint32_t nv2a_gpu_flip(const void *presented, size_t bytes, uint32_t va, uint32_t pitch);
+/* Show a flip in a window through a swap chain: the surface at `presented`
+ * straight from its texture (no publish), or CPU pixels (0x00RRGGBB rows).
+ * Both letterbox to aspect_w:aspect_h and return 0 when they could not, so the
+ * caller falls back to the guest-RAM route. */
+int nv2a_gpu_present_surface(void *window, const void *presented, uint32_t pitch, uint32_t rows,
+                             uint32_t aspect_w, uint32_t aspect_h, int interval);
+int nv2a_gpu_present_pixels(void *window, const uint32_t *pixels, uint32_t width, uint32_t height,
+                            int interval);
 void nv2a_gpu_surface_modified(const void *addr, size_t bytes);
 void nv2a_gpu_surface_publish(const void *addr, size_t bytes);
 void nv2a_gpu_invalidate(void);

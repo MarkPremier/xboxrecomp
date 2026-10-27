@@ -117,6 +117,37 @@ static int pb_surf_trace(void)
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
+extern void *xbox_FramebufferWindowHandle(void);
+extern void xbox_FramebufferSize(uint32_t *width, uint32_t *height);
+extern const uint32_t *xbox_FramebufferPixels(uint32_t *width, uint32_t *height);
+extern int xbox_FramebufferWantsPixels(void);
+extern void xbox_FramebufferSetDirectPresent(void);
+extern void xbox_FramebufferFrameShown(void);
+
+/* The window's swap chain shows each flip (nv2a_gpu_present_*);
+ * RECOMP_PRESENT=gdi keeps the old route: publish to guest RAM, StretchDIBits. */
+static void *present_window(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_PRESENT");
+        enabled = !(e && !_stricmp(e, "gdi"));
+    }
+    return enabled ? xbox_FramebufferWindowHandle() : NULL;
+}
+
+/* RECOMP_VSYNC=<n>: present on every nth monitor refresh; 0 (the default)
+ * presents at once and leaves the pacing to the emulated vblank. */
+static int present_interval(void)
+{
+    static int interval = -1;
+    if (interval < 0) {
+        const char *e = getenv("RECOMP_VSYNC");
+        interval = e ? atoi(e) : 0;
+        if (interval < 0 || interval > 4) interval = 0;
+    }
+    return interval;
+}
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
 /* Would writing this surface land on the title's own image?
@@ -2056,6 +2087,18 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
                                         | ((argb >> 5) & 0x07E0)
                                         | ((argb >> 3) & 0x001F));
     }
+}
+
+/* Whether the overlay is on: present_pvideo_overlay then paints the movie
+ * into the guest-RAM frame, so that frame has to take the CPU route. */
+static int pvideo_overlay_active(void)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const volatile uint32_t *regs = (const volatile uint32_t *)(mem + 0xFD008000u);
+    uint32_t buffer = regs[0x700 / 4];
+    uint32_t slot = (buffer & 0x10u) ? 1u : 0u;
+    return (buffer & 0x11u) && !(regs[0x704 / 4] & 1u)
+        && ((regs[0x958 / 4 + slot] >> 16) & 3u) == 1u;
 }
 
 static void present_pvideo_overlay(uint32_t destination)
@@ -4699,7 +4742,31 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     pitch = scan_pitch;
                 }
             }
-            if (done) {
+            void *window = present_window();
+            int shown_direct = 0;
+            /* Straight from the GPU surface into the window's swap chain:
+             * no publish, no GPU wait, no CPU conversion. Not for a frame
+             * the movie overlay paints into guest RAM, or one a capture or
+             * dump wants converted on the CPU. */
+            if (done && window && !xbox_FramebufferWantsPixels() && !pvideo_overlay_active()) {
+                uint32_t h = present_h ? present_h : s_gpu.clip_y + s_gpu.clip_h;
+                uint32_t frame_w, frame_h;
+                xbox_FramebufferSize(&frame_w, &frame_h);
+                if (nv2a_gpu_present_surface(window, (uint8_t *)xbox_GetMemoryOffset() + dma_resolve(done),
+                                             pitch, h, frame_w, frame_h, present_interval())) {
+                    static int announced;
+                    if (!announced++)
+                        fprintf(stderr, "[GPU] flip %u: shown from the GPU surface (0x%08X pitch %u)\n",
+                                s_gpu.flips, done, pitch);
+                    xbox_FramebufferSetDirectPresent();
+                    xbox_FramebufferWindowSet(dma_resolve(done), pitch);
+                    xbox_FramebufferFrameShown();
+                    shown_direct = 1;
+                }
+            }
+            if (shown_direct) {
+                /* shown above */
+            } else if (done) {
                 uint32_t show = done;
                 if (lazy_flip()) {
                     uint8_t *base = (uint8_t *)xbox_GetMemoryOffset() + dma_resolve(done);
@@ -4716,6 +4783,20 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 present_pvideo_overlay(show);
                 xbox_FramebufferWindowSet(dma_resolve(show), pitch);
                 xbox_FramebufferWindowPresent(dma_resolve(show), pitch);
+                if (window) {
+                    /* Converted on the CPU; the swap chain still shows it. */
+                    uint32_t frame_w, frame_h;
+                    const uint32_t *pixels = xbox_FramebufferPixels(&frame_w, &frame_h);
+                    static unsigned cpu_frames;
+                    if (pixels && nv2a_gpu_present_pixels(window, pixels, frame_w, frame_h, present_interval())) {
+                        xbox_FramebufferSetDirectPresent();
+                        /* 1, 10, 100...: a steady stream here is a surface
+                         * the direct route never finds. */
+                        if (++cpu_frames == 1 || cpu_frames == 10 || cpu_frames == 100 || cpu_frames % 1000 == 0)
+                            fprintf(stderr, "[GPU] flip %u: shown from CPU pixels (%u so far; overlay %d)\n",
+                                    s_gpu.flips, cpu_frames, pvideo_overlay_active());
+                    }
+                }
             } else {
                 nv2a_pb_exec_flush();
             }
