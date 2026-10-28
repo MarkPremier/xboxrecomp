@@ -93,6 +93,20 @@ static float clampf(float v, float mn, float mx)
     return v;
 }
 
+/* The 3D voices' HRTF filter (the title's own impulse responses, set with
+ * SET_HRIR): on, as on the console and in xemu, unless RECOMP_APU_HRTF=0.
+ * Without it a 3D sound reached its bins unplaced (mono) and at the level of
+ * its unfiltered samples. */
+static bool apu_hrtf_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_HRTF");
+        on = (e && *e) ? (atoi(e) != 0) : 1;
+    }
+    return on != 0;
+}
+
 static float attenuate(uint16_t vol)
 {
     vol &= 0xFFF;
@@ -390,6 +404,26 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     case NV1BA0_PIO_SET_VOICE_TAR_VOLA:
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
                        NV_PAVS_VOICE_TAR_VOLA, 0xFFFFFFFF, argument);
+        {
+            /* RECOMP_APU_VOL_TRACE: a 2D voice's volume as the title sets
+             * it, and the code addresses on the guest stack then (who set it). */
+            static int trace = -1;
+            if (trace < 0) trace = getenv("RECOMP_APU_VOL_TRACE") != NULL;
+            if (trace && d->regs[NV_PAPU_FECV] >= MCPX_HW_MAX_3D_VOICES) {
+                extern __declspec(thread) uint32_t g_esp;
+                extern ptrdiff_t g_xbox_mem_offset;
+                char callers[256];
+                int n = 0, i;
+                callers[0] = 0;
+                for (i = 0; i < 96 && n < 200; i++) {
+                    uint32_t word = *(volatile uint32_t *)((uintptr_t)(g_esp + 4u * i) + g_xbox_mem_offset);
+                    if (word >= 0x11000 && word < 0x1F0000)
+                        n += snprintf(callers + n, sizeof callers - n, " %X", word);
+                }
+                fprintf(stderr, "[VOL] v%u VOLA %08X (vol0 %.1f dB) stack:%s\n", d->regs[NV_PAPU_FECV], argument,
+                        (argument & 0xFFF) / 64.0f, callers);
+            }
+        }
         break;
     case NV1BA0_PIO_SET_VOICE_TAR_VOLB:
         voice_set_mask(d, (uint16_t)d->regs[NV_PAPU_FECV],
@@ -1188,7 +1222,7 @@ static void voice_process(MCPXAPUState *d,
     }
 
     /* HRTF processing for 3D voices */
-    if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf) {
+    if (v < MCPX_HW_MAX_3D_VOICES && apu_hrtf_enabled()) {
         uint16_t hrtf_handle =
             (uint16_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
