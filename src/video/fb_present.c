@@ -62,6 +62,11 @@ static volatile LONG s_capture_pending;
 static char          s_capture_path[MAX_PATH];
 static void fb_frame_shown(void);
 
+/* Set by the kernel: what the GPU backend and the guest's file reads did
+ * since the previous flip, for the hitch log. */
+void (*g_xbox_hitch_gpu)(char *text, size_t size, int write);
+void (*g_xbox_hitch_io)(char *text, size_t size, int write);
+
 static void fb_frame_shown(void)
 {
     InterlockedIncrement64(&s_present_frame);
@@ -85,10 +90,13 @@ static void fb_frame_shown(void)
             if (!first) first = (double)now.QuadPart;
             if (last.QuadPart) {
                 double ms = (double)(now.QuadPart - last.QuadPart) * 1000.0 / frequency;
+                char gpu[384] = "", io[96] = "";
+                if (g_xbox_hitch_gpu) g_xbox_hitch_gpu(gpu, sizeof(gpu), ms > threshold);
+                if (g_xbox_hitch_io) g_xbox_hitch_io(io, sizeof(io), ms > threshold);
                 if (ms > threshold)
-                    fprintf(stderr, "[HITCH] t=%.3f s frame %lld took %.1f ms\n",
+                    fprintf(stderr, "[HITCH] t=%.3f s frame %lld took %.1f ms; %s; %s\n",
                             ((double)now.QuadPart - first) / frequency,
-                            (long long)s_present_frame, ms);
+                            (long long)s_present_frame, ms, gpu, io);
             }
             last = now;
         }

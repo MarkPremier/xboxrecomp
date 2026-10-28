@@ -3911,6 +3911,25 @@ static int bridge_async_io_enabled(void)
     return on;
 }
 
+/* RECOMP_HITCH_MS: the guest's file reads since the previous flip. */
+static LONG64 g_read_calls, g_read_bytes, g_read_ticks;
+
+static void bridge_read_summary(char *text, size_t size, int write)
+{
+    static LONG64 calls, bytes, ticks;
+    LARGE_INTEGER frequency;
+    LONG64 c = g_read_calls, b = g_read_bytes, t = g_read_ticks;
+    QueryPerformanceFrequency(&frequency);
+    if (write && text && size)
+        snprintf(text, size, "io: %lld reads %.2f MiB %.1f ms", (long long)(c - calls),
+                 (double)(b - bytes) / 1048576.0, (double)(t - ticks) * 1000.0 / (double)frequency.QuadPart);
+    calls = c; bytes = b; ticks = t;
+}
+
+extern void (*g_xbox_hitch_io)(char *text, size_t size, int write);
+extern void (*g_xbox_hitch_gpu)(char *text, size_t size, int write);
+extern void nv2a_gpu_frame_summary(char *text, size_t size, int write);
+
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
@@ -3934,8 +3953,20 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
-    g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(buffer_va), length, poff);
+    {
+        LARGE_INTEGER start, end;
+        /* The hitch log's sources, set here (every title reads early) since
+         * the GPU backend is also linked into tools without the video side. */
+        g_xbox_hitch_io = bridge_read_summary;
+        g_xbox_hitch_gpu = nv2a_gpu_frame_summary;
+        QueryPerformanceCounter(&start);
+        g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
+                    XBOX_TO_NATIVE(buffer_va), length, poff);
+        QueryPerformanceCounter(&end);
+        g_read_calls++;
+        g_read_bytes += (LONG64)ios.Information;
+        g_read_ticks += end.QuadPart - start.QuadPart;
+    }
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look

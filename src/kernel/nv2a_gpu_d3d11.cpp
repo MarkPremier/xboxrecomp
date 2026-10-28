@@ -18,6 +18,11 @@
 #include <set>
 #include <atomic>
 #include <unordered_map>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
 #if defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #include <emmintrin.h>
 #endif
@@ -53,7 +58,7 @@ static struct {
     double draw_setup, draw_textures, draw_streams, draw_shaders, draw_submit, draw_bookkeeping;
     double vertex_compile, pixel_compile;
     uint64_t vertex_shader_hits, vertex_shader_misses, pixel_shader_hits, pixel_shader_misses, shader_evictions;
-    uint64_t vertex_shader_failures, pixel_shader_failures;
+    uint64_t vertex_shader_failures, pixel_shader_failures, shader_disk_hits, pixel_async_compiles, pixel_generic_draws, vertex_async_compiles, vertex_skipped_draws;
     uint64_t hash_bytes;
     uint64_t blend_created, depth_created, sampler_created;
     uint64_t color_created, depth_surface_created, color_refreshed, depth_refreshed;
@@ -96,6 +101,35 @@ struct GpuTimer {
 };
 
 static void report_gpu_samples();
+
+/* RECOMP_HITCH_MS: what the backend did since the previous flip -- the time
+ * in the costly one-off kinds of work -- for the hitch log. Called every
+ * flip; writes only when asked. */
+extern "C" void nv2a_gpu_frame_summary(char *text, size_t size, int write)
+{
+    static decltype(gpu_timing) previous;
+    const auto &now = gpu_timing;
+    if (write && text && size)
+        std::snprintf(text, size,
+                      "gpu: draw %.1f ms (shaders %.1f, textures %.1f, submit %.1f), compile vs %llu/%.1f ms ps %llu/%.1f ms, "
+                      "textures %llu new %llu updated %.2f MiB, hash %.1f ms, sync %.1f ms (%llu), targets %llu+%llu new, generic draws %llu, skipped draws %llu",
+                      (now.draw - previous.draw) * 1e3, (now.draw_shaders - previous.draw_shaders) * 1e3,
+                      (now.draw_textures - previous.draw_textures) * 1e3, (now.draw_submit - previous.draw_submit) * 1e3,
+                      (unsigned long long)(now.vertex_shader_misses - previous.vertex_shader_misses),
+                      (now.vertex_compile - previous.vertex_compile) * 1e3,
+                      (unsigned long long)(now.pixel_shader_misses - previous.pixel_shader_misses),
+                      (now.pixel_compile - previous.pixel_compile) * 1e3,
+                      (unsigned long long)(now.texture_created - previous.texture_created),
+                      (unsigned long long)(now.texture_updated - previous.texture_updated),
+                      (double)(now.texture_update_bytes - previous.texture_update_bytes) / 1048576.0,
+                      (now.hash - previous.hash) * 1e3, (now.sync - previous.sync) * 1e3,
+                      (unsigned long long)(now.sync_calls - previous.sync_calls),
+                      (unsigned long long)(now.color_created - previous.color_created),
+                      (unsigned long long)(now.depth_surface_created - previous.depth_surface_created),
+                      (unsigned long long)(now.pixel_generic_draws - previous.pixel_generic_draws),
+                      (unsigned long long)(now.vertex_skipped_draws - previous.vertex_skipped_draws));
+    previous = now;
+}
 
 extern "C" void nv2a_gpu_report(void)
 {
@@ -171,6 +205,10 @@ extern "C" void nv2a_gpu_report(void)
                  (unsigned long long)gpu_timing.pixel_shader_misses,
                  (unsigned long long)gpu_timing.pixel_shader_failures, gpu_timing.pixel_compile,
                  (unsigned long long)gpu_timing.shader_evictions);
+    std::fprintf(stderr, "[GPU-D3D11] shader disk cache: %llu loaded; background compiles: %llu pixel (%llu draws with the generic shader meanwhile), %llu vertex (%llu draws skipped meanwhile)\n",
+                 (unsigned long long)gpu_timing.shader_disk_hits, (unsigned long long)gpu_timing.pixel_async_compiles,
+                 (unsigned long long)gpu_timing.pixel_generic_draws, (unsigned long long)gpu_timing.vertex_async_compiles,
+                 (unsigned long long)gpu_timing.vertex_skipped_draws);
     std::fprintf(stderr, "[GPU-D3D11] fixed function: %llu draws, %llu lit, %llu skinned, %llu texgen, %llu texture-matrix\n",
                  (unsigned long long)gpu_timing.fixed_draws, (unsigned long long)gpu_timing.lit_draws,
                  (unsigned long long)gpu_timing.skinned_draws, (unsigned long long)gpu_timing.texgen_draws,
@@ -821,42 +859,100 @@ static int projection_register(const Nv2aGpuDraw &state)
     return -1;
 }
 
-static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state)
+/* Compiled shaders persist on disk: each guest shader variant costs fxc
+ * 50-200 ms, paid on the frame that first draws with it -- the stutter the
+ * first time a scene shows a new material. With the cache that happens once
+ * per machine, not once per session. The key covers the source, the
+ * definitions, entry point, profile and flags, so a changed shader simply
+ * misses. Directory: RECOMP_SHADER_CACHE, default
+ * %LOCALAPPDATA%\xboxrecomp\shadercache; RECOMP_SHADER_CACHE=0 turns it off. */
+static const std::wstring &shader_cache_directory()
 {
-    uint32_t words = vertex_program_word_count(state);
-    if (!words) return nullptr;
-    for (auto &cached : vertex_variants) if (cached.key.size() == words &&
-        !std::memcmp(cached.key.data(), state.vertex_program + state.vertex_start, words * sizeof(uint32_t))) {
-        cached.last_used = ++shader_use_serial;
-        gpu_timing.vertex_shader_hits++;
-        return &cached;
+    static const std::wstring directory = [] {
+        std::wstring path;
+        const char *setting = std::getenv("RECOMP_SHADER_CACHE");
+        if (setting && !std::strcmp(setting, "0")) return path;
+        if (setting && *setting) {
+            int length = MultiByteToWideChar(CP_UTF8, 0, setting, -1, nullptr, 0);
+            path.resize(length > 0 ? length - 1 : 0);
+            if (length > 1) MultiByteToWideChar(CP_UTF8, 0, setting, -1, &path[0], length);
+        } else {
+            wchar_t base[MAX_PATH];
+            DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+            if (!length || length >= MAX_PATH) return path;
+            path = std::wstring(base) + L"\\xboxrecomp";
+            CreateDirectoryW(path.c_str(), nullptr);
+            path += L"\\shadercache";
+        }
+        CreateDirectoryW(path.c_str(), nullptr);
+        DWORD attributes = GetFileAttributesW(path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) path.clear();
+        return path;
+    }();
+    return directory;
+}
+
+static void shader_key_mix(uint64_t key[2], const void *data, size_t size)
+{
+    const unsigned char *bytes = (const unsigned char *)data;
+    for (size_t index = 0; index < size; index++) {
+        key[0] = (key[0] ^ bytes[index]) * 0x100000001B3ull;
+        key[1] = (key[1] ^ bytes[index]) * 0x9E3779B97F4A7C15ull + 0x632BE59BD9B4E019ull;
     }
-    VertexVariant variant;
-    variant.key.resize(words);
-    std::memcpy(variant.key.data(), state.vertex_program + state.vertex_start, words * sizeof(uint32_t));
-    gpu_timing.vertex_shader_misses++;
-    GpuTimer compile_timer(gpu_timing.vertex_compile);
-    std::string source = vertex_program_source(variant.key, false);
-    if (source.empty()) return nullptr;
-    ComPtr<ID3DBlob> code, errors;
-    HRESULT result = D3DCompile(source.data(), source.size(), "NV2A-vertex", nullptr, nullptr, "vs_guest", "vs_5_0",
-                               D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors);
-    if (FAILED(result)) {
-        gpu_timing.vertex_shader_failures++;
-        std::fprintf(stderr, "[GPU-D3D11] vertex compile: %s\n", errors ? (const char *)errors->GetBufferPointer() : "failed");
-        return nullptr;
+    key[0] = (key[0] ^ size) * 0x100000001B3ull;   /* separates the fields */
+}
+
+static HRESULT compile_shader_cached(const char *source, size_t size, const char *name, const D3D_SHADER_MACRO *defines,
+                                     const char *entry, const char *profile, UINT flags,
+                                     ComPtr<ID3DBlob> &code, ComPtr<ID3DBlob> &errors, bool compile = true)
+{
+    const std::wstring &directory = shader_cache_directory();
+    std::wstring path;
+    if (!directory.empty()) {
+        uint64_t key[2] = {0xCBF29CE484222325ull, 0x84222325CBF29CE4ull};
+        shader_key_mix(key, source, size);
+        shader_key_mix(key, entry, std::strlen(entry));
+        shader_key_mix(key, profile, std::strlen(profile));
+        shader_key_mix(key, &flags, sizeof flags);
+        for (const D3D_SHADER_MACRO *macro = defines; macro && macro->Name; macro++) {
+            shader_key_mix(key, macro->Name, std::strlen(macro->Name));
+            shader_key_mix(key, macro->Definition, std::strlen(macro->Definition));
+        }
+        wchar_t file[40];
+        swprintf(file, 40, L"\\%016llx%016llx.dxbc", (unsigned long long)key[0], (unsigned long long)key[1]);
+        path = directory + file;
+        HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (handle != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER length = {};
+            DWORD read = 0;
+            bool loaded = GetFileSizeEx(handle, &length) && length.QuadPart > 0 && length.QuadPart < (64 << 20) &&
+                          SUCCEEDED(D3DCreateBlob((SIZE_T)length.QuadPart, &code)) &&
+                          ReadFile(handle, code->GetBufferPointer(), (DWORD)length.QuadPart, &read, nullptr) &&
+                          read == (DWORD)length.QuadPart && read >= 4 && !std::memcmp(code->GetBufferPointer(), "DXBC", 4);
+            CloseHandle(handle);
+            if (loaded) { gpu_timing.shader_disk_hits++; return S_OK; }
+            code.Reset();
+        }
     }
-    D3D11_INPUT_ELEMENT_DESC elements[16] = {};
-    for (uint32_t attribute = 0; attribute < 16; attribute++) {
-        elements[attribute].SemanticName = "TEXCOORD"; elements[attribute].SemanticIndex = attribute;
-        elements[attribute].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        elements[attribute].AlignedByteOffset = (UINT)offsetof(Nv2aGpuVertex, attributes) + attribute * 16;
-        elements[attribute].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+    if (!compile) return E_PENDING;
+    HRESULT result = D3DCompile(source, size, name, defines, nullptr, entry, profile, flags, 0, &code, &errors);
+    if (SUCCEEDED(result) && !path.empty()) {
+        /* Written under a unique name and renamed into place, so a reader
+         * (or a second compile of the same shader) never sees half a file. */
+        wchar_t suffix[32];
+        swprintf(suffix, 32, L".%lu.%lu.tmp", GetCurrentProcessId(), GetCurrentThreadId());
+        std::wstring temporary = path + suffix;
+        HANDLE handle = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (handle != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            bool complete = WriteFile(handle, code->GetBufferPointer(), (DWORD)code->GetBufferSize(), &written, nullptr) &&
+                            written == code->GetBufferSize();
+            CloseHandle(handle);
+            if (!complete || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+                DeleteFileW(temporary.c_str());
+        }
     }
-    if (FAILED(device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &variant.shader)) ||
-        FAILED(device->CreateInputLayout(elements, 16, code->GetBufferPointer(), code->GetBufferSize(), &variant.layout))) return nullptr;
-    variant.bytecode_bytes = code->GetBufferSize();
-    return cache_shader_variant(vertex_variants, std::move(variant));
+    return result;
 }
 
 extern "C" int nv2a_gpu_execute_state(const uint32_t program[136][4], const uint32_t valid[136], uint32_t start,
@@ -879,8 +975,8 @@ extern "C" int nv2a_gpu_execute_state(const uint32_t program[136][4], const uint
         std::string source = vertex_program_source(variant.key, true);
         if (source.empty()) return 0;
         ComPtr<ID3DBlob> code, errors;
-        HRESULT result = D3DCompile(source.data(), source.size(), "NV2A-state", nullptr, nullptr, "cs_guest", "cs_5_0",
-                                   D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors);
+        HRESULT result = compile_shader_cached(source.data(), source.size(), "NV2A-state", nullptr, "cs_guest", "cs_5_0",
+                                   D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, code, errors);
         if (FAILED(result)) {
             std::fprintf(stderr, "[GPU-D3D11] state compile: %s\n", errors ? (const char *)errors->GetBufferPointer() : "failed");
             return 0;
@@ -922,6 +1018,237 @@ extern "C" int nv2a_gpu_execute_state(const uint32_t program[136][4], const uint
     return 1;
 }
 
+/* A pixel shader variant neither in memory nor on disk compiles on worker
+ * threads; meanwhile its draws use the generic shader -- the same source
+ * without NV_COMPILED, reading the combiner setup from the constant buffer
+ * every draw already fills. Slower per pixel, so it only bridges the few
+ * frames a compile takes, but it never stalls the frame. RECOMP_SHADER_ASYNC=0
+ * compiles in the draw instead, as before. */
+struct PixelCompileJob {
+    std::array<uint32_t,43> key;
+    std::array<std::string,8> values;
+    ComPtr<ID3DBlob> code, errors;
+    ComPtr<ID3D11PixelShader> shader;
+    bool generic = false;
+    /* A vertex program instead: its words, HLSL and the objects made from it. */
+    bool vertex = false;
+    std::vector<uint32_t> vertex_key;
+    std::string vertex_source;
+    ComPtr<ID3D11VertexShader> vertex_shader;
+    ComPtr<ID3D11InputLayout> vertex_layout;
+};
+static std::mutex pixel_jobs_lock;
+static std::condition_variable pixel_jobs_signal;
+static std::deque<std::shared_ptr<PixelCompileJob>> pixel_jobs_queued;
+static std::vector<std::shared_ptr<PixelCompileJob>> pixel_jobs_done;
+static std::vector<std::array<uint32_t,43>> pixel_jobs_pending;
+static std::vector<std::vector<uint32_t>> vertex_jobs_pending;
+static std::atomic<int> pixel_jobs_finished{0};
+static ComPtr<ID3D11PixelShader> generic_pixel_shader;
+static bool generic_pixel_requested;
+
+static bool pixel_compiles_async()
+{
+    static const bool enabled = [] {
+        const char *setting = std::getenv("RECOMP_SHADER_ASYNC");
+        return !(setting && *setting == '0');
+    }();
+    return enabled;
+}
+
+static HRESULT compile_pixel_variant(const PixelCompileJob &job, ComPtr<ID3DBlob> &code, ComPtr<ID3DBlob> &errors,
+                                     bool compile = true)
+{
+    if (job.generic)
+        return compile_shader_cached(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A-generic", nullptr,
+                                     "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS,
+                                     code, errors, compile);
+    const auto &values = job.values;
+    const D3D_SHADER_MACRO definitions[] = {
+        {"NV_COMPILED","1"}, {"NV_STAGE_COUNT",values[0].c_str()}, {"NV_COMBINER_CONTROL",values[1].c_str()},
+        {"NV_STAGE_PROGRAM",values[2].c_str()}, {"NV_FINAL0",values[3].c_str()}, {"NV_FINAL1",values[4].c_str()},
+        {"NV_STAGE_WORDS",values[5].c_str()}, {"NV_W_DEPTH",job.key[36] ? "1" : "0"},
+        {"NV_TEXTURE_SIGNS",values[6].c_str()},
+        {"NV_WINDOW_CLIP_MODE",values[7].c_str()},
+        {"NV_DEPTH_ENABLED",job.key[37] ? "1" : "0"},
+        {"NV_DEPTH_SEMANTIC",job.key[36] ? "SV_DepthGreaterEqual" : "SV_DEPTH"}, {nullptr,nullptr}
+    };
+    return compile_shader_cached(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A-guest", definitions,
+                                 "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS,
+                                 code, errors, compile);
+}
+
+static HRESULT compile_vertex_variant(const PixelCompileJob &job, ComPtr<ID3DBlob> &code, ComPtr<ID3DBlob> &errors,
+                                      bool compile = true)
+{
+    return compile_shader_cached(job.vertex_source.data(), job.vertex_source.size(), "NV2A-vertex", nullptr, "vs_guest",
+                                 "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, code, errors, compile);
+}
+
+static bool create_vertex_objects(ID3DBlob *code, ComPtr<ID3D11VertexShader> &shader, ComPtr<ID3D11InputLayout> &layout)
+{
+    D3D11_INPUT_ELEMENT_DESC elements[16] = {};
+    for (uint32_t attribute = 0; attribute < 16; attribute++) {
+        elements[attribute].SemanticName = "TEXCOORD"; elements[attribute].SemanticIndex = attribute;
+        elements[attribute].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        elements[attribute].AlignedByteOffset = (UINT)offsetof(Nv2aGpuVertex, attributes) + attribute * 16;
+        elements[attribute].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+    }
+    if (FAILED(device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &shader)) ||
+        FAILED(device->CreateInputLayout(elements, 16, code->GetBufferPointer(), code->GetBufferSize(), &layout))) {
+        shader.Reset(); layout.Reset();
+        return false;
+    }
+    return true;
+}
+
+static void pixel_compile_worker()
+{
+    for (;;) {
+        std::shared_ptr<PixelCompileJob> job;
+        {
+            std::unique_lock<std::mutex> hold(pixel_jobs_lock);
+            pixel_jobs_signal.wait(hold, [] { return !pixel_jobs_queued.empty(); });
+            job = pixel_jobs_queued.front();
+            pixel_jobs_queued.pop_front();
+        }
+        /* The device is free-threaded: the driver's own compile of the
+         * bytecode (long for the generic shader) happens here too. */
+        if (job->vertex) {
+            if (SUCCEEDED(compile_vertex_variant(*job, job->code, job->errors)))
+                create_vertex_objects(job->code.Get(), job->vertex_shader, job->vertex_layout);
+        } else if (SUCCEEDED(compile_pixel_variant(*job, job->code, job->errors)) &&
+            FAILED(device->CreatePixelShader(job->code->GetBufferPointer(), job->code->GetBufferSize(), nullptr, &job->shader)))
+            job->shader.Reset();
+        std::lock_guard<std::mutex> hold(pixel_jobs_lock);
+        pixel_jobs_done.push_back(job);
+        pixel_jobs_finished++;
+    }
+}
+
+static void queue_pixel_compile(std::shared_ptr<PixelCompileJob> job)
+{
+    static bool started;
+    if (!started) {
+        started = true;
+        unsigned threads = std::max(1u, std::min(3u, std::thread::hardware_concurrency() / 4));
+        for (unsigned index = 0; index < threads; index++) std::thread(pixel_compile_worker).detach();
+    }
+    std::lock_guard<std::mutex> hold(pixel_jobs_lock);
+    if (job->vertex) vertex_jobs_pending.push_back(job->vertex_key);
+    else if (!job->generic) pixel_jobs_pending.push_back(job->key);
+    if (job->generic) pixel_jobs_queued.push_front(job); else pixel_jobs_queued.push_back(job);
+    pixel_jobs_signal.notify_one();
+}
+
+/* Variants the workers finished since the last draw, into the cache. */
+static void install_compiled_pixel_shaders()
+{
+    if (!pixel_jobs_finished.load(std::memory_order_relaxed)) return;
+    std::vector<std::shared_ptr<PixelCompileJob>> done;
+    {
+        std::lock_guard<std::mutex> hold(pixel_jobs_lock);
+        done.swap(pixel_jobs_done);
+        pixel_jobs_finished = 0;
+        for (const auto &job : done) {
+            if (job->vertex)
+                vertex_jobs_pending.erase(std::remove(vertex_jobs_pending.begin(), vertex_jobs_pending.end(), job->vertex_key),
+                                          vertex_jobs_pending.end());
+            else
+                pixel_jobs_pending.erase(std::remove(pixel_jobs_pending.begin(), pixel_jobs_pending.end(), job->key),
+                                         pixel_jobs_pending.end());
+        }
+    }
+    for (const auto &job : done) {
+        if (job->vertex) {
+            if (!job->vertex_shader) {
+                gpu_timing.vertex_shader_failures++;
+                std::fprintf(stderr, "[GPU-D3D11] vertex compile: %s\n",
+                             job->errors ? (const char *)job->errors->GetBufferPointer() : "failed");
+                continue;
+            }
+            VertexVariant variant;
+            variant.key = job->vertex_key;
+            variant.shader = job->vertex_shader;
+            variant.layout = job->vertex_layout;
+            variant.bytecode_bytes = job->code->GetBufferSize();
+            gpu_timing.vertex_async_compiles++;
+            cache_shader_variant(vertex_variants, std::move(variant));
+            continue;
+        }
+        if (!job->shader) {
+            gpu_timing.pixel_shader_failures++;
+            std::fprintf(stderr, "[GPU-D3D11] %s shader compile: %s\n", job->generic ? "generic" : "guest",
+                         job->errors ? (const char *)job->errors->GetBufferPointer() : "failed");
+            continue;
+        }
+        if (job->generic) {
+            generic_pixel_shader = job->shader;
+            continue;
+        }
+        ShaderVariant variant = {};
+        variant.key = job->key;
+        variant.shader = job->shader;
+        variant.bytecode_bytes = job->code->GetBufferSize();
+        gpu_timing.pixel_async_compiles++;
+        cache_shader_variant(shader_variants, std::move(variant));
+    }
+}
+
+/* A vertex program not in memory or on disk compiles on the workers too.
+ * There is no generic vertex shader to stand in, so its draws are skipped
+ * (*pending) until it is ready: an object missing for a few frames the
+ * first time this machine ever sees it, instead of a frame frozen for the
+ * compile. */
+static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
+{
+    *pending = false;
+    uint32_t words = vertex_program_word_count(state);
+    if (!words) return nullptr;
+    /* Finished compiles are installed by get_pixel_shader, which runs first:
+     * installing here could evict the pixel shader this draw just took. */
+    for (auto &cached : vertex_variants) if (cached.key.size() == words &&
+        !std::memcmp(cached.key.data(), state.vertex_program + state.vertex_start, words * sizeof(uint32_t))) {
+        cached.last_used = ++shader_use_serial;
+        gpu_timing.vertex_shader_hits++;
+        return &cached;
+    }
+    std::vector<uint32_t> key(state.vertex_program[state.vertex_start], state.vertex_program[state.vertex_start] + words);
+    bool async = pixel_compiles_async();
+    if (async) {
+        std::lock_guard<std::mutex> hold(pixel_jobs_lock);
+        if (std::find(vertex_jobs_pending.begin(), vertex_jobs_pending.end(), key) != vertex_jobs_pending.end()) {
+            gpu_timing.vertex_skipped_draws++;
+            *pending = true;
+            return nullptr;
+        }
+    }
+    gpu_timing.vertex_shader_misses++;
+    GpuTimer compile_timer(gpu_timing.vertex_compile);
+    auto job = std::make_shared<PixelCompileJob>();
+    job->vertex = true;
+    job->vertex_source = vertex_program_source(key, false);
+    if (job->vertex_source.empty()) return nullptr;
+    job->vertex_key = std::move(key);
+    ComPtr<ID3DBlob> code, errors;
+    if (FAILED(compile_vertex_variant(*job, code, errors, !async))) {
+        if (async && !errors) {
+            queue_pixel_compile(job);
+            gpu_timing.vertex_skipped_draws++;
+            *pending = true;
+            return nullptr;
+        }
+        gpu_timing.vertex_shader_failures++;
+        std::fprintf(stderr, "[GPU-D3D11] vertex compile: %s\n", errors ? (const char *)errors->GetBufferPointer() : "failed");
+        return nullptr;
+    }
+    VertexVariant variant;
+    variant.key = std::move(job->vertex_key);
+    if (!create_vertex_objects(code.Get(), variant.shader, variant.layout)) return nullptr;
+    variant.bytecode_bytes = code->GetBufferSize();
+    return cache_shader_variant(vertex_variants, std::move(variant));
+}
+
 static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t window_clip_mode)
 {
     ShaderVariant variant = {};
@@ -937,14 +1264,29 @@ static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t wi
         variant.key[4+stage*4] = state.combiners.rgb_input[stage]; variant.key[5+stage*4] = state.combiners.alpha_input[stage];
         variant.key[6+stage*4] = state.combiners.rgb_output[stage]; variant.key[7+stage*4] = state.combiners.alpha_output[stage];
     }
+    install_compiled_pixel_shaders();
+    /* RECOMP_SHADER_GENERIC=1: every draw with the generic shader, to check it
+     * against the compiled variants. */
+    static const bool generic_only = std::getenv("RECOMP_SHADER_GENERIC") && *std::getenv("RECOMP_SHADER_GENERIC") == '1';
+    if (generic_only && generic_pixel_shader) return generic_pixel_shader.Get();
     for (auto &cached : shader_variants) if (cached.key == variant.key) {
         cached.last_used = ++shader_use_serial;
         gpu_timing.pixel_shader_hits++;
         return cached.shader.Get();
     }
+    bool async = pixel_compiles_async();
+    if (async && generic_pixel_shader) {
+        std::lock_guard<std::mutex> hold(pixel_jobs_lock);
+        if (std::find(pixel_jobs_pending.begin(), pixel_jobs_pending.end(), variant.key) != pixel_jobs_pending.end()) {
+            gpu_timing.pixel_generic_draws++;
+            return generic_pixel_shader.Get();
+        }
+    }
     gpu_timing.pixel_shader_misses++;
     GpuTimer compile_timer(gpu_timing.pixel_compile);
-    std::array<std::string,8> values;
+    auto job = std::make_shared<PixelCompileJob>();
+    job->key = variant.key;
+    std::array<std::string,8> &values = job->values;
     values[0] = std::to_string(variant.key[0] & 255u) + "u";
     values[1] = std::to_string(variant.key[0]) + "u"; values[2] = std::to_string(variant.key[1]) + "u";
     values[3] = std::to_string(variant.key[2]) + "u"; values[4] = std::to_string(variant.key[3]) + "u";
@@ -966,19 +1308,25 @@ static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t wi
     }
     values[6] += ")";
     values[7] = std::to_string(variant.key[42]) + "u";
-    const D3D_SHADER_MACRO definitions[] = {
-        {"NV_COMPILED","1"}, {"NV_STAGE_COUNT",values[0].c_str()}, {"NV_COMBINER_CONTROL",values[1].c_str()},
-        {"NV_STAGE_PROGRAM",values[2].c_str()}, {"NV_FINAL0",values[3].c_str()}, {"NV_FINAL1",values[4].c_str()},
-        {"NV_STAGE_WORDS",values[5].c_str()}, {"NV_W_DEPTH",variant.key[36] ? "1" : "0"},
-        {"NV_TEXTURE_SIGNS",values[6].c_str()},
-        {"NV_WINDOW_CLIP_MODE",values[7].c_str()},
-        {"NV_DEPTH_ENABLED",variant.key[37] ? "1" : "0"},
-        {"NV_DEPTH_SEMANTIC",variant.key[36] ? "SV_DepthGreaterEqual" : "SV_DEPTH"}, {nullptr,nullptr}
-    };
-    ComPtr<ID3DBlob> code, errors;
-    HRESULT result = D3DCompile(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A-guest", definitions, nullptr,
-                               "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &errors);
-    if (FAILED(result)) {
+    if (async && !generic_pixel_requested) {
+        /* The generic shader itself, first in the workers' queue (from disk
+         * after the first run); until it exists, misses compile in the draw. */
+        generic_pixel_requested = true;
+        auto generic = std::make_shared<PixelCompileJob>();
+        generic->generic = true;
+        queue_pixel_compile(generic);
+    }
+    if (async && generic_pixel_shader) {
+        ComPtr<ID3DBlob> code, errors;
+        if (FAILED(compile_pixel_variant(*job, code, errors, false))) {
+            queue_pixel_compile(job);
+            gpu_timing.pixel_generic_draws++;
+            return generic_pixel_shader.Get();
+        }
+        job->code = code;
+    }
+    ComPtr<ID3DBlob> code = job->code, errors;
+    if (!code && FAILED(compile_pixel_variant(*job, code, errors))) {
         gpu_timing.pixel_shader_failures++;
         std::fprintf(stderr, "[GPU-D3D11] guest shader compile: %s\n", errors ? (const char *)errors->GetBufferPointer() : "failed");
         return nullptr;
@@ -4332,7 +4680,9 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             constants.texture_key[stage][2] == 3u) uncombined = false;
     ID3D11PixelShader *program = uncombined ? uncombined_shader.Get() : get_pixel_shader(*state, constants.window_clip_control[0]);
     if (!program) return 0;
-    VertexVariant *guest_vertex = state->vertex_program ? get_vertex_shader(*state) : nullptr;
+    bool vertex_pending = false;
+    VertexVariant *guest_vertex = state->vertex_program ? get_vertex_shader(*state, &vertex_pending) : nullptr;
+    if (vertex_pending) return 1;   /* its shader is compiling: drawn once it exists */
     if (state->vertex_program && !guest_vertex) return reject("unsupported vertex program");
     phase_timer.next_phase(gpu_timing.draw_submit);
     UINT stride = vertex_stride, offset = vertex_offset;
@@ -4425,8 +4775,8 @@ extern "C" int nv2a_gpu_compile(void)
     if (vertex_shader && uncombined_shader && geometry_shader && line_geometry_shader && point_geometry_shader) return 1;
     if (!nv2a_gpu_available()) return 0;
     ComPtr<ID3DBlob> pixel_code, errors;
-    HRESULT result = D3DCompile(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A", nullptr, nullptr,
-                               "vs_main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &vertex_code, &errors);
+    HRESULT result = compile_shader_cached(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A", nullptr,
+                               "vs_main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, vertex_code, errors);
     if (FAILED(result)) {
         std::fprintf(stderr, "[GPU-D3D11] shader compile: %s\n", errors ? (const char *)errors->GetBufferPointer() : "failed");
         return 0;
@@ -4438,8 +4788,8 @@ extern "C" int nv2a_gpu_compile(void)
         return 0;
     }
     pixel_code.Reset(); errors.Reset();
-    result = D3DCompile(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A", nullptr, nullptr,
-                       "ps_uncombined", "ps_5_0", D3DCOMPILE_IEEE_STRICTNESS, 0, &pixel_code, &errors);
+    result = compile_shader_cached(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A", nullptr,
+                       "ps_uncombined", "ps_5_0", D3DCOMPILE_IEEE_STRICTNESS, pixel_code, errors);
     if (FAILED(result)) return 0;
     if (FAILED(device->CreatePixelShader(pixel_code->GetBufferPointer(), pixel_code->GetBufferSize(), nullptr, &uncombined_shader))) return 0;
     const struct { const char *entry; ComPtr<ID3D11GeometryShader> *shader; } geometries[] = {
@@ -4447,8 +4797,8 @@ extern "C" int nv2a_gpu_compile(void)
     };
     for (const auto &geometry : geometries) {
         pixel_code.Reset(); errors.Reset();
-        result = D3DCompile(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A", nullptr, nullptr,
-                           geometry.entry, "gs_5_0", D3DCOMPILE_IEEE_STRICTNESS, 0, &pixel_code, &errors);
+        result = compile_shader_cached(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A", nullptr,
+                           geometry.entry, "gs_5_0", D3DCOMPILE_IEEE_STRICTNESS, pixel_code, errors);
         if (SUCCEEDED(result))
             result = device->CreateGeometryShader(pixel_code->GetBufferPointer(), pixel_code->GetBufferSize(), nullptr,
                                                    geometry.shader->ReleaseAndGetAddressOf());
