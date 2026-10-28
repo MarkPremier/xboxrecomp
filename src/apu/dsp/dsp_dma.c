@@ -201,6 +201,19 @@ static void dsp_dma_run(DSPDMAState *s)
 
         size_t transfer_size = count * item_size;
 
+        /* RECOMP_APU_DSPDMA_TRACE: the first DMA nodes each DSP runs. */
+        {
+            static int on = -1;
+            static int logged[2];
+            if (on < 0) on = getenv("RECOMP_APU_DSPDMA_TRACE") != NULL;
+            if (on && logged[s->core->is_gp ? 1 : 0]++ < 200)
+                fprintf(stderr, "[DSPDMA] %s %s %s:%04X count %u (ch %u) buf %X fmt %u scratch base %06X off %06X size %06X%s\n",
+                        s->core->is_gp ? "GP" : "EP", direction ? "dsp->" : "->dsp",
+                        mem_space == DSP_SPACE_X ? "x" : mem_space == DSP_SPACE_Y ? "y" : "p",
+                        mem_address, count, channel_count, buf_id, format, scratch_base,
+                        scratch_offset, scratch_size, dsp_interleave ? " interleaved" : "");
+        }
+
         // FIXME: Remove this intermediate buffer
         static uint8_t *scratch_buf = NULL;
         static size_t scratch_buf_size = 0;

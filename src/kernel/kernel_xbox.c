@@ -12,6 +12,14 @@
 #include "kernel.h"
 #include <string.h>
 
+/* XC_AUDIO's value (xbox_SetAudioFlags), read by DirectSound at start-up. */
+static uint32_t g_xbox_audio_flags;
+
+void xbox_SetAudioFlags(uint32_t flags)
+{
+    g_xbox_audio_flags = flags;
+}
+
 /* ============================================================================
  * Exported Data Objects
  *
@@ -177,10 +185,12 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_AUDIO:
-        /* Stereo PCM matches the two-channel host output. 1 means mono;
-         * advertising AC3 requires an encoded-output path. */
+        /* Stereo PCM (0) unless the host set otherwise (xbox_SetAudioFlags):
+         * 1 mono, 2 surround (matrixed), 0x10000 Dolby Digital (AC3). With
+         * AC3 DirectSound mixes 5.1, which a host can play as six channels
+         * (the GP's mix) instead of encoding it. */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 0x00000000;
+            *(PULONG)Value = g_xbox_audio_flags;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

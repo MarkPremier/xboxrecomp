@@ -157,12 +157,12 @@ static const OpcodeEntry nonparallel_opcodes[] = {
     { "00000001010000001100d110", "and #xxxx, D", dis_and_long, emu_and_long },
     { "00000000iiiiiiii101110EE", "andi #xx, D", dis_andi, emu_andi },
     { "0000110000011101SiiiiiiD", "asl #ii, S2, D", dis_asl_imm, emu_asl_imm },
-    { "0000110000011110010SsssD", "asl S1, S2, D", NULL, NULL },
+    { "0000110000011110010SsssD", "asl S1, S2, D", NULL, emu_asl_reg },
     { "0000110000011100SiiiiiiD", "asr #ii, S2, D", dis_asr_imm, emu_asr_imm },
-    { "0000110000011110011SsssD", "asr S1, S2, D", NULL, NULL },
+    { "0000110000011110011SsssD", "asr S1, S2, D", NULL, emu_asr_reg },
     { "00001101000100000100CCCC", "bcc xxxx", dis_bcc_long, emu_bcc_long }, //??
     { "00000101CCCC01aaaa0aaaaa", "bcc xxx", dis_bcc_imm, emu_bcc_imm },
-    { "0000110100011RRR0100CCCC", "bcc Rn", NULL, NULL },
+    { "0000110100011RRR0100CCCC", "bcc Rn", NULL, emu_bcc_rn },
     { "0000101101MMMRRR0S00bbbb", "bchg #n, [X or Y]:ea", dis_bchg_ea, emu_bchg_ea, match_MMMRRR },
     { "0000101100aaaaaa0S00bbbb", "bchg #n, [X or Y]:aa", dis_bchg_aa, emu_bchg_aa },
     { "0000101110pppppp0S00bbbb", "bchg #n, [X or Y]:pp", dis_bchg_pp, emu_bchg_pp },
@@ -175,7 +175,7 @@ static const OpcodeEntry nonparallel_opcodes[] = {
     { "0000101011DDDDDD010bbbbb", "bclr #n, D", dis_bclr_reg, emu_bclr_reg },
     { "000011010001000011000000", "bra xxxx", dis_bra_long, emu_bra_long },
     { "00000101000011aaaa0aaaaa", "bra xxx", dis_bra_imm, emu_bra_imm },
-    { "0000110100011RRR11000000", "bra Rn", NULL, NULL },
+    { "0000110100011RRR11000000", "bra Rn", NULL, emu_bra_rn },
     { "0000110010MMMRRR0S0bbbbb", "brclr #n, [X or Y]:ea, xxxx", NULL, NULL, match_MMMRRR },
     { "0000110010aaaaaa1S0bbbbb", "brclr #n, [X or Y]:aa, xxxx", NULL, NULL },
     { "0000110011pppppp0S0bbbbb", "brclr #n, [X or Y]:pp, xxxx", dis_brclr_pp, emu_brclr_pp },
@@ -187,9 +187,9 @@ static const OpcodeEntry nonparallel_opcodes[] = {
     { "0000110011pppppp0S1bbbbb", "brset #n, [X or Y]:pp, xxxx", dis_brset_pp, emu_brset_pp },
     { "0000010010qqqqqq0S1bbbbb", "brset #n, [X or Y]:qq, xxxx", NULL, NULL },
     { "0000110011DDDDDD101bbbbb", "brset #n, S, xxxx", dis_brset_reg, emu_brset_reg },
-    { "00001101000100000000CCCC", "bscc xxxx", NULL, NULL },
-    { "00000101CCCC00aaaa0aaaaa", "bscc xxx", NULL, NULL },
-    { "0000110100011RRR0000CCCC", "bscc Rn", NULL, NULL },
+    { "00001101000100000000CCCC", "bscc xxxx", NULL, emu_bscc_long },
+    { "00000101CCCC00aaaa0aaaaa", "bscc xxx", NULL, emu_bscc_imm },
+    { "0000110100011RRR0000CCCC", "bscc Rn", NULL, emu_bscc_rn },
     { "0000110110MMMRRR0S0bbbbb", "bsclr #n, [X or Y]:ea, xxxx", NULL, NULL, match_MMMRRR },
     { "0000110110aaaaaa1S0bbbbb", "bsclr #n, [X or Y]:aa, xxxx", NULL, NULL },
     { "0000010010qqqqqq1S0bbbbb", "bsclr #n, [X or Y]:qq, xxxx", NULL, NULL },
@@ -202,7 +202,7 @@ static const OpcodeEntry nonparallel_opcodes[] = {
     { "0000101011DDDDDD011bbbbb", "bset, #n, D", dis_bset_reg, emu_bset_reg },
     { "000011010001000010000000", "bsr xxxx", dis_bsr_long, emu_bsr_long },
     { "00000101000010aaaa0aaaaa", "bsr xxx", dis_bsr_imm, emu_bsr_imm },
-    { "0000110100011RRR10000000", "bsr Rn", NULL, NULL },
+    { "0000110100011RRR10000000", "bsr Rn", NULL, emu_bsr_rn },
     { "0000110110MMMRRR0S1bbbbb", "bsset #n, [X or Y]:ea, xxxx", NULL, NULL, match_MMMRRR },
     { "0000110110aaaaaa1S1bbbbb", "bsset #n, [X or Y]:aa, xxxx", NULL, NULL },
     { "0000110111pppppp0S1bbbbb", "bsset #n, [X or Y]:pp, xxxx", NULL, NULL },
@@ -213,7 +213,7 @@ static const OpcodeEntry nonparallel_opcodes[] = {
     { "0000101110pppppp0S10bbbb", "btst #n, [X or Y]:pp", dis_btst_pp, emu_btst_pp },
     { "0000000101qqqqqq0S10bbbb", "btst #n, [X or Y]:qq", NULL, NULL },
     { "0000101111DDDDDD0110bbbb", "btst #n, D", dis_btst_reg, emu_btst_reg },
-    { "0000110000011110000000SD", "clb S, D", NULL, NULL },
+    { "0000110000011110000000SD", "clb S, D", NULL, emu_clb },
     { "0000000101iiiiii1000d101", "cmp #xx, S2", dis_cmp_imm, emu_cmp_imm },
     { "00000001010000001100d101", "cmp #xxxx, S2", dis_cmp_long, emu_cmp_long },
     { "00001100000111111111gggd", "cmpu S1, S2", dis_cmpu, emu_cmpu },
@@ -235,14 +235,14 @@ static const OpcodeEntry nonparallel_opcodes[] = {
     { "000000000000000010001100", "enddo", NULL, emu_enddo },
     { "0000000101iiiiii1000d011", "eor #xx, D", NULL, NULL },
     { "00000001010000001100d011", "eor #xxxx, D", NULL, NULL },
-    { "0000110000011010000sSSSD", "extract S1, S2, D", NULL, NULL },
-    { "0000110000011000000s000D", "extract #CO, S2, D", NULL, NULL },
-    { "0000110000011010100sSSSD", "extractu S1, S2, D", NULL, NULL },
-    { "0000110000011000100s000D", "extractu #CO, S2, D", NULL, NULL },
+    { "0000110000011010000sSSSD", "extract S1, S2, D", NULL, emu_extract_reg },
+    { "0000110000011000000s000D", "extract #CO, S2, D", NULL, emu_extract_imm },
+    { "0000110000011010100sSSSD", "extractu S1, S2, D", NULL, emu_extractu_reg },
+    { "0000110000011000100s000D", "extractu #CO, S2, D", NULL, emu_extractu_imm },
     { "000000000000000000000101", "ill", NULL, emu_illegal },
     { "00000000000000000000100d", "inc D", NULL, emu_inc },
-    { "00001100000110110qqqSSSD", "insert S1, S2, D", NULL, NULL },
-    { "00001100000110010qqq000D", "insert #CO, S2, D", NULL, NULL },
+    { "00001100000110110qqqSSSD", "insert S1, S2, D", NULL, emu_insert_reg },
+    { "00001100000110010qqq000D", "insert #CO, S2, D", NULL, emu_insert_imm },
     { "00001110CCCCaaaaaaaaaaaa", "jcc xxx", dis_jcc_imm, emu_jcc_imm },
     { "0000101011MMMRRR1010CCCC", "jcc ea", dis_jcc_ea, emu_jcc_ea, match_MMMRRR },
     { "0000101001MMMRRR1S00bbbb", "jclr #n, [X or Y]:ea, xxxx", dis_jclr_ea, emu_jclr_ea, match_MMMRRR },
@@ -274,9 +274,9 @@ static const OpcodeEntry nonparallel_opcodes[] = {
     { "0000010011000RRR000ddddd", "lra Rn, D", NULL, NULL },
     { "0000010001000000010ddddd", "lra xxxx, D", NULL, NULL },
     { "000011000001111010iiiiiD", "lsl #ii, D", dis_lsl_imm, emu_lsl_imm },
-    { "00001100000111100001sssD", "lsl S, D", NULL, NULL },
-    { "000011000001111011iiiiiD", "lsr #ii, D", NULL, NULL },
-    { "00001100000111100011sssD", "lsr S, D", NULL, NULL },
+    { "00001100000111100001sssD", "lsl S, D", NULL, emu_lsl_reg },
+    { "000011000001111011iiiiiD", "lsr #ii, D", NULL, emu_lsr_imm },
+    { "00001100000111100011sssD", "lsr S, D", NULL, emu_lsr_reg },
     { "00000100010MMRRR000ddddd", "lua ea, D", dis_lua, emu_lua },
     { "0000010000aaaRRRaaaadddd", "lua (Rn + aa), D", dis_lua_rel, emu_lua_rel },
     { "00000001000sssss11QQdk10", "mac S, #n, D", NULL, NULL },
@@ -284,7 +284,7 @@ static const OpcodeEntry nonparallel_opcodes[] = {
     { "00000001001001101sdkQQQQ", "mac_s_u S1, S2, D", NULL, NULL },
     { "00000001000sssss11QQdk11", "macr S1, S2, D", NULL, NULL },
     { "000000010100000111qqdk11", "macri #xxxx, S, D", NULL, NULL },
-    { "00001100000110111000sssD", "merge S, D", NULL, NULL },
+    { "00001100000110111000sssD", "merge S, D", NULL, emu_merge },
     { "0000101001110RRR1WDDDDDD", "move X:(Rn + xxxx) <-> R", dis_move_x_long, emu_move_x_long },
     { "0000101101110RRR1WDDDDDD", "move Y:(Rn + xxxx) <-> R", NULL, NULL },
     { "0000001aaaaaaRRR1a0WDDDD", "move X:(Rn + xxx) <-> R", dis_move_x_imm, emu_move_x_imm },
@@ -310,7 +310,7 @@ static const OpcodeEntry nonparallel_opcodes[] = {
     { "000000010100000111qqdk01", "mpyri #xxxx, S, D", NULL, NULL },
     { "000000000000000000000000", "nop", NULL, emu_nop},
     { "0000000111011RRR0001d101", "norm Rn, D", dis_norm, emu_norm },
-    { "00001100000111100010sssD", "normf S, D", NULL, NULL },
+    { "00001100000111100010sssD", "normf S, D", NULL, emu_normf },
     { "0000000101iiiiii1000d010", "or #xx, D", NULL, NULL },
     { "00000001010000001100d010", "or #xxxx, D", dis_or_long, emu_or_long },
     { "00000000iiiiiiii111110EE", "ori #xx, D", dis_ori, emu_ori },
@@ -607,6 +607,40 @@ void dsp56k_execute_instruction(dsp_core_t* dsp)
     dsp->instr_cycle = 2;
 
     bool tracing = TRACE_DSP_DISASM || trace_event_get_state(TRACE_DSP56K_EXECUTE_INSTRUCTION_DISASM);
+
+    /* RECOMP_DSP_TRACE=<skip>,<count>[,gp]: the EP's (or GP's) instructions
+     * <skip> onwards, disassembled with the accumulators, to stderr. */
+    {
+        static int configured;
+        static unsigned long long skip, count, executed;
+        static int want_gp;
+        if (!configured) {
+            const char *e = getenv("RECOMP_DSP_TRACE");
+            configured = 1;
+            if (e) {
+                skip = strtoull(e, (char **)&e, 0);
+                if (*e == ',') count = strtoull(e + 1, (char **)&e, 0);
+                if (*e == ',') want_gp = 1;
+            }
+        }
+        static FILE *out;
+        if (count && (bool)dsp->is_gp == (bool)want_gp && executed++ >= skip && executed <= skip + count) {
+            if (!out) {
+                out = fopen("dsp_trace.txt", "w");
+                if (out) setvbuf(out, NULL, _IOFBF, 1 << 20);
+                else out = stderr;
+            }
+            if (executed == skip + count) fflush(out);
+            if (disasm_instruction(dsp, DSP_TRACE_MODE))
+                fprintf(out, "[DSPT] %04X %06X %-40s A=%02X:%06X:%06X B=%02X:%06X:%06X X0=%06X X1=%06X Y0=%06X Y1=%06X SR=%04X R0=%04X R1=%04X R4=%04X\n",
+                        dsp->pc, dsp->cur_inst, disasm_get_instruction_text(dsp),
+                        dsp->registers[DSP_REG_A2], dsp->registers[DSP_REG_A1], dsp->registers[DSP_REG_A0],
+                        dsp->registers[DSP_REG_B2], dsp->registers[DSP_REG_B1], dsp->registers[DSP_REG_B0],
+                        dsp->registers[DSP_REG_X0], dsp->registers[DSP_REG_X1], dsp->registers[DSP_REG_Y0],
+                        dsp->registers[DSP_REG_Y1], dsp->registers[DSP_REG_SR], dsp->registers[DSP_REG_R0],
+                        dsp->registers[DSP_REG_R1], dsp->registers[DSP_REG_R4]);
+        }
+    }
 
     /* Disasm current instruction ? (trace mode only) */
     if (tracing) {
@@ -947,7 +981,10 @@ uint32_t dsp56k_read_memory(dsp_core_t* dsp, int space, uint32_t address)
             }
         }
     } else if (space == DSP_SPACE_Y) {
-        assert(address < DSP_YRAM_SIZE);
+        /* The EP's Dolby Digital encoder reads tables above its 256 words of
+         * Y RAM (a Y ROM, presumably); the read used to run off the array. */
+        if (address >= DSP_YRAM_SIZE)
+            return 0;
         return dsp->yram[address];
     } else if (space == DSP_SPACE_P) {
         return read_memory_p(dsp, address);
@@ -1215,9 +1252,11 @@ static uint16_t dsp_asr56(uint32_t *dest, int n)
 {
     /* Shift right dest n bits: D>>=n */
 
-    uint64_t dest_v = dest[2] | ((uint64_t)dest[1] << 24) | ((uint64_t)dest[0] << 48);
+    /* Arithmetic: the accumulator's sign (bit 55) fills from the left. */
+    int64_t dest_v = (int64_t)((dest[2] | ((uint64_t)dest[1] << 24) | ((uint64_t)dest[0] << 48)) << 8) >> 8;
 
-    uint16_t carry = (dest_v >> (n-1)) & 1;
+    if (n > 55) n = 55;
+    uint16_t carry = n ? (dest_v >> (n-1)) & 1 : 0;
 
     dest_v >>= n;
     dest[2] = dest_v & BITMASK(24);

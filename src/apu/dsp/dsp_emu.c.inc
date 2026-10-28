@@ -27,8 +27,14 @@ typedef void (*emu_func_t)(dsp_core_t* dsp);
 
 static void emu_undefined(dsp_core_t* dsp)
 {
+    static int reported;
     dsp->cur_inst_len = 0;
-    printf("Dsp: 0x%04x: 0x%06x Illegal instruction\n",dsp->pc, dsp->cur_inst);
+    /* Report only the first few: this runs on the audio thread with the APU
+     * lock held, and an unthrottled flood of prints stalls the whole game. */
+    if (reported < 20) {
+        reported++;
+        fprintf(stderr, "Dsp: 0x%04x: 0x%06x Illegal instruction\n", dsp->pc, dsp->cur_inst);
+    }
     /* Add some artificial CPU cycles to avoid being stuck in an infinite loop */
     dsp->instr_cycle += 100;
     if (dsp->exception_debugging) {
@@ -5968,6 +5974,101 @@ static void emu_asr_imm(dsp_core_t* dsp)
     emu_ccr_update_e_u_n_z(dsp, dest[0], dest[1], dest[2]);
 }
 
+/* Shifts by a register amount, lsr by an immediate, clb and normf: the
+ * 0x0C1E group, which the EP's Dolby Digital encoder uses. The amount
+ * register (sss) is A1, B1, X0, Y0, X1 or Y1. */
+static uint32_t dsp_shift_amount_reg(dsp_core_t* dsp)
+{
+    static const int regs[8] = { DSP_REG_A1, DSP_REG_B1, DSP_REG_A1, DSP_REG_B1,
+                                 DSP_REG_X0, DSP_REG_Y0, DSP_REG_X1, DSP_REG_Y1 };
+    return dsp->registers[regs[(dsp->cur_inst >> 1) & 7]] & BITMASK(24);
+}
+
+static void dsp_shift_acc(dsp_core_t* dsp, int src, int dst, int left, uint32_t n)
+{
+    uint32_t dest[3];
+    uint16_t newsr;
+
+    dest[0] = dsp->registers[src ? DSP_REG_B2 : DSP_REG_A2];
+    dest[1] = dsp->registers[src ? DSP_REG_B1 : DSP_REG_A1];
+    dest[2] = dsp->registers[src ? DSP_REG_B0 : DSP_REG_A0];
+    if (n > 56) n = 56;
+    newsr = left ? dsp_asl56(dest, n) : dsp_asr56(dest, n);
+    dsp->registers[dst ? DSP_REG_B2 : DSP_REG_A2] = dest[0];
+    dsp->registers[dst ? DSP_REG_B1 : DSP_REG_A1] = dest[1];
+    dsp->registers[dst ? DSP_REG_B0 : DSP_REG_A0] = dest[2];
+
+    dsp->registers[DSP_REG_SR] &= BITMASK(16)-((1<<DSP_SR_C)|(1<<DSP_SR_V));
+    dsp->registers[DSP_REG_SR] |= newsr & ((1<<DSP_SR_C)|(1<<DSP_SR_V)|(1<<DSP_SR_L));
+    emu_ccr_update_e_u_n_z(dsp, dest[0], dest[1], dest[2]);
+}
+
+static void emu_asl_reg(dsp_core_t* dsp)
+{
+    dsp_shift_acc(dsp, (dsp->cur_inst >> 4) & 1, dsp->cur_inst & 1, 1, dsp_shift_amount_reg(dsp) & BITMASK(6));
+}
+
+static void emu_asr_reg(dsp_core_t* dsp)
+{
+    dsp_shift_acc(dsp, (dsp->cur_inst >> 4) & 1, dsp->cur_inst & 1, 0, dsp_shift_amount_reg(dsp) & BITMASK(6));
+}
+
+/* Logical shifts of D1 only, as lsl/lsr #ii do one bit at a time. */
+static void dsp_shift_d1(dsp_core_t* dsp, int left, uint32_t n)
+{
+    int d1 = (dsp->cur_inst & 1) ? DSP_REG_B1 : DSP_REG_A1;
+    uint32_t v = dsp->registers[d1] & BITMASK(24), carry = 0;
+
+    if (n > 24) n = 24;
+    if (n) {
+        carry = left ? (v >> (24 - n)) & 1 : (v >> (n - 1)) & 1;
+        v = n == 24 ? 0 : (left ? (v << n) & BITMASK(24) : v >> n);
+    }
+    dsp->registers[d1] = v;
+    dsp->registers[DSP_REG_SR] &= BITMASK(16)-((1<<DSP_SR_C)|(1<<DSP_SR_N)|(1<<DSP_SR_Z)|(1<<DSP_SR_V));
+    dsp->registers[DSP_REG_SR] |= carry << DSP_SR_C;
+    dsp->registers[DSP_REG_SR] |= ((v >> 23) & 1) << DSP_SR_N;
+    dsp->registers[DSP_REG_SR] |= (v == 0) << DSP_SR_Z;
+}
+
+static void emu_lsr_imm(dsp_core_t* dsp) { dsp_shift_d1(dsp, 0, (dsp->cur_inst >> 1) & BITMASK(5)); }
+static void emu_lsl_reg(dsp_core_t* dsp) { dsp_shift_d1(dsp, 1, dsp_shift_amount_reg(dsp) & BITMASK(5)); }
+static void emu_lsr_reg(dsp_core_t* dsp) { dsp_shift_d1(dsp, 0, dsp_shift_amount_reg(dsp) & BITMASK(5)); }
+
+/* clb: 9 minus the number of leading sign bits of S's 56 bits -- the shift
+ * normf needs to normalize it -- into D1, D2 sign-extended, D0 cleared.
+ * Zero (or all ones) gives 0. */
+static void emu_clb(dsp_core_t* dsp)
+{
+    int src = (dsp->cur_inst >> 1) & 1, dst = dsp->cur_inst & 1;
+    uint64_t v = ((uint64_t)(dsp->registers[src ? DSP_REG_B2 : DSP_REG_A2] & 0xff) << 48) |
+                 ((uint64_t)(dsp->registers[src ? DSP_REG_B1 : DSP_REG_A1] & 0xffffff) << 24) |
+                 (uint64_t)(dsp->registers[src ? DSP_REG_B0 : DSP_REG_A0] & 0xffffff);
+    uint32_t sign = (v >> 55) & 1, count = 0, result;
+    int bit;
+
+    for (bit = 55; bit >= 0 && ((v >> bit) & 1) == sign; bit--)
+        count++;
+    result = count >= 56 ? 0 : (uint32_t)(9 - (int)count) & BITMASK(24);
+    dsp->registers[dst ? DSP_REG_B2 : DSP_REG_A2] = (result >> 23) & 1 ? 0xff : 0;
+    dsp->registers[dst ? DSP_REG_B1 : DSP_REG_A1] = result;
+    dsp->registers[dst ? DSP_REG_B0 : DSP_REG_A0] = 0;
+    dsp->registers[DSP_REG_SR] &= BITMASK(16)-((1<<DSP_SR_N)|(1<<DSP_SR_Z)|(1<<DSP_SR_V));
+    dsp->registers[DSP_REG_SR] |= ((result >> 23) & 1) << DSP_SR_N;
+    dsp->registers[DSP_REG_SR] |= (result == 0) << DSP_SR_Z;
+}
+
+/* normf: D shifted right by S if S is positive, left by -S if negative. */
+static void emu_normf(dsp_core_t* dsp)
+{
+    int32_t amount = dsp_signextend(24, dsp_shift_amount_reg(dsp));
+    int d = dsp->cur_inst & 1;
+    if (amount >= 0)
+        dsp_shift_acc(dsp, d, d, 0, (uint32_t)amount);
+    else
+        dsp_shift_acc(dsp, d, d, 1, (uint32_t)-amount);
+}
+
 static void emu_bcc_long(dsp_core_t* dsp)
 {
     uint32_t xxxx = read_memory_p(dsp, dsp->pc+1);
@@ -6352,6 +6453,71 @@ static void emu_bsr_imm(dsp_core_t* dsp)
     dsp->pc &= BITMASK(24);
     dsp->cur_inst_len = 0;
 
+    dsp->instr_cycle += 2;
+}
+
+/* Conditional branches to subroutine, and the PC-relative register forms of
+ * the branches; the EP's Dolby Digital encoder uses bscc. */
+static void dsp_branch_sub(dsp_core_t* dsp, uint32_t displacement)
+{
+    dsp_stack_push(dsp, dsp->pc+dsp->cur_inst_len, dsp->registers[DSP_REG_SR], 0);
+    dsp->pc += displacement;
+    dsp->pc &= BITMASK(24);
+    dsp->cur_inst_len = 0;
+}
+
+static void emu_bscc_long(dsp_core_t* dsp)
+{
+    uint32_t xxxx = read_memory_p(dsp, dsp->pc+1);
+    dsp->cur_inst_len++;
+
+    if (emu_calc_cc(dsp, dsp->cur_inst & BITMASK(4)))
+        dsp_branch_sub(dsp, xxxx);
+    dsp->instr_cycle += 4;
+}
+
+static void emu_bscc_imm(dsp_core_t* dsp)
+{
+    uint32_t xxx = (dsp->cur_inst & BITMASK(5))
+                 + ((dsp->cur_inst & (BITMASK(4) << 6)) >> 1);
+
+    if (emu_calc_cc(dsp, (dsp->cur_inst >> 12) & BITMASK(4)))
+        dsp_branch_sub(dsp, dsp_signextend(9, xxx));
+    dsp->instr_cycle += 2;
+}
+
+static uint32_t dsp_branch_rn(dsp_core_t* dsp)
+{
+    return dsp->registers[DSP_REG_R0 + ((dsp->cur_inst >> 8) & BITMASK(3))];
+}
+
+static void emu_bscc_rn(dsp_core_t* dsp)
+{
+    if (emu_calc_cc(dsp, dsp->cur_inst & BITMASK(4)))
+        dsp_branch_sub(dsp, dsp_branch_rn(dsp));
+    dsp->instr_cycle += 2;
+}
+
+static void emu_bsr_rn(dsp_core_t* dsp)
+{
+    dsp_branch_sub(dsp, dsp_branch_rn(dsp));
+    dsp->instr_cycle += 2;
+}
+
+static void emu_bcc_rn(dsp_core_t* dsp)
+{
+    if (emu_calc_cc(dsp, dsp->cur_inst & BITMASK(4))) {
+        dsp->pc += dsp_branch_rn(dsp);
+        dsp->pc &= BITMASK(24);
+        dsp->cur_inst_len = 0;
+    }
+}
+
+static void emu_bra_rn(dsp_core_t* dsp)
+{
+    dsp->pc += dsp_branch_rn(dsp);
+    dsp->pc &= BITMASK(24);
+    dsp->cur_inst_len = 0;
     dsp->instr_cycle += 2;
 }
 
@@ -6839,6 +7005,85 @@ static void emu_enddo(dsp_core_t* dsp)
     dsp->registers[DSP_REG_SR] &= 0x7f;
     dsp->registers[DSP_REG_SR] |= saved_sr & (1<<DSP_SR_LF);
     dsp_stack_pop(dsp, &dsp->registers[DSP_REG_LA], &dsp->registers[DSP_REG_LC]);
+}
+
+/* Bit-field instructions (DSP56300): extract, extractu, insert, merge. The
+ * control word, a register or the extension word (#CO), has the field's
+ * offset in bits 5-0 and its width in bits 17-12, over the 56-bit
+ * accumulator. Dolby's encoders on the EP use them (DirectSound set up for
+ * surround or Dolby Digital output); the port had them unimplemented. */
+static uint64_t dsp_acc_get(dsp_core_t* dsp, int b)
+{
+    return ((uint64_t)(dsp->registers[b ? DSP_REG_B2 : DSP_REG_A2] & 0xff) << 48) |
+           ((uint64_t)(dsp->registers[b ? DSP_REG_B1 : DSP_REG_A1] & 0xffffff) << 24) |
+           (uint64_t)(dsp->registers[b ? DSP_REG_B0 : DSP_REG_A0] & 0xffffff);
+}
+
+static void dsp_acc_set(dsp_core_t* dsp, int b, uint64_t v)
+{
+    dsp->registers[b ? DSP_REG_B2 : DSP_REG_A2] = (uint32_t)(v >> 48) & 0xff;
+    dsp->registers[b ? DSP_REG_B1 : DSP_REG_A1] = (uint32_t)(v >> 24) & 0xffffff;
+    dsp->registers[b ? DSP_REG_B0 : DSP_REG_A0] = (uint32_t)v & 0xffffff;
+    dsp->registers[DSP_REG_SR] &= BITMASK(16) - ((1 << DSP_SR_C) | (1 << DSP_SR_V));
+    emu_ccr_update_e_u_n_z(dsp, dsp->registers[b ? DSP_REG_B2 : DSP_REG_A2],
+                           dsp->registers[b ? DSP_REG_B1 : DSP_REG_A1],
+                           dsp->registers[b ? DSP_REG_B0 : DSP_REG_A0]);
+}
+
+/* The SSS/qqq register field of these instructions. */
+static uint32_t dsp_bitfield_reg(dsp_core_t* dsp, uint32_t field)
+{
+    static const int regs[8] = { DSP_REG_A0, DSP_REG_B0, DSP_REG_A1, DSP_REG_B1,
+                                 DSP_REG_X0, DSP_REG_Y0, DSP_REG_X1, DSP_REG_Y1 };
+    return dsp->registers[regs[field & 7]] & 0xffffff;
+}
+
+static void dsp_extract(dsp_core_t* dsp, uint32_t control, int signed_field)
+{
+    uint32_t offset = control & 0x3f, width = (control >> 12) & 0x3f;
+    int src = (dsp->cur_inst >> 4) & 1, dst = dsp->cur_inst & 1;
+    uint64_t v = offset < 56 ? dsp_acc_get(dsp, src) >> offset : 0;
+    if (width < 56) {
+        v &= ((uint64_t)1 << width) - 1;
+        if (signed_field && width && (v >> (width - 1)) & 1) v |= ~(((uint64_t)1 << width) - 1);
+    }
+    dsp_acc_set(dsp, dst, v & 0x00ffffffffffffffULL);
+}
+
+static void dsp_insert(dsp_core_t* dsp, uint32_t control)
+{
+    uint32_t offset = control & 0x3f, width = (control >> 12) & 0x3f;
+    int dst = dsp->cur_inst & 1;
+    uint64_t field = dsp_bitfield_reg(dsp, (dsp->cur_inst >> 4) & 7);
+    uint64_t mask = width >= 56 ? 0x00ffffffffffffffULL : (((uint64_t)1 << width) - 1);
+    uint64_t v = dsp_acc_get(dsp, dst);
+    if (offset < 56) v = (v & ~(mask << offset)) | ((field & mask) << offset);
+    dsp_acc_set(dsp, dst, v & 0x00ffffffffffffffULL);
+}
+
+static uint32_t dsp_extension_word(dsp_core_t* dsp)
+{
+    uint32_t word = read_memory_p(dsp, dsp->pc + 1);
+    dsp->cur_inst_len++;
+    return word;
+}
+
+static void emu_extract_reg(dsp_core_t* dsp)  { dsp_extract(dsp, dsp_bitfield_reg(dsp, (dsp->cur_inst >> 1) & 7), 1); }
+static void emu_extract_imm(dsp_core_t* dsp)  { dsp_extract(dsp, dsp_extension_word(dsp), 1); }
+static void emu_extractu_reg(dsp_core_t* dsp) { dsp_extract(dsp, dsp_bitfield_reg(dsp, (dsp->cur_inst >> 1) & 7), 0); }
+static void emu_extractu_imm(dsp_core_t* dsp) { dsp_extract(dsp, dsp_extension_word(dsp), 0); }
+static void emu_insert_reg(dsp_core_t* dsp)   { dsp_insert(dsp, dsp_bitfield_reg(dsp, (dsp->cur_inst >> 1) & 7)); }
+static void emu_insert_imm(dsp_core_t* dsp)   { dsp_insert(dsp, dsp_extension_word(dsp)); }
+
+static void emu_merge(dsp_core_t* dsp)
+{
+    int dst = dsp->cur_inst & 1;
+    uint32_t src = dsp_bitfield_reg(dsp, (dsp->cur_inst >> 1) & 7);
+    uint32_t d1 = dsp->registers[dst ? DSP_REG_B1 : DSP_REG_A1] & 0xffffff;
+    uint64_t v = dsp_acc_get(dsp, dst);
+    d1 = ((src & 0xfff) << 12) | (d1 & 0xfff);
+    v = (v & ~((uint64_t)0xffffff << 24)) | ((uint64_t)d1 << 24);
+    dsp_acc_set(dsp, dst, v);
 }
 
 static void emu_illegal(dsp_core_t* dsp)

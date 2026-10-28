@@ -30,6 +30,7 @@
 #include "dsp/dsp_state.h"
 #include "dsp/debug.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -325,9 +326,22 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
     unsigned int bytes_to_copy = TARGET_PAGE_SIZE - offset_in_page;
 
     (void)d;
-    (void)max_sge;
 
     while (len > 0) {
+        /* Past the end of the page table: xemu asserts here. Writes are
+         * dropped and reads return silence, rather than taking whatever
+         * follows the table as a physical address. */
+        if (page_entry > max_sge) {
+            static int reported;
+            if (reported < 10) {
+                reported++;
+                fprintf(stderr, "[APU-DSP] DMA past the page table: sge base %08llX max %u, "
+                        "offset %06X len %zu %s\n", (unsigned long long)sge_base, max_sge,
+                        page_entry * TARGET_PAGE_SIZE + offset_in_page, len, dir ? "write" : "read");
+            }
+            if (!dir) memset(ptr, 0, len);
+            return;
+        }
         uint32_t prd_address = ldl_le_phys(address_space_memory,
                                            sge_base + page_entry * 8 + 0);
         uint8_t *guest = dsp_ram_address(prd_address + offset_in_page,
@@ -394,11 +408,55 @@ static void scratch_trace(MCPXAPUState *d, const char *who, hwaddr sge_base, uin
     (void)d;
 }
 
+/* The GP's six-channel mix, as the title's DSP image (DirectSound's
+ * dsstdfx) leaves it for the EP: each frame it writes each channel's 32
+ * samples (24-bit DSP words) into its own ring in scratch memory, at
+ * RECOMP_APU_SURROUND_BASE (0x8000) + channel x RECOMP_APU_SURROUND_STRIDE
+ * (0x800), for the EP. Kept for RECOMP_APU_WAV's .6ch.raw: with Turok, in
+ * every XC_AUDIO mode only rings 0 and 2 (left, right) carry sound --
+ * DirectSound still pans to the front pair alone -- so this is not yet a
+ * route to 5.1 output. */
+static int16_t s_surround[256][6];
+static int s_surround_seen;
+static uint32_t s_surround_base = 0x8000, s_surround_stride = 0x800;
+
+static void surround_capture(MCPXAPUState *d, const uint8_t *ptr, uint32_t addr, size_t len)
+{
+    static int configured;
+    uint32_t ch, slot, i;
+    if (!configured) {
+        const char *base = getenv("RECOMP_APU_SURROUND_BASE"), *stride = getenv("RECOMP_APU_SURROUND_STRIDE");
+        if (base && *base) s_surround_base = (uint32_t)strtoul(base, NULL, 0);
+        if (stride && *stride) s_surround_stride = (uint32_t)strtoul(stride, NULL, 0);
+        configured = 1;
+    }
+    if (len != NUM_SAMPLES_PER_FRAME * 4 || addr < s_surround_base ||
+            addr >= s_surround_base + 6 * s_surround_stride)
+        return;
+    ch = (addr - s_surround_base) / s_surround_stride;
+    slot = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+    for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        uint32_t word;
+        memcpy(&word, ptr + 4 * i, 4);
+        s_surround[slot + i][ch] = (int16_t)(((int32_t)(word << 8)) >> 16);   /* 24 -> 16 bits */
+    }
+    s_surround_seen = 1;
+}
+
+/* The last window (256 frames) of the six-channel mix: FL FR C LFE SL SR
+ * as the rings are ordered. 0 if the GP has not written them. */
+int mcpx_apu_surround_window(const int16_t (**frames)[6])
+{
+    *frames = (const int16_t (*)[6])s_surround;
+    return s_surround_seen;
+}
+
 static void gp_scratch_rw(void *opaque, uint8_t *ptr, uint32_t addr, size_t len,
                           bool dir)
 {
     s_dsp_dma_count[0]++;
     MCPXAPUState *d = opaque;
+    if (dir) surround_capture(d, ptr, addr, len);
     scratch_trace(d, "GP", d->regs[NV_PAPU_GPSADDR], addr, len, dir);
     scatter_gather_rw(d, d->regs[NV_PAPU_GPSADDR], d->regs[NV_PAPU_GPSMAXSGE],
                       ptr, addr, len, dir);
@@ -675,6 +733,11 @@ void mcpx_apu_ep_write(void *opaque, hwaddr addr, uint64_t val, unsigned int siz
     }
 }
 
+static double s_bin_energy[NUM_MIXBINS];
+static unsigned long s_bin_samples;
+
+#define DSP_FRAME_CYCLE_BUDGET 106667u   /* 160 MHz / 1500 frames a second */
+
 static void dsp_frame_engine(MCPXAPUState *d,
                              float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -695,8 +758,26 @@ static void dsp_frame_engine(MCPXAPUState *d,
         fprintf(stderr, "[APU-DSP]   dma: gp scratch %lu ep scratch %lu gp fifo r %lu w %lu ep fifo r %lu w %lu; "
                 "gp pc %06X ep pc %06X\n", s_dsp_dma_count[0], s_dsp_dma_count[1], s_dsp_dma_count[2],
                 s_dsp_dma_count[3], s_dsp_dma_count[4], s_dsp_dma_count[5], d->gp.dsp->core.pc, d->ep.dsp->core.pc);
+        {
+            /* Each active mixbin's RMS over the last second (full scale 1000). */
+            char line[1024];
+            int len = 0;
+            for (int b = 0; b < NUM_MIXBINS; b++)
+                if (s_bin_energy[b] > 0)
+                    len += snprintf(line + len, sizeof(line) - len, " %d:%.0f", b,
+                                    1000.0 * sqrt(s_bin_energy[b] / ((double)s_bin_samples + 1)));
+            fprintf(stderr, "[APU-DSP]   mixbins%s\n", len ? line : " silent");
+            memset(s_bin_energy, 0, sizeof(s_bin_energy));
+            s_bin_samples = 0;
+        }
         diag_next = GetTickCount() + 1000;
         gp_cycles_max = ep_cycles_max = 0;
+    }
+    if (diag) {
+        for (int b = 0; b < NUM_MIXBINS; b++)
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                s_bin_energy[b] += (double)mixbins[b][i] * mixbins[b][i];
+        s_bin_samples += NUM_SAMPLES_PER_FRAME;
     }
 
     /* Write VP results to the GP DSP MIXBUF */
@@ -717,9 +798,14 @@ static void dsp_frame_engine(MCPXAPUState *d,
         dsp_start_frame(d->gp.dsp);
         d->gp.dsp->core.is_idle = false;
         d->gp.dsp->core.cycle_count = 0;
+        /* Until it idles, but no longer than the chip could: 160 MHz over a
+         * 32-sample frame is ~106k cycles. A program that never idles (the
+         * EP's encoders, set up for surround or Dolby Digital output) held
+         * this thread, and the APU lock, forever. */
         do {
             dsp_run(d->gp.dsp, 1000);
-        } while (!d->gp.dsp->core.is_idle && d->gp.realtime);
+        } while (!d->gp.dsp->core.is_idle && d->gp.realtime &&
+                 d->gp.dsp->core.cycle_count < DSP_FRAME_CYCLE_BUDGET);
         g_dbg.gp.cycles = d->gp.dsp->core.cycle_count;
         if (d->gp.dsp->core.cycle_count > gp_cycles_max) gp_cycles_max = d->gp.dsp->core.cycle_count;
         mcpx_apu_dsp_gp_runs++;
@@ -751,7 +837,8 @@ static void dsp_frame_engine(MCPXAPUState *d,
             d->ep.dsp->core.cycle_count = 0;
             do {
                 dsp_run(d->ep.dsp, 1000);
-            } while (!d->ep.dsp->core.is_idle && d->ep.realtime);
+            } while (!d->ep.dsp->core.is_idle && d->ep.realtime &&
+                     d->ep.dsp->core.cycle_count < 8 * DSP_FRAME_CYCLE_BUDGET);
             g_dbg.ep.cycles = d->ep.dsp->core.cycle_count;
             if (d->ep.dsp->core.cycle_count > ep_cycles_max) ep_cycles_max = d->ep.dsp->core.cycle_count;
             mcpx_apu_dsp_ep_runs++;

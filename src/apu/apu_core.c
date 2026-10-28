@@ -419,8 +419,9 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
 /* Optional raw PCM capture for offline analysis (RECOMP_APU_WAV=<base>):
  * <base>.emu.raw = EP/DSP mixdown before the software mixer,
  * <base>.mix.raw = what is actually submitted to the audio backend. */
-static FILE *g_wav_emu, *g_wav_mix;
+static FILE *g_wav_emu, *g_wav_mix, *g_wav_6ch;
 static int g_wav_init;
+extern int mcpx_apu_surround_window(const int16_t (**frames)[6]);
 
 static void apu_wav_capture(const int16_t (*buf)[2], int n, int mix)
 {
@@ -433,11 +434,18 @@ static void apu_wav_capture(const int16_t (*buf)[2], int n, int mix)
             g_wav_emu = fopen(path, "wb");
             snprintf(path, sizeof(path), "%s.mix.raw", base);
             g_wav_mix = fopen(path, "wb");
+            snprintf(path, sizeof(path), "%s.6ch.raw", base);
+            g_wav_6ch = fopen(path, "wb");
         }
     }
     FILE *f = mix ? g_wav_mix : g_wav_emu;
     if (f) {
         fwrite(buf, sizeof(int16_t) * 2, n, f);
+    }
+    if (!mix && g_wav_6ch) {
+        const int16_t (*surround)[6];
+        mcpx_apu_surround_window(&surround);
+        fwrite(surround, sizeof(int16_t) * 6, n, g_wav_6ch);
     }
 }
 
