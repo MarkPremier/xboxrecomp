@@ -367,16 +367,21 @@ static void kbm_cam_setf(uint32_t camera, uint32_t offset, float v)
  * them with
  *   RECOMP_KBM_MAP="A=Space|Return,RT=MouseL,Y=WheelUp|Q,BACK=None"
  * Key names: a letter or digit, Space Return Tab Escape Back Shift Control
- * Alt Up Down Left Right, MouseL MouseR MouseM WheelUp WheelDown, or None.
- * A listed target loses its default keys. */
+ * Alt Up Down Left Right, MouseL MouseR MouseM Mouse4 Mouse5 WheelUp
+ * WheelDown, or None. A listed target loses its default keys. MOVE_UP,
+ * MOVE_DOWN, MOVE_LEFT and MOVE_RIGHT push the left stick all the way; a
+ * title can rebind any target while it runs (xbox_KbmSetBinding). */
 #define KBM_MOUSE_L    0x101
 #define KBM_MOUSE_R    0x102
 #define KBM_MOUSE_M    0x103
 #define KBM_WHEEL_UP   0x104
 #define KBM_WHEEL_DOWN 0x105
+#define KBM_MOUSE_4    0x106
+#define KBM_MOUSE_5    0x107
 
 enum { KB_A, KB_B, KB_X, KB_Y, KB_BLACK, KB_WHITE, KB_LT, KB_RT, KB_START, KB_BACK,
-       KB_LTHUMB, KB_RTHUMB, KB_UP, KB_DOWN, KB_LEFT, KB_RIGHT, KB_COUNT };
+       KB_LTHUMB, KB_RTHUMB, KB_UP, KB_DOWN, KB_LEFT, KB_RIGHT,
+       KB_MOVE_UP, KB_MOVE_DOWN, KB_MOVE_LEFT, KB_MOVE_RIGHT, KB_COUNT };
 
 struct kbm_bind { const char *name; int vk[3]; };
 static struct kbm_bind kbm_binds[KB_COUNT] = {
@@ -386,6 +391,7 @@ static struct kbm_bind kbm_binds[KB_COUNT] = {
     { "LTHUMB", { 'R' } }, { "RTHUMB", { KBM_MOUSE_M } },
     { "UP", { VK_UP, '1', KBM_WHEEL_UP } }, { "DOWN", { VK_DOWN, '2', KBM_WHEEL_DOWN } },
     { "LEFT", { VK_LEFT, '3' } }, { "RIGHT", { VK_RIGHT, '4' } },
+    { "MOVE_UP", { 'W' } }, { "MOVE_DOWN", { 'S' } }, { "MOVE_LEFT", { 'A' } }, { "MOVE_RIGHT", { 'D' } },
 };
 
 static int kbm_vk_name(const char *name)
@@ -396,6 +402,7 @@ static int kbm_vk_name(const char *name)
         { "Shift", VK_SHIFT }, { "Control", VK_CONTROL }, { "Alt", VK_MENU },
         { "Up", VK_UP }, { "Down", VK_DOWN }, { "Left", VK_LEFT }, { "Right", VK_RIGHT },
         { "MouseL", KBM_MOUSE_L }, { "MouseR", KBM_MOUSE_R }, { "MouseM", KBM_MOUSE_M },
+        { "Mouse4", KBM_MOUSE_4 }, { "Mouse5", KBM_MOUSE_5 },
         { "WheelUp", KBM_WHEEL_UP }, { "WheelDown", KBM_WHEEL_DOWN },
     };
     unsigned i;
@@ -441,6 +448,29 @@ void xbox_KbmPulse(const char *target, int ms)
     for (i = 0; i < KB_COUNT; i++)
         if (!strcmp(kbm_binds[i].name, target))
             InterlockedExchange(&kbm_pulse_until[i], (LONG)(GetTickCount() + (DWORD)ms));
+}
+
+/* A title's own rebinding (a controls page): `target`'s keys are now these
+ * (virtual-key codes, or the mouse codes 0x101 left, 0x102 right, 0x103
+ * middle, 0x104 wheel up, 0x105 wheel down, 0x106 and 0x107 the side
+ * buttons), up to three; none unbinds it. Any thread. */
+void xbox_KbmSetBinding(const char *target, const int *keys, int count)
+{
+    unsigned i;
+    int k;
+    for (i = 0; i < KB_COUNT; i++)
+        if (!strcmp(kbm_binds[i].name, target))
+            for (k = 0; k < 3; k++)
+                InterlockedExchange((volatile LONG *)&kbm_binds[i].vk[k], k < count ? keys[k] : 0);
+}
+
+/* While a title waits for a key to bind, nothing the keyboard or mouse does
+ * reaches it as a pad (a real pad still does). */
+static volatile LONG kbm_capture;
+
+void xbox_KbmSetCapture(int on)
+{
+    InterlockedExchange(&kbm_capture, on != 0);
 }
 
 /* While a menu has the pointer (xbox_FramebufferSetMenuPointer) the mouse is
@@ -494,7 +524,7 @@ static DWORD kbm_wheel_up_until, kbm_wheel_down_until;
 
 static BOOL kbm_mouse_button(int which)
 {
-    static int held_over[3];
+    static int held_over[5];
     int down = xbox_FramebufferMouseButton(which);
     if (xbox_FramebufferMenuPointer()) held_over[which] = 1;
     else if (!down) held_over[which] = 0;
@@ -508,6 +538,8 @@ static BOOL kbm_input_down(int vk)
     case KBM_MOUSE_L:    return kbm_mouse_button(0);
     case KBM_MOUSE_R:    return kbm_mouse_button(1);
     case KBM_MOUSE_M:    return kbm_mouse_button(2);
+    case KBM_MOUSE_4:    return kbm_mouse_button(3);
+    case KBM_MOUSE_5:    return kbm_mouse_button(4);
     case KBM_WHEEL_UP:   return (long)(GetTickCount() - kbm_wheel_up_until) < 0;
     case KBM_WHEEL_DOWN: return (long)(GetTickCount() - kbm_wheel_down_until) < 0;
     default:             return key_down(vk);
@@ -591,9 +623,9 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     memset(pState, 0, sizeof(*pState));
     kbm_follow_menu_mode();
 
-    /* Left stick: WASD, full deflection. */
-    pState->Gamepad.sThumbLX = axis_from_keys('A', 'D');
-    pState->Gamepad.sThumbLY = axis_from_keys('S', 'W');
+    /* Left stick: the movement keys (WASD), full deflection. */
+    pState->Gamepad.sThumbLX = (SHORT)((kbm_down(KB_MOVE_RIGHT) ? 32767 : 0) - (kbm_down(KB_MOVE_LEFT) ? 32767 : 0));
+    pState->Gamepad.sThumbLY = (SHORT)((kbm_down(KB_MOVE_UP) ? 32767 : 0) - (kbm_down(KB_MOVE_DOWN) ? 32767 : 0));
 
     /* Right stick: the mouse delta scaled straight to the stick. Clamp each
      * poll's delta so a focus change or a stuck cursor cannot slam it to full,
@@ -817,6 +849,7 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = kbm_down(KB_WHITE) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = kbm_down(KB_LT) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = kbm_down(KB_RT) ? 255 : 0;
+    if (kbm_capture) memset(&pState->Gamepad, 0, sizeof pState->Gamepad);
 
     pState->dwPacketNumber = ++packet;
 }

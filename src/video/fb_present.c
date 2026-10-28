@@ -395,8 +395,8 @@ static void fb_inject_poll(void)
  * only by the input thread, one word at a time. A delta seen a frame late is
  * indistinguishable from one made a frame later. */
 static volatile LONG s_mouse_dx, s_mouse_dy, s_mouse_wheel;
-static volatile unsigned char s_mouse_btn[3];   /* 0=L, 1=R, 2=M */
-static volatile LONG s_mouse_clicks[3];         /* presses since xbox_FramebufferMouseClicks */
+static volatile unsigned char s_mouse_btn[5];   /* 0=L, 1=R, 2=M, 3 and 4 the side buttons */
+static volatile LONG s_mouse_clicks[5];         /* presses since xbox_FramebufferMouseClicks */
 static int s_mouse_x, s_mouse_y, s_mouse_have;
 static int s_mouse_inside;   /* s_mouse_x/y is where the free cursor last was */
 static int s_mouse_capture, s_cursor_hidden;
@@ -511,7 +511,7 @@ int xbox_FramebufferMouseDelta(int *dx, int *dy)
 
 int xbox_FramebufferMouseButton(int which)
 {
-    if ((unsigned)which > 2)
+    if ((unsigned)which > 4)
         return 0;
     return s_mouse_btn[which] != 0;
 }
@@ -520,7 +520,7 @@ int xbox_FramebufferMouseButton(int which)
  * down and up again before a poll of xbox_FramebufferMouseButton sees it. */
 int xbox_FramebufferMouseClicks(int which)
 {
-    if ((unsigned)which > 2)
+    if ((unsigned)which > 4)
         return 0;
     return (int)InterlockedExchange(&s_mouse_clicks[which], 0);
 }
@@ -814,14 +814,14 @@ static void rep_apply(const struct RecEvent *e)
         break;
     case 'u':
         memset((void *)s_key_down, 0, sizeof s_key_down);
-        s_mouse_btn[0] = s_mouse_btn[1] = s_mouse_btn[2] = 0;
+        memset((void *)s_mouse_btn, 0, sizeof s_mouse_btn);
         break;
     case 'm':
         InterlockedExchangeAdd(&s_mouse_dx, (LONG)e->a);
         InterlockedExchangeAdd(&s_mouse_dy, (LONG)e->b);
         break;
     case 'b':
-        if ((unsigned)e->a < 3) {
+        if ((unsigned)e->a < 5) {
             s_mouse_btn[e->a] = e->b ? 1 : 0;
             if (e->b) InterlockedIncrement(&s_mouse_clicks[e->a]);
         }
@@ -1064,6 +1064,14 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_RBUTTONUP:   rec_event("b 1 0"); s_mouse_btn[1] = 0; return 0;
     case WM_MBUTTONDOWN: rec_event("b 2 1"); s_mouse_btn[2] = 1; InterlockedIncrement(&s_mouse_clicks[2]); return 0;
     case WM_MBUTTONUP:   rec_event("b 2 0"); s_mouse_btn[2] = 0; return 0;
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP: {
+        int button = GET_XBUTTON_WPARAM(w) == XBUTTON2 ? 4 : 3, down = m == WM_XBUTTONDOWN;
+        rec_event("b %d %d", button, down);
+        s_mouse_btn[button] = (unsigned char)down;
+        if (down) InterlockedIncrement(&s_mouse_clicks[button]);
+        return TRUE;
+    }
 
     case WM_MOUSEWHEEL:
         rec_event("w %d", (int)(GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA));
@@ -1078,7 +1086,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_KILLFOCUS:
         rec_event("u");
         memset((void *)s_key_down, 0, sizeof s_key_down);
-        s_mouse_btn[0] = s_mouse_btn[1] = s_mouse_btn[2] = 0;
+        memset((void *)s_mouse_btn, 0, sizeof s_mouse_btn);
         xbox_FramebufferMouseCapture(0);
         return 0;
 
