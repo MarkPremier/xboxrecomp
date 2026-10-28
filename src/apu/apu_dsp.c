@@ -253,6 +253,33 @@ static void dsp_frame_stub(MCPXAPUState *d,
 }
 
 /* ============================================================
+ * Speaker-bin output (RECOMP_APU_MONITOR=mixbins)
+ * ============================================================
+ *
+ * The DSPs run (DirectSound waits on their command acknowledgements), but
+ * what is heard is the voices' speaker bins straight from the VP: on the
+ * Xbox, bins 0..5 are front left, front right, centre, LFE, surround left
+ * and surround right. Stereo folds centre and surrounds in at -3 dB and
+ * leaves the LFE out, as a Dolby downmix does. The GP's effects (reverb,
+ * fed by the bins above 5) are not heard this way. */
+static int s_speaker_bins;     /* RECOMP_APU_MONITOR=mixbins */
+
+static void speaker_bin_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        float left = mixbins[0][i] + 0.7071f * (mixbins[2][i] + mixbins[4][i]);
+        float right = mixbins[1][i] + 0.7071f * (mixbins[2][i] + mixbins[5][i]);
+        if (left > 1.0f) left = 1.0f;
+        if (left < -1.0f) left = -1.0f;
+        if (right > 1.0f) right = 1.0f;
+        if (right < -1.0f) right = -1.0f;
+        d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
+        d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
+    }
+}
+
+/* ============================================================
  * Real GP/EP DSP56300 pipeline (ported from xemu gp_ep.c)
  * ============================================================ */
 
@@ -344,10 +371,35 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
     }
 }
 
+/* RECOMP_APU_DIAG: DSP DMA transfers since start, by kind (index: GP scratch,
+ * EP scratch, GP fifo read, GP fifo write, EP fifo read, EP fifo write). */
+static unsigned long s_dsp_dma_count[6];
+
+/* RECOMP_APU_SCRATCH_TRACE: the first transfers of each DSP's scratch DMA --
+ * the DSP's scratch offset, length, direction and where its first page
+ * resolves. The GP hands its mix to the EP through scratch memory. */
+static void scratch_trace(MCPXAPUState *d, const char *who, hwaddr sge_base, uint32_t addr, size_t len, bool dir)
+{
+    static int on = -1;
+    static unsigned long n;
+    if (on < 0) on = getenv("RECOMP_APU_SCRATCH_TRACE") != NULL;
+    if (!on || n >= 400) return;
+    {
+        uint32_t prd = ldl_le_phys(address_space_memory, sge_base + (addr / TARGET_PAGE_SIZE) * 8);
+        fprintf(stderr, "[SCRATCH] %s %s off %06X len %5zu -> phys %08X host %p\n", who, dir ? "write" : "read ",
+                addr, len, prd + addr % TARGET_PAGE_SIZE,
+                (void *)dsp_ram_address(prd + addr % TARGET_PAGE_SIZE, 4));
+    }
+    n++;
+    (void)d;
+}
+
 static void gp_scratch_rw(void *opaque, uint8_t *ptr, uint32_t addr, size_t len,
                           bool dir)
 {
+    s_dsp_dma_count[0]++;
     MCPXAPUState *d = opaque;
+    scratch_trace(d, "GP", d->regs[NV_PAPU_GPSADDR], addr, len, dir);
     scatter_gather_rw(d, d->regs[NV_PAPU_GPSADDR], d->regs[NV_PAPU_GPSMAXSGE],
                       ptr, addr, len, dir);
 }
@@ -355,7 +407,9 @@ static void gp_scratch_rw(void *opaque, uint8_t *ptr, uint32_t addr, size_t len,
 static void ep_scratch_rw(void *opaque, uint8_t *ptr, uint32_t addr, size_t len,
                           bool dir)
 {
+    s_dsp_dma_count[1]++;
     MCPXAPUState *d = opaque;
+    scratch_trace(d, "EP", d->regs[NV_PAPU_EPSADDR], addr, len, dir);
     scatter_gather_rw(d, d->regs[NV_PAPU_EPSADDR], d->regs[NV_PAPU_EPSMAXSGE],
                       ptr, addr, len, dir);
 }
@@ -396,6 +450,7 @@ static uint32_t circular_scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
 static void gp_fifo_rw(void *opaque, uint8_t *ptr, unsigned int index,
                        size_t len, bool dir)
 {
+    s_dsp_dma_count[2 + (dir ? 1 : 0)]++;
     MCPXAPUState *d = opaque;
     uint32_t base;
     uint32_t end;
@@ -448,6 +503,7 @@ static bool ep_sink_samples(MCPXAPUState *d, uint8_t *ptr, size_t len)
 static void ep_fifo_rw(void *opaque, uint8_t *ptr, unsigned int index,
                        size_t len, bool dir)
 {
+    s_dsp_dma_count[4 + (dir ? 1 : 0)]++;
     MCPXAPUState *d = opaque;
     uint32_t base;
     uint32_t end;
@@ -623,6 +679,25 @@ static void dsp_frame_engine(MCPXAPUState *d,
                              float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     static bool logged_gp, logged_ep;
+    if (s_speaker_bins) speaker_bin_frame(d, mixbins);
+    static int diag = -1;
+    static DWORD diag_next;
+    static unsigned long frames, gp_cycles_max, ep_cycles_max;
+
+    /* RECOMP_APU_DIAG: once a second, how often each DSP ran and the EP
+     * handed output over, against the frames the VP made. */
+    if (diag < 0) diag = getenv("RECOMP_APU_DIAG") != NULL;
+    frames++;
+    if (diag && (long)(GetTickCount() - diag_next) >= 0) {
+        fprintf(stderr, "[APU-DSP] frames %lu gp runs %lu (max %lu cycles) ep runs %lu (max %lu cycles) ep sinks %lu\n",
+                frames, mcpx_apu_dsp_gp_runs, gp_cycles_max, mcpx_apu_dsp_ep_runs, ep_cycles_max,
+                mcpx_apu_dsp_ep_sinks);
+        fprintf(stderr, "[APU-DSP]   dma: gp scratch %lu ep scratch %lu gp fifo r %lu w %lu ep fifo r %lu w %lu; "
+                "gp pc %06X ep pc %06X\n", s_dsp_dma_count[0], s_dsp_dma_count[1], s_dsp_dma_count[2],
+                s_dsp_dma_count[3], s_dsp_dma_count[4], s_dsp_dma_count[5], d->gp.dsp->core.pc, d->ep.dsp->core.pc);
+        diag_next = GetTickCount() + 1000;
+        gp_cycles_max = ep_cycles_max = 0;
+    }
 
     /* Write VP results to the GP DSP MIXBUF */
     for (int mixbin = 0; mixbin < NUM_MIXBINS; mixbin++) {
@@ -646,6 +721,7 @@ static void dsp_frame_engine(MCPXAPUState *d,
             dsp_run(d->gp.dsp, 1000);
         } while (!d->gp.dsp->core.is_idle && d->gp.realtime);
         g_dbg.gp.cycles = d->gp.dsp->core.cycle_count;
+        if (d->gp.dsp->core.cycle_count > gp_cycles_max) gp_cycles_max = d->gp.dsp->core.cycle_count;
         mcpx_apu_dsp_gp_runs++;
         if (!logged_gp) {
             logged_gp = true;
@@ -677,6 +753,7 @@ static void dsp_frame_engine(MCPXAPUState *d,
                 dsp_run(d->ep.dsp, 1000);
             } while (!d->ep.dsp->core.is_idle && d->ep.realtime);
             g_dbg.ep.cycles = d->ep.dsp->core.cycle_count;
+            if (d->ep.dsp->core.cycle_count > ep_cycles_max) ep_cycles_max = d->ep.dsp->core.cycle_count;
             mcpx_apu_dsp_ep_runs++;
             if (!logged_ep) {
                 logged_ep = true;
@@ -734,7 +811,18 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
     }
 
     if (preference) {
+        /* RECOMP_APU_MONITOR=gp|ep|vp|gp_or_ep: which stage's output is heard
+         * (xemu's debug monitor point). gp_or_ep by default. */
+        const char *monitor = getenv("RECOMP_APU_MONITOR");
         d->monitor.point = MCPX_APU_DEBUG_MON_GP_OR_EP;
+        if (monitor && !_stricmp(monitor, "gp")) d->monitor.point = MCPX_APU_DEBUG_MON_GP;
+        else if (monitor && !_stricmp(monitor, "ep")) d->monitor.point = MCPX_APU_DEBUG_MON_EP;
+        else if (monitor && !_stricmp(monitor, "vp")) d->monitor.point = MCPX_APU_DEBUG_MON_VP;
+        else if (monitor && !_stricmp(monitor, "mixbins")) {
+            d->monitor.point = MCPX_APU_DEBUG_MON_AC97;   /* neither DSP writes the output */
+            s_speaker_bins = 1;
+        }
+        if (monitor) fprintf(stderr, "[APU] monitor point %s (%d)\n", monitor, (int)d->monitor.point);
         d->gp.realtime = true;
         d->ep.realtime = true;
     } else {

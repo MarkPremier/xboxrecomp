@@ -583,8 +583,13 @@ static void throttle(MCPXAPUState *d)
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
+    /* Behind schedule, the frames are made at once until it is caught up:
+     * a wait that oversleeps (the system timer can be 15 ms coarse) must not
+     * cost audio time, or the output runs slower than real time and the
+     * queue drains (crackling). Only a stall of more than eight packets
+     * starts the schedule afresh. */
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+        now_us - d->next_frame_time_us > 8 * EP_FRAME_US) {
         d->next_frame_time_us = now_us;
     }
 
@@ -605,6 +610,8 @@ static void throttle(MCPXAPUState *d)
 /* ============================================================
  * se_frame - Process one audio frame (VP -> GP -> EP pipeline)
  * ============================================================ */
+
+static double g_apu_yield_s;     /* RECOMP_APU_DIAG: time given away to the title */
 
 static void se_frame(MCPXAPUState *d)
 {
@@ -628,9 +635,31 @@ static void se_frame(MCPXAPUState *d)
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memset(mixbins, 0, sizeof(mixbins));
 
-    mcpx_apu_vp_frame(d, mixbins);
-    mcpx_apu_dsp_frame(d, mixbins);
-    mcpx_apu_monitor_frame(d);
+    {
+        /* RECOMP_APU_DIAG: where a second's frames went. */
+        static LARGE_INTEGER frequency, report;
+        static double vp_s, dsp_s, out_s;
+        static int diag = -1;
+        LARGE_INTEGER t0, t1, t2, t3;
+        if (diag < 0) diag = getenv("RECOMP_APU_DIAG") != NULL;
+        if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&t0);
+        mcpx_apu_vp_frame(d, mixbins);
+        QueryPerformanceCounter(&t1);
+        mcpx_apu_dsp_frame(d, mixbins);
+        QueryPerformanceCounter(&t2);
+        mcpx_apu_monitor_frame(d);
+        QueryPerformanceCounter(&t3);
+        vp_s += (double)(t1.QuadPart - t0.QuadPart) / frequency.QuadPart;
+        dsp_s += (double)(t2.QuadPart - t1.QuadPart) / frequency.QuadPart;
+        out_s += (double)(t3.QuadPart - t2.QuadPart) / frequency.QuadPart;
+        if (diag && t3.QuadPart - report.QuadPart >= frequency.QuadPart) {
+            fprintf(stderr, "[APU-TIME] last second: vp %.0f ms dsp %.0f ms output %.0f ms yield %.0f ms\n",
+                    vp_s * 1000, dsp_s * 1000, out_s * 1000, g_apu_yield_s * 1000);
+            vp_s = dsp_s = out_s = g_apu_yield_s = 0;
+            report = t3;
+        }
+    }
 
     d->ep_frame_div++;
 
@@ -709,9 +738,16 @@ static void *mcpx_apu_frame_thread(void *arg)
          * thread starved there indefinitely: Burnout 3 froze on its vehicle
          * select, blocked in voice_lock at raised IRQL, which in turn held
          * off every USB interrupt. */
-        qemu_mutex_unlock(&d->lock);
-        SwitchToThread();
-        qemu_mutex_lock(&d->lock);
+        {
+            LARGE_INTEGER y0, y1, f;
+            QueryPerformanceCounter(&y0);
+            qemu_mutex_unlock(&d->lock);
+            SwitchToThread();
+            qemu_mutex_lock(&d->lock);
+            QueryPerformanceCounter(&y1);
+            QueryPerformanceFrequency(&f);
+            g_apu_yield_s += (double)(y1.QuadPart - y0.QuadPart) / f.QuadPart;
+        }
     }
 
     qemu_mutex_unlock(&d->lock);

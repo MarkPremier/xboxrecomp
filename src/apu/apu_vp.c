@@ -1258,6 +1258,88 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             uint16_t v = (uint16_t)d->regs[current];
             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+            /* RECOMP_APU_VOICE_TRACE: each list's voices once a second --
+             * format, stream state, position and pitch. */
+            {
+                static int trace = -1;
+                static DWORD next_report;
+                static int reporting;
+                if (trace < 0) trace = getenv("RECOMP_APU_VOICE_TRACE") != NULL;
+                if (trace && list == 0 && i == 0) {
+                    reporting = (long)(GetTickCount() - next_report) >= 0;
+                    if (reporting) next_report = GetTickCount() + 1000;
+                }
+                if (trace && reporting) {
+                    uint32_t fmt = ldl_le_phys(address_space_memory,
+                                               d->regs[NV_PAPU_VPVADDR] + v * NV_PAVS_SIZE + NV_PAVS_VOICE_CFG_FMT);
+                    fprintf(stderr, "[VOICE] list %d v%u act %u paused %u fmt %08X stream %u cbo %u ebo %u ssl %d/%d/%d pitch %d\n",
+                            list, v,
+                            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE),
+                            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_PAUSED),
+                            fmt, voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_DATA_TYPE),
+                            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+                            d->vp.ssl[v].ssl_index, d->vp.ssl[v].ssl_seg, d->vp.ssl[v].count[d->vp.ssl[v].ssl_index],
+                            (int16_t)voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK, NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH));
+                    if (voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) &&
+                            d->vp.ssl[v].count[d->vp.ssl[v].ssl_index]) {
+                        int index = d->vp.ssl[v].ssl_index;
+                        hwaddr entry = d->regs[NV_PAPU_VPSSLADDR] +
+                                       (d->vp.ssl[v].base[index] + d->vp.ssl[v].ssl_seg) * 8;
+                        uint32_t seg = ldl_le_phys(address_space_memory, entry);
+                        uint32_t seglen = ldl_le_phys(address_space_memory, entry + 4);
+                        uint32_t cbo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO);
+                        const int16_t *pcm = (const int16_t *)mcpx_apu_ram_address(seg, 64);
+                        fprintf(stderr, "[VOICE]   v%u segment %08X len %08X (cs %u) at cbo: %d %d %d %d %d %d %d %d\n",
+                                v, seg, seglen, (seglen >> 16) & 3, pcm[cbo % 512 * 2], pcm[cbo % 512 * 2 + 1],
+                                pcm[2], pcm[3], pcm[100], pcm[101], pcm[500], pcm[501]);
+                    }
+                    if (!voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_DATA_TYPE)) {
+                        uint32_t ba = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START, NV_PAVS_VOICE_CUR_PSL_START_BA);
+                        hwaddr data = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, ba);
+                        uint32_t first = ldl_le_phys(address_space_memory, data);
+                        fprintf(stderr, "[VOICE]   v%u ba %06X data phys %08llX host %p first %08X\n", v, ba,
+                                (unsigned long long)data, (void *)mcpx_apu_ram_address(data, 4), first);
+                    }
+                    {
+                        fprintf(stderr, "[VOICE]   v%u vol A %08X B %08X C %08X\n", v,
+                                ldl_le_phys(address_space_memory, d->regs[NV_PAPU_VPVADDR] + v * NV_PAVS_SIZE + NV_PAVS_VOICE_TAR_VOLA),
+                                ldl_le_phys(address_space_memory, d->regs[NV_PAPU_VPVADDR] + v * NV_PAVS_SIZE + NV_PAVS_VOICE_TAR_VOLB),
+                                ldl_le_phys(address_space_memory, d->regs[NV_PAPU_VPVADDR] + v * NV_PAVS_SIZE + NV_PAVS_VOICE_TAR_VOLC));
+                        fprintf(stderr, "[VOICE]   v%u bins %u %u %u %u %u %u %u %u\n", v,
+                                voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, NV_PAVS_VOICE_CFG_VBIN_V0BIN),
+                                voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, NV_PAVS_VOICE_CFG_VBIN_V1BIN),
+                                voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, NV_PAVS_VOICE_CFG_VBIN_V2BIN),
+                                voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, NV_PAVS_VOICE_CFG_VBIN_V3BIN),
+                                voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, NV_PAVS_VOICE_CFG_VBIN_V4BIN),
+                                voice_get_mask(d, v, NV_PAVS_VOICE_CFG_VBIN, NV_PAVS_VOICE_CFG_VBIN_V5BIN),
+                                voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_V6BIN),
+                                voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_V7BIN));
+                    }
+                    if (list == 0 && i == 0) {
+                        int f;
+                        for (f = 0; f < 4; f++)
+                            fprintf(stderr, "[VOICE]   GP out fifo %d base %06X end %06X cur %06X\n", f,
+                                    d->regs[NV_PAPU_GPOFBASE0 + 0x10 * f], d->regs[NV_PAPU_GPOFEND0 + 0x10 * f],
+                                    d->regs[NV_PAPU_GPOFCUR0 + 0x10 * f]);
+                        for (f = 0; f < 2; f++)
+                            fprintf(stderr, "[VOICE]   EP in fifo %d base %06X end %06X cur %06X; out fifo %d base %06X end %06X cur %06X\n", f,
+                                    d->regs[NV_PAPU_EPIFBASE0 + 0x10 * f], d->regs[NV_PAPU_EPIFEND0 + 0x10 * f],
+                                    d->regs[NV_PAPU_EPIFCUR0 + 0x10 * f], f,
+                                    d->regs[NV_PAPU_EPOFBASE0 + 0x10 * f], d->regs[NV_PAPU_EPOFEND0 + 0x10 * f],
+                                    d->regs[NV_PAPU_EPOFCUR0 + 0x10 * f]);
+                        fprintf(stderr, "[VOICE]   headroom hrtf %u submix %u %u %u %u %u %u %u %u\n",
+                                d->vp.hrtf_headroom, d->vp.submix_headroom[0], d->vp.submix_headroom[1],
+                                d->vp.submix_headroom[2], d->vp.submix_headroom[3], d->vp.submix_headroom[4],
+                                d->vp.submix_headroom[5], d->vp.submix_headroom[6], d->vp.submix_headroom[7]);
+                        fprintf(stderr, "[VOICE]   EPFADDR %08X first page %08X\n", d->regs[NV_PAPU_EPFADDR],
+                                ldl_le_phys(address_space_memory, d->regs[NV_PAPU_EPFADDR]));
+                        fprintf(stderr, "[VOICE]   GPFADDR %08X first page %08X VPSGEADDR %08X\n",
+                                d->regs[NV_PAPU_GPFADDR], ldl_le_phys(address_space_memory, d->regs[NV_PAPU_GPFADDR]),
+                                d->regs[NV_PAPU_VPSGEADDR]);
+                    }
+                }
+            }
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
