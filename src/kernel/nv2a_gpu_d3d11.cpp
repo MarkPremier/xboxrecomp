@@ -405,7 +405,7 @@ struct DepthSurface {
  *
  * Unset or "auto": the whole multiple of 480 lines that covers the primary
  * monitor's height (3 on 1440p), so the frame is rendered at least at the
- * screen's own resolution.
+ * screen's own resolution; above 1920 lines, the monitor's own (4.5 on 4K).
  *
  * nv2a_gpu_set_render_scale changes it while the title runs; the change waits
  * for the next flip, where every target is redrawn at the new size. */
@@ -414,7 +414,8 @@ static float automatic_render_scale()
     DEVMODEA mode = {};
     mode.dmSize = sizeof mode;
     if (!EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &mode) || !mode.dmPelsHeight) return 1.0f;
-    float automatic = (float)std::min<DWORD>((mode.dmPelsHeight + 479) / 480, 4);
+    float automatic = mode.dmPelsHeight > 1920 ? std::min(mode.dmPelsHeight / 480.0f, 8.0f)
+                                                : (float)((mode.dmPelsHeight + 479) / 480);
     std::fprintf(stderr, "[GPU-D3D11] render scale %gx (monitor %lux%lu)\n", automatic,
                  mode.dmPelsWidth, mode.dmPelsHeight);
     return automatic;
@@ -3074,16 +3075,26 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
     if (binding.shadow) {
         /* A shadow-map stage reads the depth the GPU drew there; no guest
          * round trip. Null when no pass has drawn it yet (the caller lights
-         * the stage). */
+         * the stage). The latest drawn of its textures: one made at the
+         * render scale before the map was seen drawn without colour (and so
+         * kept at the title's size) is left behind, stale. */
+        DepthSurface *shadow = nullptr;
+        unsigned candidates = 0;
         for (auto &surface : depth_surfaces)
             if (surface.memory == binding.source && surface.width == binding.width &&
                     surface.height == binding.height && surface.pitch == binding.pitch) {
-                if (!surface.dirty && !refresh_depth(surface)) return nullptr;
-                surface.last_used = ++surface_use_serial;
-                resolve_depth(surface);
-                return surface.sample_view.Get();
+                candidates++;
+                if (!shadow || surface.last_used > shadow->last_used) shadow = &surface;
             }
-        return nullptr;
+        if (!shadow) return nullptr;
+        static std::set<const uint8_t *> reported;
+        if (candidates > 1 && reported.insert(shadow->memory).second)
+            std::fprintf(stderr, "[GPU-D3D11] shadow map %p: %u textures, reading the %ux%u one drawn last\n",
+                         (const void *)shadow->memory, candidates, shadow->texture_width, shadow->texture_height);
+        if (!shadow->dirty && !refresh_depth(*shadow)) return nullptr;
+        shadow->last_used = ++surface_use_serial;
+        resolve_depth(*shadow);
+        return shadow->sample_view.Get();
     }
     static const bool mirror_aliases = []() {
         const char *setting = std::getenv("RECOMP_NV2A_GPU_ALIAS_COPIES");

@@ -388,6 +388,7 @@ static void fb_inject_poll(void)
  * indistinguishable from one made a frame later. */
 static volatile LONG s_mouse_dx, s_mouse_dy, s_mouse_wheel;
 static volatile unsigned char s_mouse_btn[3];   /* 0=L, 1=R, 2=M */
+static volatile LONG s_mouse_clicks[3];         /* presses since xbox_FramebufferMouseClicks */
 static int s_mouse_x, s_mouse_y, s_mouse_have;
 static int s_mouse_inside;   /* s_mouse_x/y is where the free cursor last was */
 static int s_mouse_capture, s_cursor_hidden;
@@ -507,6 +508,15 @@ int xbox_FramebufferMouseButton(int which)
     return s_mouse_btn[which] != 0;
 }
 
+/* Presses of a button since the last call: a click quicker than a frame is
+ * down and up again before a poll of xbox_FramebufferMouseButton sees it. */
+int xbox_FramebufferMouseClicks(int which)
+{
+    if ((unsigned)which > 2)
+        return 0;
+    return (int)InterlockedExchange(&s_mouse_clicks[which], 0);
+}
+
 int xbox_FramebufferMouseWheel(void)
 {
     return (int)InterlockedExchange(&s_mouse_wheel, 0);
@@ -570,10 +580,31 @@ void xbox_FramebufferMouseCapture(int on)
  * reads where the cursor is over the window (xbox_FramebufferPointer). Leaving
  * the menu takes the grab back if the window is the one in front. The cursor
  * over the client area is the title's own picture when it gives one
- * (xbox_FramebufferSetCursorImage). */
+ * (xbox_FramebufferSetCursorImage). In a menu it shows only once the mouse
+ * moves, and hides again when the title says the keys or a pad moved on
+ * (xbox_FramebufferHidePointer). */
 #define FB_MENU_POINTER (WM_APP + 3)
+#define FB_HIDE_POINTER (WM_APP + 4)
 static volatile LONG s_menu_pointer;
+static int s_pointer_shown;
 static HCURSOR s_cursor_image;
+
+/* The cursor over the client area as it should be now (window thread). */
+static void fb_pointer_cursor(HWND h)
+{
+    POINT p;
+    RECT c;
+    if (s_mouse_capture || !GetCursorPos(&p) || !ScreenToClient(h, &p) || !GetClientRect(h, &c) ||
+            !PtInRect(&c, p)) return;
+    if (s_menu_pointer && !s_pointer_shown) SetCursor(NULL);
+    else SetCursor(s_cursor_image ? s_cursor_image : LoadCursorA(NULL, IDC_ARROW));
+}
+
+void xbox_FramebufferHidePointer(void)
+{
+    if (s_fb_hwnd && s_menu_pointer)
+        PostMessageA(s_fb_hwnd, FB_HIDE_POINTER, 0, 0);
+}
 
 void xbox_FramebufferSetMenuPointer(int on)
 {
@@ -782,8 +813,10 @@ static void rep_apply(const struct RecEvent *e)
         InterlockedExchangeAdd(&s_mouse_dy, (LONG)e->b);
         break;
     case 'b':
-        if ((unsigned)e->a < 3)
+        if ((unsigned)e->a < 3) {
             s_mouse_btn[e->a] = e->b ? 1 : 0;
+            if (e->b) InterlockedIncrement(&s_mouse_clicks[e->a]);
+        }
         break;
     case 'w':
         InterlockedExchangeAdd(&s_mouse_wheel, (LONG)e->a);
@@ -836,7 +869,15 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case FB_MENU_POINTER:
         if (w) {
+            POINT p;
             xbox_FramebufferMouseCapture(0);
+            /* Where the cursor is now, so the move its release makes is no
+             * motion. */
+            if (GetCursorPos(&p) && ScreenToClient(h, &p)) {
+                s_mouse_x = p.x; s_mouse_y = p.y; s_mouse_have = 1;
+            }
+            s_pointer_shown = 0;
+            fb_pointer_cursor(h);
         } else if (getenv("RECOMP_KBM") && GetForegroundWindow() == h) {
             const char *nf = getenv("RECOMP_NO_FOCUS");
             if (!(nf && *nf && *nf != '0'))
@@ -844,9 +885,14 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         return 0;
 
+    case FB_HIDE_POINTER:
+        s_pointer_shown = 0;
+        fb_pointer_cursor(h);
+        return 0;
+
     case WM_SETCURSOR:
-        if (LOWORD(l) == HTCLIENT && s_cursor_image && !s_mouse_capture) {
-            SetCursor(s_cursor_image);
+        if (LOWORD(l) == HTCLIENT && !s_mouse_capture && (s_cursor_image || (s_menu_pointer && !s_pointer_shown))) {
+            fb_pointer_cursor(h);
             return TRUE;
         }
         break;
@@ -957,6 +1003,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             }
         } else {
             s_mouse_inside = 1;
+            if (s_menu_pointer && !s_pointer_shown && s_mouse_have && (x != s_mouse_x || y != s_mouse_y)) {
+                s_pointer_shown = 1;
+                SetCursor(s_cursor_image ? s_cursor_image : LoadCursorA(NULL, IDC_ARROW));
+            }
             if (s_mouse_have) {
                 if (x != s_mouse_x || y != s_mouse_y)
                     rec_event("m %d %d", x - s_mouse_x, y - s_mouse_y);
@@ -999,11 +1049,12 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             xbox_FramebufferMouseCapture(1);
         rec_event("b 0 1");
         s_mouse_btn[0] = 1;
+        InterlockedIncrement(&s_mouse_clicks[0]);
         return 0;
     case WM_LBUTTONUP:   rec_event("b 0 0"); s_mouse_btn[0] = 0; return 0;
-    case WM_RBUTTONDOWN: rec_event("b 1 1"); s_mouse_btn[1] = 1; return 0;
+    case WM_RBUTTONDOWN: rec_event("b 1 1"); s_mouse_btn[1] = 1; InterlockedIncrement(&s_mouse_clicks[1]); return 0;
     case WM_RBUTTONUP:   rec_event("b 1 0"); s_mouse_btn[1] = 0; return 0;
-    case WM_MBUTTONDOWN: rec_event("b 2 1"); s_mouse_btn[2] = 1; return 0;
+    case WM_MBUTTONDOWN: rec_event("b 2 1"); s_mouse_btn[2] = 1; InterlockedIncrement(&s_mouse_clicks[2]); return 0;
     case WM_MBUTTONUP:   rec_event("b 2 0"); s_mouse_btn[2] = 0; return 0;
 
     case WM_MOUSEWHEEL:
@@ -1450,6 +1501,7 @@ void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 int xbox_FramebufferMouseDelta(int *dx, int *dy) { if (dx) *dx = 0; if (dy) *dy = 0; return 0; }
 int xbox_FramebufferMouseButton(int which) { (void)which; return 0; }
+int xbox_FramebufferMouseClicks(int which) { (void)which; return 0; }
 int xbox_FramebufferMouseWheel(void) { return 0; }
 void xbox_FramebufferMouseCapture(int on) { (void)on; }
 void *xbox_FramebufferWindowHandle(void) { return NULL; }
@@ -1462,6 +1514,7 @@ void xbox_FramebufferSetFullscreen(int on) { (void)on; }
 void xbox_FramebufferSetWindowAspect(float aspect) { (void)aspect; }
 int xbox_FramebufferFullscreen(void) { return 0; }
 void xbox_FramebufferSetMenuPointer(int on) { (void)on; }
+void xbox_FramebufferHidePointer(void) {}
 int xbox_FramebufferMenuPointer(void) { return 0; }
 int xbox_FramebufferPointer(int *x, int *y, int *width, int *height) { (void)x; (void)y; (void)width; (void)height; return 0; }
 void xbox_FramebufferSetCursorImage(const uint32_t *bgra, int width, int height, int hot_x, int hot_y)
