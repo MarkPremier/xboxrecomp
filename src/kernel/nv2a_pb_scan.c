@@ -66,6 +66,7 @@ uint32_t g_pb_current_va;
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc, const uint32_t *words, uint32_t count);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 
@@ -418,7 +419,24 @@ void nv2a_pb_run(uint32_t put_va)
             if (s_exec_enabled && !s_survey && bulk) {
                 while (st.count && va != put_va && va + 4u <= win_hi && budget &&
                        !(call_end && va == call_end)) {
+                    /* As many as can be taken at once (index lists,
+                     * uploads, padding): up to PUT, the window's end or the
+                     * block's end, whichever is first. */
+                    uint32_t run = st.count, taken;
+                    if (put_va > va && (put_va - va) / 4u < run) run = (put_va - va) / 4u;
+                    if ((win_hi - va) / 4u < run) run = (win_hi - va) / 4u;
+                    if (call_end > va && (call_end - va) / 4u < run) run = (call_end - va) / 4u;
+                    if (budget < run) run = budget;
                     g_pb_current_va = va;
+                    taken = nv2a_pb_exec_run(st.subch, st.method, st.noninc,
+                                             (const uint32_t *)(mem + va), run);
+                    if (taken) {
+                        va += taken * 4u;
+                        budget -= taken;
+                        if (!st.noninc) st.method += taken * 4u;
+                        st.count -= taken;
+                        continue;
+                    }
                     nv2a_pb_exec_method(st.subch, st.method, *(const uint32_t *)(mem + va));
                     va += 4;
                     budget--;

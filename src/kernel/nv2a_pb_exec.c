@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <xmmintrin.h>   /* _mm_prefetch */
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
@@ -3031,6 +3032,14 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
         for (vertex = 0; vertex < vertex_count; vertex++) {
             uint32_t index = indices[vertex];
             uint32_t slot = index & (GPU_VERTEX_SEEN - 1u);
+            /* The next vertex's attributes, while this one converts: its
+             * index is known, and the fetch otherwise waits on memory. */
+            if (program && vertex + 1 < vertex_count)
+                for (stage = 0; stage < gpu_fetch_count; stage++) {
+                    const FastAttr *f = &gpu_fast_attr[gpu_fetch_stages[stage]];
+                    if (f->mode == FAST_ATTR_MEMORY && indices[vertex + 1] <= f->last_index)
+                        _mm_prefetch((const char *)f->base + (size_t)indices[vertex + 1] * f->stride, _MM_HINT_T0);
+                }
             Nv2aGpuVertex *destination;
             if (gpu_vertex_seen[slot].tag == gpu_vertex_serial && gpu_vertex_seen[slot].key == index) {
                 gpu_indices[gpu_index_count++] = gpu_vertex_seen[slot].offset;
@@ -4191,6 +4200,49 @@ static void vertex_program_upload(uint32_t method, uint32_t param)
         if (component == 3)
             s_gpu.constant_load++;
     }
+}
+
+/* A run of a packet's parameters (contiguous words) for nv2a_pb_run: the
+ * ones nv2a_pb_exec_method's fast path would handle -- index lists, vertex-
+ * program and constant uploads, zero no-ops -- in one call. Returns how many
+ * words it took (0: run them one at a time); it stops at the first word it
+ * would not handle. Not while tracing, whose output is per word. */
+uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc, const uint32_t *words, uint32_t count)
+{
+    static int verbose = -1;
+    uint32_t taken = 0;
+    if (verbose < 0) verbose = pb_verbose_trace();
+    if (subch != 0 || verbose || !count) return 0;
+    if (noninc && (method == NV097_ARRAY_ELEMENT16 || method == NV097_ARRAY_ELEMENT32)) {
+        int sixteen = method == NV097_ARRAY_ELEMENT16;
+        if (!require_index_capacity(count * (sixteen ? 2u : 1u), method)) return 0;
+        for (; taken < count; taken++) {
+            uint32_t word = words[taken];
+            if (sixteen) {
+                append_vertex_index(word & 0xFFFFu);
+                append_vertex_index(word >> 16);
+            } else
+                append_vertex_index(word);
+        }
+        if (sixteen) s_gpu.array16_indices += (uint64_t)count * 2;
+        else {
+            s_gpu.array32_indices += count;
+            s_gpu.batch_array32_count += count;
+        }
+        return taken;
+    }
+    if (method >= 0x0B00 && method < 0x0C00) {
+        for (; taken < count && method >= 0x0B00 && method < 0x0C00; taken++) {
+            vertex_program_upload(method, words[taken]);
+            if (!noninc) method += 4;
+        }
+        return taken;
+    }
+    if (noninc && method == 0x0100) {
+        while (taken < count && !words[taken]) taken++;
+        return taken;
+    }
+    return 0;
 }
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
