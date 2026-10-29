@@ -3141,6 +3141,31 @@ static int gpu_batch_rejected(const char *reason)
     return 0;
 }
 
+/* The widescreen squeeze of a 2D draw (nv2a_gpu_d3d11.cpp) goes triangle by
+ * triangle, which tears a screen-wide effect drawn in strips (Turok's
+ * underwater warp): its edge strips stretch, its inner ones squeeze. A small
+ * batch lying on the screen from its left edge to its right is left whole.
+ * Effects projected through a register the backend does not know also come
+ * as 2D, with vertices far off the screen or behind the eye: those keep the
+ * per-triangle rule. Positions from the CPU interpreter, in logical pixels. */
+int nv2a_pb_exec_batch_spans(float width)
+{
+    float margin = width * 0.02f;
+    int reaches_left = 0, reaches_right = 0;
+    uint32_t v;
+    if (!s_gpu.idx_count || s_gpu.idx_count > 1024u) return 0;
+    for (v = 0; v < s_gpu.idx_count; v++) {
+        Nv2aCpuVertex vertex;
+        float x;
+        if (!fetch_shader_vertex(s_gpu.idx[v], &vertex) || !(vertex.output[0][3] > 0)) return 0;
+        x = vertex.output[0][0];
+        if (x < -margin || x > width + margin) return 0;
+        if (x <= margin) reaches_left = 1;
+        if (x >= width - margin) reaches_right = 1;
+    }
+    return reaches_left && reaches_right;
+}
+
 static int gpu_raster_batch(void)
 {
     uint8_t *memory = (uint8_t *)xbox_GetMemoryOffset();

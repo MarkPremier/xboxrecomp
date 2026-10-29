@@ -511,7 +511,9 @@ static float render_scale()
  *   - a 2D draw (a program that projects through neither) is squeezed back to
  *     the middle 4:3 by the geometry shader, triangle by triangle, unless the
  *     triangle reaches the left or right edge: backdrops, fades and edge
- *     effects span the screen, the HUD and text keep their shape.
+ *     effects span the screen, the HUD and text keep their shape. A draw
+ *     that reaches both edges is left whole (nv2a_pb_exec_batch_spans), so
+ *     a full-screen effect drawn in strips stays in one piece.
  *
  * A frame with no 3D draw on the screen (a loading screen, a menu) is a 2D
  * picture made for 4:3: two in a row and the targets go back to 4:3 until a
@@ -4498,7 +4500,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     if (widened > 1.001f) {
         if (projection >= 0)
             for (int component = 0; component < 4; component++) constants.vertex_constants[projection][component] /= widened;
-        else {
+        else if (!nv2a_pb_exec_batch_spans(constants.viewport[0])) {
             constants.viewport[3] = 1.0f / widened;
             squeeze_2d = true;
         }

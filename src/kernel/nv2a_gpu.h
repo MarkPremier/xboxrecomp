@@ -153,6 +153,9 @@ typedef struct Nv2aGpuDraw {
 } Nv2aGpuDraw;
 
 int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, uint32_t count);
+/* During nv2a_gpu_draw: 1 if the batch being drawn reaches both the left and
+ * the right edge of a screen `width` logical pixels wide (nv2a_pb_exec.c). */
+int nv2a_pb_exec_batch_spans(float width);
 /* 1 = queued, 0 = use CPU clear, -1 = native resource failure. */
 int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t color, uint32_t depth);
 int nv2a_gpu_execute_state(const uint32_t program[136][4], const uint32_t valid[136], uint32_t start,
