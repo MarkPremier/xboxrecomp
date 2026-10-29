@@ -1,7 +1,7 @@
 #include "nv2a_gpu.h"
 #include <d3d11.h>
 #include <d3d11_1.h>
-#include <dxgi1_2.h>
+#include <dxgi1_5.h>
 #include <wrl/client.h>
 #include <cstdio>
 #include <cstdlib>
@@ -2774,6 +2774,11 @@ struct Presenter {
     ComPtr<ID3D11ShaderResourceView> pixels_view;
     UINT pixels_width = 0, pixels_height = 0;
     bool failed = false;
+    /* DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING when the system has it: without it
+     * a flip-model window presented with no sync interval still waits on
+     * the compositor, so "vsync off" was held to the refresh rate (and a
+     * variable-refresh display could not follow the frame rate). */
+    UINT flags = 0;
 };
 static Presenter presenter;
 
@@ -2804,7 +2809,7 @@ static bool presenter_ready(HWND window)
         if (!width || !height) return false;   /* minimised: nothing to show */
         if (width != presenter.width || height != presenter.height) {
             presenter.target.Reset();   /* unbound after every present */
-            HRESULT result = presenter.chain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+            HRESULT result = presenter.chain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, presenter.flags);
             if (FAILED(result)) return presenter_failed("resize", result);
             presenter.width = width; presenter.height = height;
             if (!presenter_target()) return false;
@@ -2829,6 +2834,15 @@ static bool presenter_ready(HWND window)
     description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; description.BufferCount = 2;
     description.Scaling = DXGI_SCALING_STRETCH; description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     description.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    {
+        ComPtr<IDXGIFactory5> factory5;
+        BOOL tearing = FALSE;
+        if (SUCCEEDED(factory.As(&factory5)) &&
+                SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof tearing)) &&
+                tearing)
+            presenter.flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    }
+    description.Flags = presenter.flags;
     result = factory->CreateSwapChainForHwnd(device.Get(), window, &description, nullptr, nullptr, &presenter.chain);
     if (FAILED(result)) return presenter_failed("swap chain", result);
     /* The window toggles its own borderless fullscreen (fb_present, Alt+Enter);
@@ -2924,7 +2938,8 @@ static bool present_view(ID3D11ShaderResourceView *view, float u, float v, float
     ID3D11RenderTargetView *no_target = nullptr;
     context->PSSetShaderResources(0, 1, &no_view);
     context->OMSetRenderTargets(1, &no_target, nullptr);
-    HRESULT result = presenter.chain->Present(interval > 0 ? (UINT)interval : 0, 0);
+    HRESULT result = presenter.chain->Present(interval > 0 ? (UINT)interval : 0,
+        interval <= 0 && (presenter.flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) ? DXGI_PRESENT_ALLOW_TEARING : 0);
     if (result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET)
         return presenter_failed("present", result);
     return true;
