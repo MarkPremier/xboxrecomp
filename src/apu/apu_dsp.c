@@ -37,12 +37,22 @@
 #include <inttypes.h>
 
 extern uint8_t *xbox_ApuPhysicalPointer(uint64_t physical, uint32_t bytes);
+extern uint8_t *xbox_ApuScratchPointer(uint64_t physical, uint32_t bytes);
 
 static uint8_t *dsp_ram_address(uint64_t physical, uint32_t bytes)
 {
     if (g_state && g_state->physical_mapper)
         return mcpx_apu_ram_address(physical, bytes);
     return xbox_ApuPhysicalPointer(physical, bytes);
+}
+
+/* The DSPs' scratch and FIFO pages: DirectSound's contiguous allocations,
+ * kept there even when an ordinary translation retags the page
+ * (xbox_ApuScratchPointer). */
+static uint8_t *dsp_dma_address(uint64_t physical, uint32_t bytes)
+{
+    uint8_t *pointer = xbox_ApuScratchPointer(physical, bytes);
+    return pointer ? pointer : dsp_ram_address(physical, bytes);
 }
 
 /* ── Engine selection ────────────────────────────────────────────────────
@@ -344,8 +354,14 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
         }
         uint32_t prd_address = ldl_le_phys(address_space_memory,
                                            sge_base + page_entry * 8 + 0);
-        uint8_t *guest = dsp_ram_address(prd_address + offset_in_page,
-                                                 TARGET_PAGE_SIZE);
+        if (bytes_to_copy > len) {
+            bytes_to_copy = len;
+        }
+        /* Only the bytes copied from this page: a whole page from a mid-page
+         * offset reaches into the next physical page, which need not be
+         * stored with this one -- the lookup then fails and the APU aborts. */
+        uint8_t *guest = dsp_dma_address(prd_address + offset_in_page,
+                                         bytes_to_copy);
 
         /* Diagnostic: force DSP payload writes to ordinary RAM instead of the
          * contiguous redirect, to test whether the write to the window is what
@@ -358,10 +374,6 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
                 guest = (uint8_t *)((uintptr_t)xbox_GetMemoryOffset() +
                                     prd_address + offset_in_page);
             }
-        }
-
-        if (bytes_to_copy > len) {
-            bytes_to_copy = len;
         }
 
         if (dir) {

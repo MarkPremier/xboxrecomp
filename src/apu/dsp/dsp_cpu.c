@@ -663,7 +663,11 @@ void dsp56k_execute_instruction(dsp_core_t* dsp)
             op = lookup_opcode(dsp->cur_inst);
             dsp->pram_opcache[dsp->pc] = op;
         }
-        if (op->emu_func) {
+        if (op == NULL) {
+            /* No entry for the word (garbage run as code): an illegal
+             * instruction, not a crash of the whole game. */
+            emu_undefined(dsp);
+        } else if (op->emu_func) {
             op->emu_func(dsp);
         } else {
             DPRINTF("%x - %s\n", dsp->cur_inst, op->name);

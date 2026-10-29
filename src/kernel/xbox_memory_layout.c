@@ -4065,6 +4065,22 @@ uint8_t *xbox_ApuPhysicalPointer(uint64_t physical, uint32_t bytes)
     return xbox_DmaPhysicalPointer(physical, bytes);
 }
 
+/* The DSPs' scratch pages (the GP's program and mix, the EP's input) are
+ * DirectSound's contiguous allocations, read and written only by the DSPs
+ * once set up. A later ordinary translation of the same page number retags
+ * the page (last writer wins) and sent a DSP to unrelated RAM: Turok's flying
+ * level then ran garbage as the GP's program. Pages a live contiguous block
+ * owns resolve to it even when RECOMP_APU_NO_REDIR keeps voices off the
+ * redirect. */
+uint8_t *xbox_ApuScratchPointer(uint64_t physical, uint32_t bytes)
+{
+    if (g_contig_memory && bytes && physical < CONTIG_ARENA_BYTES &&
+        physical + bytes <= CONTIG_ARENA_BYTES &&
+        contig_block_at((uint32_t)physical, NULL, NULL))
+        return (uint8_t *)g_contig_memory + physical;
+    return xbox_ApuPhysicalPointer(physical, bytes);
+}
+
 
 static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment);
 
