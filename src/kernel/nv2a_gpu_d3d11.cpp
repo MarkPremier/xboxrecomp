@@ -676,6 +676,7 @@ struct VertexVariant {
     std::vector<uint32_t> key;
     ComPtr<ID3D11VertexShader> shader;
     ComPtr<ID3D11InputLayout> layout;
+    uint32_t input_mask = 0;   /* the packed attributes its layout reads */
     uint64_t last_used, bytecode_bytes;
 };
 static std::vector<VertexVariant> vertex_variants;
@@ -1054,6 +1055,7 @@ struct PixelCompileJob {
     std::string vertex_source;
     ComPtr<ID3D11VertexShader> vertex_shader;
     ComPtr<ID3D11InputLayout> vertex_layout;
+    uint32_t vertex_mask = 0;
 };
 static std::mutex pixel_jobs_lock;
 static std::condition_variable pixel_jobs_signal;
@@ -1103,13 +1105,18 @@ static HRESULT compile_vertex_variant(const PixelCompileJob &job, ComPtr<ID3DBlo
                                  "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, code, errors, compile);
 }
 
-static bool create_vertex_objects(ID3DBlob *code, ComPtr<ID3D11VertexShader> &shader, ComPtr<ID3D11InputLayout> &layout)
+/* The layout reads the attributes in `mask` packed in order (nv2a_gpu_draw
+ * uploads only those); the rest -- inputs the program never reads -- alias
+ * the first, as elements may overlap. */
+static bool create_vertex_objects(ID3DBlob *code, ComPtr<ID3D11VertexShader> &shader, ComPtr<ID3D11InputLayout> &layout,
+                                  uint32_t mask)
 {
     D3D11_INPUT_ELEMENT_DESC elements[16] = {};
+    uint32_t packed = 0;
     for (uint32_t attribute = 0; attribute < 16; attribute++) {
         elements[attribute].SemanticName = "TEXCOORD"; elements[attribute].SemanticIndex = attribute;
         elements[attribute].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        elements[attribute].AlignedByteOffset = attribute * 16;   /* the attribute block alone (nv2a_gpu_draw) */
+        elements[attribute].AlignedByteOffset = (mask & (1u << attribute)) ? 16 * packed++ : 0;
         elements[attribute].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
     }
     if (FAILED(device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &shader)) ||
@@ -1134,7 +1141,7 @@ static void pixel_compile_worker()
          * bytecode (long for the generic shader) happens here too. */
         if (job->vertex) {
             if (SUCCEEDED(compile_vertex_variant(*job, job->code, job->errors)))
-                create_vertex_objects(job->code.Get(), job->vertex_shader, job->vertex_layout);
+                create_vertex_objects(job->code.Get(), job->vertex_shader, job->vertex_layout, job->vertex_mask);
         } else if (SUCCEEDED(compile_pixel_variant(*job, job->code, job->errors)) &&
             FAILED(device->CreatePixelShader(job->code->GetBufferPointer(), job->code->GetBufferSize(), nullptr, &job->shader)))
             job->shader.Reset();
@@ -1189,6 +1196,7 @@ static void install_compiled_pixel_shaders()
             variant.key = job->vertex_key;
             variant.shader = job->vertex_shader;
             variant.layout = job->vertex_layout;
+            variant.input_mask = job->vertex_mask;
             variant.bytecode_bytes = job->code->GetBufferSize();
             gpu_timing.vertex_async_compiles++;
             cache_shader_variant(vertex_variants, std::move(variant));
@@ -1248,6 +1256,7 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
     job->vertex_source = vertex_program_source(key, false);
     if (job->vertex_source.empty()) return nullptr;
     job->vertex_key = std::move(key);
+    job->vertex_mask = state.attribute_mask;
     ComPtr<ID3DBlob> code, errors;
     if (FAILED(compile_vertex_variant(*job, code, errors, !async))) {
         if (async && !errors) {
@@ -1262,7 +1271,8 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
     }
     VertexVariant variant;
     variant.key = std::move(job->vertex_key);
-    if (!create_vertex_objects(code.Get(), variant.shader, variant.layout)) return nullptr;
+    if (!create_vertex_objects(code.Get(), variant.shader, variant.layout, state.attribute_mask)) return nullptr;
+    variant.input_mask = state.attribute_mask;
     variant.bytecode_bytes = code->GetBufferSize();
     return cache_shader_variant(vertex_variants, std::move(variant));
 }
@@ -4653,7 +4663,11 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     /* A vertex program reads only the sixteen attributes, so only that block
      * of each vertex is uploaded (256 of its ~400 bytes); the fixed-function
      * path reads only the named fields before it. */
-    UINT vertex_stride = state->vertex_program ? sizeof(vertices[0].attributes) : sizeof(Nv2aGpuVertex) - sizeof(vertices[0].attributes);
+    uint32_t packed_attributes[16], packed_count = 0;
+    if (state->vertex_program)
+        for (uint32_t attribute = 0; attribute < 16; attribute++)
+            if (state->attribute_mask & (1u << attribute)) packed_attributes[packed_count++] = attribute;
+    UINT vertex_stride = state->vertex_program ? packed_count * 16u : sizeof(Nv2aGpuVertex) - sizeof(vertices[0].attributes);
     auto &vertex_stream = vertex_streams[state->vertex_program ? 1 : 0];
     UINT vertex_bytes = count * vertex_stride;
     UINT index_bytes = state->indices ? state->index_count * sizeof(uint32_t) : 0;
@@ -4664,8 +4678,11 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
                     D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER, "geometry", vertex_offset))
         return 0;
     uint8_t *vertex_destination = (uint8_t *)vertex_stream.mapped.pData + vertex_offset;
-    if (state->vertex_program) for (uint32_t vertex = 0; vertex < count; vertex++)
-        std::memcpy(vertex_destination + vertex * vertex_stride, vertices[vertex].attributes, vertex_stride);
+    if (state->vertex_program) for (uint32_t vertex = 0; vertex < count; vertex++) {
+        uint8_t *packed = vertex_destination + vertex * vertex_stride;
+        for (uint32_t a = 0; a < packed_count; a++)
+            std::memcpy(packed + a * 16u, vertices[vertex].attributes[packed_attributes[a]], 16);
+    }
     else for (uint32_t vertex = 0; vertex < count; vertex++)
         std::memcpy(vertex_destination + vertex * vertex_stride, &vertices[vertex], offsetof(Nv2aGpuVertex, attributes));
     UINT index_offset = 0;
@@ -4721,6 +4738,13 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     VertexVariant *guest_vertex = state->vertex_program ? get_vertex_shader(*state, &vertex_pending) : nullptr;
     if (vertex_pending) return 1;   /* its shader is compiling: drawn once it exists */
     if (state->vertex_program && !guest_vertex) return reject("unsupported vertex program");
+    if (guest_vertex && guest_vertex->input_mask != state->attribute_mask) {
+        static unsigned shown;
+        if (shown++ < 8)
+            std::fprintf(stderr, "[GPU-D3D11] vertex layout mask %04X != draw's %04X; draw skipped\n",
+                         guest_vertex->input_mask, state->attribute_mask);
+        return 1;
+    }
     phase_timer.next_phase(gpu_timing.draw_submit);
     UINT stride = vertex_stride, offset = vertex_offset;
     ID3D11Buffer *buffers[] = {vertex_stream.buffer.Get()}, *constants_buffer[] = {constant_buffer.Get()};

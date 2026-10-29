@@ -128,6 +128,9 @@ typedef struct Nv2aGpuDraw {
 	const uint32_t *vertex_valid;
 	const float (*vertex_constants)[4];
 	uint32_t vertex_start, fixed_transform, flat_shading;
+	/* Vertex program: the attributes it reads (bit n = attribute n), the
+	 * ones uploaded, packed in order. */
+	uint32_t attribute_mask;
 	const uint32_t *indices;
 	uint32_t index_count;
 	uint32_t topology, point_size;

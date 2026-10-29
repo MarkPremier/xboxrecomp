@@ -3208,6 +3208,7 @@ static int gpu_raster_batch(void)
             }
             gpu_attribute_mask = fetch_all ? 0xFFFFu : mask;
         }
+        state.attribute_mask = gpu_attribute_mask;
     } else if ((s_gpu.transform_execution_mode & 3u) == 0u && s_gpu.composite_valid == 0xFFFFu) {
         state.fixed_transform = 1; state.vertex_constants = s_gpu.vp_constants;
         state.lighting_enable = s_gpu.lighting_enable; state.specular_enable = s_gpu.specular_enable;
