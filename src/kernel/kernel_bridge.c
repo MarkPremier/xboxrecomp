@@ -3970,8 +3970,13 @@ static void bridge_NtReadFile(void)
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
-     * identical from inside the title -- the first bytes settle it. */
-    {
+     * identical from inside the title -- the first bytes settle it.
+     * RECOMP_READ_LOG=1: a title streaming music or speech reads dozens of
+     * times a second, and the line (unbuffered, flushed) cost its thread a
+     * few percent when always on. */
+    static int read_log = -1;
+    if (read_log < 0) read_log = getenv("RECOMP_READ_LOG") != NULL;
+    if (read_log) {
         const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
         uint32_t got = (uint32_t)ios.Information;
         /* The offset matters as much as the length. A title streaming a pack

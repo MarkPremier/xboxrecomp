@@ -2846,7 +2846,10 @@ static int gpu_decode_volume_texture(void *context, uint32_t level, uint32_t hor
     return sample_texture_bound(&texture, horizontal, vertical, color);
 }
 
-static uint32_t gpu_vertex_tags[65536], gpu_vertex_offsets[65536], gpu_vertex_keys[65536], gpu_vertex_serial;
+/* Vertices already appended in this chunk, by index (low 16 bits): one
+ * entry's tag, full index and offset share a cache line. */
+static struct { uint32_t tag, key, offset; } gpu_vertex_seen[65536];
+static uint32_t gpu_vertex_serial;
 static uint32_t gpu_attribute_mask;
 
 /* fetch_attr's per-call work -- which source, where it starts, how far it may
@@ -2865,6 +2868,10 @@ typedef struct {
 } FastAttr;
 static FastAttr gpu_fast_attr[16];
 static int gpu_fast_attr_ready;
+/* The batch's attributes the program reads (fetched) and the rest (zeroed). */
+static uint8_t gpu_fetch_stages[16], gpu_zero_stages[16];
+static uint32_t gpu_fetch_count, gpu_zero_count;
+static int gpu_zero_unread = -1;
 
 static void fast_attr_prepare(FastAttr *f, const VertexAttr *a)
 {
@@ -2955,17 +2962,25 @@ static void gpu_begin_chunk(void)
 {
     gpu_index_count = 0;
     if (++gpu_vertex_serial == 0) {
-        memset(gpu_vertex_tags, 0, sizeof gpu_vertex_tags);
+        memset(gpu_vertex_seen, 0, sizeof gpu_vertex_seen);
         gpu_vertex_serial = 1;
     }
 }
 
 static int gpu_submit_chunk(Nv2aGpuDraw *state, uint32_t *count);
 
+/* Only for the timings the report prints (RECOMP_PB_REPORT_MS, or
+ * RECOMP_GPU_TIMING); otherwise every call reads 0 and costs no clock read --
+ * it is called around every batch and every DMA lookup. */
 static double gpu_clock_seconds(void)
 {
     static LARGE_INTEGER frequency;
+    static int wanted = -1;
     LARGE_INTEGER counter;
+    if (wanted < 0)
+        wanted = getenv("RECOMP_PB_REPORT_MS") || getenv("RECOMP_GPU_TIMING") || getenv("RECOMP_HITCH_MS");
+    if (!wanted)
+        return 0.0;
     if ((!frequency.QuadPart && (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)) ||
         !QueryPerformanceCounter(&counter)) {
         fprintf(stderr, "[GPU-D3D11] native performance clock failed (win32 %lu)\n", GetLastError());
@@ -2996,9 +3011,17 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
         uint32_t fetch_mask = program ? (gpu_attribute_mask & 0xFFFFu) : 0u;
 
         if (program && !gpu_fast_attr_ready) {
+            if (gpu_zero_unread < 0) {
+                const char *zero = getenv("RECOMP_NV2A_VERTEX_ZERO");
+                gpu_zero_unread = zero && *zero && strcmp(zero, "0") != 0;
+            }
+            gpu_fetch_count = gpu_zero_count = 0;
             for (stage = 0; stage < 16; stage++)
-                if (fetch_mask & (1u << stage))
+                if (fetch_mask & (1u << stage)) {
                     fast_attr_prepare(&gpu_fast_attr[stage], &s_gpu.attr[stage]);
+                    gpu_fetch_stages[gpu_fetch_count++] = (uint8_t)stage;
+                } else
+                    gpu_zero_stages[gpu_zero_count++] = (uint8_t)stage;
             gpu_fast_attr_ready = 1;
         }
 
@@ -3006,12 +3029,12 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
             uint32_t index = indices[vertex];
             uint32_t slot = index & 65535u;
             Nv2aGpuVertex *destination;
-            if (gpu_vertex_tags[slot] == gpu_vertex_serial && gpu_vertex_keys[slot] == index) {
-                gpu_indices[gpu_index_count++] = gpu_vertex_offsets[slot];
+            if (gpu_vertex_seen[slot].tag == gpu_vertex_serial && gpu_vertex_seen[slot].key == index) {
+                gpu_indices[gpu_index_count++] = gpu_vertex_seen[slot].offset;
                 continue;
             }
-            gpu_vertex_tags[slot] = gpu_vertex_serial; gpu_vertex_keys[slot] = index;
-            gpu_vertex_offsets[slot] = *count;
+            gpu_vertex_seen[slot].tag = gpu_vertex_serial; gpu_vertex_seen[slot].key = index;
+            gpu_vertex_seen[slot].offset = *count;
             gpu_indices[gpu_index_count++] = *count;
             destination = &gpu_vertices[(*count)++];
             s_gpu.gpu_unique_vertices++;
@@ -3020,17 +3043,20 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
                  * it does are overwritten by the fetch below. The named fields
                  * (diffuse/specular/texture/...) are unused on this path, so a
                  * whole-struct memset is pure waste. */
-                for (stage = 0; stage < 16; stage++) {
-                    if (fetch_mask & (1u << stage)) {
-                        fast_attr_fetch(&gpu_fast_attr[stage], &s_gpu.attr[stage], index,
-                                        destination->attributes[stage]);
-                        s_gpu.gpu_attribute_fetches++;
-                    } else {
-                        memset(destination->attributes[stage], 0, sizeof destination->attributes[stage]);
-                        s_gpu.gpu_memset_bytes += sizeof destination->attributes[stage];
-                        s_gpu.gpu_attribute_skips++;
-                    }
+                for (stage = 0; stage < gpu_fetch_count; stage++) {
+                    uint32_t a = gpu_fetch_stages[stage];
+                    fast_attr_fetch(&gpu_fast_attr[a], &s_gpu.attr[a], index, destination->attributes[a]);
                 }
+                /* The attributes the program does not read are left as they
+                 * are: the shader translated from the same program reads the
+                 * same inputs (nv_cpu_vertex_input_mask), so nothing ever sees
+                 * them, and zeroing them cost as much as fetching the rest.
+                 * RECOMP_NV2A_VERTEX_ZERO=1 clears them again. */
+                if (gpu_zero_unread)
+                    for (stage = 0; stage < gpu_zero_count; stage++)
+                        memset(destination->attributes[gpu_zero_stages[stage]], 0, sizeof destination->attributes[0]);
+                s_gpu.gpu_attribute_fetches += gpu_fetch_count;
+                s_gpu.gpu_attribute_skips += gpu_zero_count;
                 memcpy(destination->position, destination->attributes[0], sizeof destination->position);
             } else {
                 memset(destination, 0, offsetof(Nv2aGpuVertex, attributes));
@@ -4118,6 +4144,14 @@ void nv2a_pb_exec_indices(uint32_t method, const uint32_t *parameters, uint32_t 
     }
 }
 
+/* See the software-method case in nv2a_pb_exec_method. */
+static int (*g_nv2a_software_native)(uint32_t parameter);
+
+void xbox_Nv2aSetSoftwareMethodNative(int (*handler)(uint32_t parameter))
+{
+    g_nv2a_software_native = handler;
+}
+
 /* SET_TRANSFORM_PROGRAM (0x0B00-0x0B7C) and SET_TRANSFORM_CONSTANT
  * (0x0B80-0x0BFC): one component of the vertex-program slot or constant at
  * the current load cursor; the fourth advances the cursor. */
@@ -4328,8 +4362,34 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         extern void xbox_Nv2aAcknowledgeHandshakes(void);
         if (!param)
             return;
+        {
+            /* RECOMP_SWM_STATS=1: how many software methods of each type
+             * (param & 0x1F) the stream carries, per 5000. */
+            static int stats = -1;
+            static unsigned counts[32], total;
+            if (stats < 0) stats = getenv("RECOMP_SWM_STATS") != NULL;
+            if (stats) {
+                counts[param & 0x1Fu]++;
+                if (++total == 5000) {
+                    char line[512]; int at = 0, t;
+                    for (t = 0; t < 32; t++)
+                        if (counts[t]) at += snprintf(line + at, sizeof line - at, " %d:%u", t, counts[t]);
+                    fprintf(stderr, "[SWM] types:%s\n", line);
+                    memset(counts, 0, sizeof counts);
+                    total = 0;
+                }
+            }
+        }
         if (xbox_Nv2aNativeFencesEnabled()) {
             s_gpu.flush_fence++;
+            /* A title may handle some software methods natively, here on the
+             * executor (xbox_Nv2aSetSoftwareMethodNative): as on hardware,
+             * the stream waits for the method, and no thread hand-off is
+             * paid. Only when no deferred one is still pending, so they stay
+             * in order. */
+            if (g_nv2a_software_native && !xbox_Nv2aSoftwareMethodPending() &&
+                    g_nv2a_software_native(param))
+                return;
             /* Deferred: the routine can wait on the GPU (this thread), so the
              * synchronous form deadlocks -- see kernel_bridge. Never dropping it
              * (re-issue until queued, stall on the 0xC-0xE pushbuffer fixups) is

@@ -87,17 +87,35 @@ static struct {
     uint64_t async_resolved_flip, async_resolved_publish, async_resolved_sync, async_flip_syncs;
 } gpu_timing;
 
+/* The phase timings feed the hitch log (RECOMP_HITCH_MS) and the periodic
+ * report (RECOMP_PB_REPORT_MS), or RECOMP_GPU_TIMING asks for them alone.
+ * Otherwise no clock is read: a draw passes a dozen timers, and the reads
+ * were a few percent of the GPU thread for numbers nobody printed. */
+static bool gpu_timing_wanted()
+{
+    static int wanted = -1;
+    if (wanted < 0)
+        wanted = std::getenv("RECOMP_HITCH_MS") || std::getenv("RECOMP_PB_REPORT_MS") ||
+                 std::getenv("RECOMP_GPU_TIMING");
+    return wanted != 0;
+}
+
 struct GpuTimer {
     double *total;
     std::chrono::steady_clock::time_point start;
-    explicit GpuTimer(double &target) : total(&target), start(std::chrono::steady_clock::now()) {}
+    explicit GpuTimer(double &target) : total(gpu_timing_wanted() ? &target : nullptr) {
+        if (total) start = std::chrono::steady_clock::now();
+    }
     void next_phase(double &target) {
+        if (!total) return;
         auto now = std::chrono::steady_clock::now();
         *total += std::chrono::duration<double>(now - start).count();
         total = &target;
         start = now;
     }
-    ~GpuTimer() { *total += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); }
+    ~GpuTimer() {
+        if (total) *total += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    }
 };
 
 static void report_gpu_samples();
@@ -1091,7 +1109,7 @@ static bool create_vertex_objects(ID3DBlob *code, ComPtr<ID3D11VertexShader> &sh
     for (uint32_t attribute = 0; attribute < 16; attribute++) {
         elements[attribute].SemanticName = "TEXCOORD"; elements[attribute].SemanticIndex = attribute;
         elements[attribute].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        elements[attribute].AlignedByteOffset = (UINT)offsetof(Nv2aGpuVertex, attributes) + attribute * 16;
+        elements[attribute].AlignedByteOffset = attribute * 16;   /* the attribute block alone (nv2a_gpu_draw) */
         elements[attribute].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
     }
     if (FAILED(device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &shader)) ||
@@ -4632,7 +4650,10 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         }
     }
     phase_timer.next_phase(gpu_timing.draw_streams);
-    UINT vertex_stride = state->vertex_program ? sizeof(Nv2aGpuVertex) : sizeof(Nv2aGpuVertex) - sizeof(vertices[0].attributes);
+    /* A vertex program reads only the sixteen attributes, so only that block
+     * of each vertex is uploaded (256 of its ~400 bytes); the fixed-function
+     * path reads only the named fields before it. */
+    UINT vertex_stride = state->vertex_program ? sizeof(vertices[0].attributes) : sizeof(Nv2aGpuVertex) - sizeof(vertices[0].attributes);
     auto &vertex_stream = vertex_streams[state->vertex_program ? 1 : 0];
     UINT vertex_bytes = count * vertex_stride;
     UINT index_bytes = state->indices ? state->index_count * sizeof(uint32_t) : 0;
@@ -4643,7 +4664,8 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
                     D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER, "geometry", vertex_offset))
         return 0;
     uint8_t *vertex_destination = (uint8_t *)vertex_stream.mapped.pData + vertex_offset;
-    if (state->vertex_program) std::memcpy(vertex_destination, vertices, vertex_bytes);
+    if (state->vertex_program) for (uint32_t vertex = 0; vertex < count; vertex++)
+        std::memcpy(vertex_destination + vertex * vertex_stride, vertices[vertex].attributes, vertex_stride);
     else for (uint32_t vertex = 0; vertex < count; vertex++)
         std::memcpy(vertex_destination + vertex * vertex_stride, &vertices[vertex], offsetof(Nv2aGpuVertex, attributes));
     UINT index_offset = 0;
