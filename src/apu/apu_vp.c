@@ -154,20 +154,22 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
+/* The lock bits are only read back by the front end (is_voice_locked), so a
+ * PIO VOICE_LOCK is an atomic bit flip. It used to take d->lock, which the
+ * frame thread holds for a whole frame and lets go of once per frame: with
+ * many 3D voices playing (HRTF, resampling) DirectSound's game thread waited
+ * a frame or more on every lock and unlock -- a fifth of Turok Evolution's
+ * frame time in its busier levels. */
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    qemu_mutex_lock(&d->lock);
-
     uint64_t mask = 1ULL << (v % 64);
+    volatile LONG64 *word = (volatile LONG64 *)&d->vp.voice_locked[v / 64];
     if (lock) {
-        d->vp.voice_locked[v / 64] |= mask;
+        InterlockedOr64(word, (LONG64)mask);
     } else {
-        d->vp.voice_locked[v / 64] &= ~mask;
+        InterlockedAnd64(word, (LONG64)~mask);
     }
-
-    qemu_cond_signal(&d->cond);
-    qemu_mutex_unlock(&d->lock);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
