@@ -69,16 +69,17 @@ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
 
+/* The inventory is only printed under RECOMP_PB_SCAN (nv2a_pb_scan_report),
+ * and counting every word for nothing was a tenth of the executor's time in a
+ * busy Turok Evolution scene. -1 until read. */
+static int s_survey = -1;
+
 static void note(uint32_t subch, uint32_t method)
 {
     uint32_t sub, m;
     int16_t slot;
-    /* The inventory is only printed under RECOMP_PB_SCAN (nv2a_pb_scan_report),
-     * and counting every word for nothing was a tenth of the executor's time
-     * in a busy Turok Evolution scene. */
-    static int surveying = -1;
-    if (surveying < 0) surveying = getenv("RECOMP_PB_SCAN") != NULL;
-    if (!surveying) return;
+    if (s_survey < 0) s_survey = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!s_survey) return;
     if (!s_seen_index_ready) {
         memset(s_seen_index, 0xFF, sizeof s_seen_index);
         s_seen_index_ready = 1;
@@ -271,6 +272,8 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
+    if (s_survey < 0)
+        s_survey = getenv("RECOMP_PB_SCAN") != NULL;
     static int scan = -1;
     if (scan < 0)
         scan = getenv("RECOMP_PB_SCAN") != NULL;
@@ -403,6 +406,26 @@ void nv2a_pb_run(uint32_t put_va)
             }
             if (!st.noninc) st.method += 4;
             st.count--;
+            /* The rest of the packet's parameters, straight through: they
+             * are contiguous, so only PUT, the window, a RunPushBuffer
+             * block's end and the budget can stop them -- the per-word
+             * bookkeeping above is for headers. A packet carries up to
+             * 2047 words and a frame some hundred thousand, mostly index
+             * lists, constants and padding. The diagnostic rings keep each
+             * packet's first word. */
+            static int bulk = -1;
+            if (bulk < 0) bulk = !getenv("RECOMP_PB_BULK") || strcmp(getenv("RECOMP_PB_BULK"), "0") != 0;
+            if (s_exec_enabled && !s_survey && bulk) {
+                while (st.count && va != put_va && va + 4u <= win_hi && budget &&
+                       !(call_end && va == call_end)) {
+                    g_pb_current_va = va;
+                    nv2a_pb_exec_method(st.subch, st.method, *(const uint32_t *)(mem + va));
+                    va += 4;
+                    budget--;
+                    if (!st.noninc) st.method += 4;
+                    st.count--;
+                }
+            }
             continue;
         }
 
