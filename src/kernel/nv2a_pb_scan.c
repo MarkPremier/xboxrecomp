@@ -73,6 +73,12 @@ static void note(uint32_t subch, uint32_t method)
 {
     uint32_t sub, m;
     int16_t slot;
+    /* The inventory is only printed under RECOMP_PB_SCAN (nv2a_pb_scan_report),
+     * and counting every word for nothing was a tenth of the executor's time
+     * in a busy Turok Evolution scene. */
+    static int surveying = -1;
+    if (surveying < 0) surveying = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!surveying) return;
     if (!s_seen_index_ready) {
         memset(s_seen_index, 0xFF, sizeof s_seen_index);
         s_seen_index_ready = 1;

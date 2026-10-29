@@ -3762,8 +3762,24 @@ static int contig_block_at(uint32_t off, uint32_t *start_off, uint32_t *size)
     int i, found = 0;
     int it = 0;
 
+    /* The GPU executor resolves runs of offsets in the same allocation
+     * (vertex arrays, textures, surfaces): try the block that answered last
+     * before scanning the whole table. Checked against the live table under
+     * the same lock, so a block freed or moved since simply misses. */
+    static volatile LONG last_hit = -1;
+
     AcquireSRWLockShared(&g_contig_lock);
     g_cba_calls++;
+    i = (int)last_hit;
+    if (i >= 0 && i < g_contig_block_count && !g_contig_blocks[i].free) {
+        uint32_t s = g_contig_blocks[i].addr - XBOX_CONTIG_BASE;
+        if (off >= s && off < s + g_contig_blocks[i].size) {
+            if (start_off) *start_off = s;
+            if (size)      *size = g_contig_blocks[i].size;
+            ReleaseSRWLockShared(&g_contig_lock);
+            return 1;
+        }
+    }
     for (i = 0; i < g_contig_block_count; i++) {
         uint32_t s;
         it++;
@@ -3774,6 +3790,7 @@ static int contig_block_at(uint32_t off, uint32_t *start_off, uint32_t *size)
             if (start_off) *start_off = s;
             if (size)      *size = g_contig_blocks[i].size;
             found = 1;
+            InterlockedExchange(&last_hit, i);
             break;
         }
     }

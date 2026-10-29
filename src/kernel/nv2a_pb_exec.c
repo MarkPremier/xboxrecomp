@@ -2849,6 +2849,108 @@ static int gpu_decode_volume_texture(void *context, uint32_t level, uint32_t hor
 static uint32_t gpu_vertex_tags[65536], gpu_vertex_offsets[65536], gpu_vertex_keys[65536], gpu_vertex_serial;
 static uint32_t gpu_attribute_mask;
 
+/* fetch_attr's per-call work -- which source, where it starts, how far it may
+ * read, what format -- is the same for every vertex of a batch, and a
+ * vertex-program batch fetches every attribute the program reads for every
+ * vertex. Worked out once per batch (gpu_raster_batch clears `ready`), each
+ * fetch is then an index check and a conversion. Anything unusual -- the
+ * immediate path, an unknown format, an index past the extent -- still goes
+ * through fetch_attr, with its checks and diagnostics. */
+enum { FAST_ATTR_SLOW, FAST_ATTR_FIXED, FAST_ATTR_MEMORY };
+typedef struct {
+    int mode;
+    const uint8_t *base;
+    uint32_t stride, type, size, last_index;
+    float fixed[4];
+} FastAttr;
+static FastAttr gpu_fast_attr[16];
+static int gpu_fast_attr_ready;
+
+static void fast_attr_prepare(FastAttr *f, const VertexAttr *a)
+{
+    uint32_t bytes;
+    uint64_t limit, offset = a->offset;
+
+    f->mode = FAST_ATTR_SLOW;
+    if (s_gpu.immediate_active)
+        return;
+    if (!a->size || !a->stride || (!s_gpu.inline_active && !a->offset)) {
+        /* fetch_attr's answer does not depend on the index here. */
+        fetch_attr(a, 0, f->fixed);
+        f->mode = FAST_ATTR_FIXED;
+        return;
+    }
+    bytes = vertex_attribute_bytes(a);
+    if (!bytes)
+        return;
+    if (s_gpu.inline_active) {
+        limit = (uint64_t)s_gpu.inline_count * 4;
+        f->base = (const uint8_t *)s_gpu.inline_buf + (size_t)offset;
+    } else {
+        if (a->offset >= XBOX_CONTIG_BASE && a->offset < XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+            limit = (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+        else
+            limit = (uint64_t)(g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram) * (1 + XBOX_NUM_MIRRORS);
+        if (limit > (uint64_t)UINT32_MAX + 1u) limit = (uint64_t)UINT32_MAX + 1u;
+        f->base = (const uint8_t *)xbox_GetMemoryOffset() + (size_t)offset;
+    }
+    if (offset + bytes > limit)
+        return;
+    {
+        uint64_t last = (limit - offset - bytes) / a->stride;
+        f->last_index = last > UINT32_MAX ? UINT32_MAX : (uint32_t)last;
+    }
+    f->stride = a->stride; f->type = a->type; f->size = a->size < 4 ? a->size : 4;
+    f->mode = FAST_ATTR_MEMORY;
+}
+
+static inline void fast_attr_fetch(const FastAttr *f, const VertexAttr *a, uint32_t index, float out[4])
+{
+    const uint8_t *p;
+    uint32_t i;
+
+    if (f->mode == FAST_ATTR_FIXED) {
+        memcpy(out, f->fixed, sizeof f->fixed);
+        return;
+    }
+    if (f->mode != FAST_ATTR_MEMORY || index > f->last_index) {
+        fetch_attr(a, index, out);
+        return;
+    }
+    p = f->base + (size_t)index * f->stride;
+    out[0] = out[1] = out[2] = 0.0f;
+    out[3] = 1.0f;
+    switch (f->type) {
+    case 1:
+        for (i = 0; i < f->size; i++)
+            out[i] = fmaxf(-1.0f, (float)((const int16_t *)p)[i] / 32767.0f);
+        return;
+    case 5:
+        for (i = 0; i < f->size; i++)
+            out[i] = (float)((const int16_t *)p)[i];
+        return;
+    case 6:
+        nv_cpu_unpack_normal(*(const uint32_t *)p, out);
+        return;
+    case 0:
+        out[0] = (float)p[2] / 255.0f;
+        out[1] = (float)p[1] / 255.0f;
+        out[2] = (float)p[0] / 255.0f;
+        out[3] = (float)p[3] / 255.0f;
+        return;
+    case 2:
+        memcpy(out, p, (size_t)f->size * 4);
+        return;
+    case 4:
+        for (i = 0; i < f->size; i++)
+            out[i] = (float)p[i] / 255.0f;
+        return;
+    default:
+        fetch_attr(a, index, out);
+        return;
+    }
+}
+
 static void gpu_begin_chunk(void)
 {
     gpu_index_count = 0;
@@ -2893,6 +2995,13 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
         const VertexAttr *tattr0 = texcoord_attr();
         uint32_t fetch_mask = program ? (gpu_attribute_mask & 0xFFFFu) : 0u;
 
+        if (program && !gpu_fast_attr_ready) {
+            for (stage = 0; stage < 16; stage++)
+                if (fetch_mask & (1u << stage))
+                    fast_attr_prepare(&gpu_fast_attr[stage], &s_gpu.attr[stage]);
+            gpu_fast_attr_ready = 1;
+        }
+
         for (vertex = 0; vertex < vertex_count; vertex++) {
             uint32_t index = indices[vertex];
             uint32_t slot = index & 65535u;
@@ -2913,7 +3022,8 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
                  * whole-struct memset is pure waste. */
                 for (stage = 0; stage < 16; stage++) {
                     if (fetch_mask & (1u << stage)) {
-                        fetch_attr(&s_gpu.attr[stage], index, destination->attributes[stage]);
+                        fast_attr_fetch(&gpu_fast_attr[stage], &s_gpu.attr[stage], index,
+                                        destination->attributes[stage]);
                         s_gpu.gpu_attribute_fetches++;
                     } else {
                         memset(destination->attributes[stage], 0, sizeof destination->attributes[stage]);
@@ -3017,6 +3127,7 @@ static int gpu_raster_batch(void)
         gpu_indices = grown; gpu_index_capacity = index_capacity;
     }
     gpu_begin_chunk();
+    gpu_fast_attr_ready = 0;
     if (!s_gpu.combiners_configured) return gpu_batch_rejected("unconfigured combiners");
     /* 16-bit colour targets draw depth only (state.color stays NULL). The
      * backend's colour surfaces are 32-bit throughout, and the 16-bit pass
@@ -4007,6 +4118,32 @@ void nv2a_pb_exec_indices(uint32_t method, const uint32_t *parameters, uint32_t 
     }
 }
 
+/* SET_TRANSFORM_PROGRAM (0x0B00-0x0B7C) and SET_TRANSFORM_CONSTANT
+ * (0x0B80-0x0BFC): one component of the vertex-program slot or constant at
+ * the current load cursor; the fourth advances the cursor. */
+static void vertex_program_upload(uint32_t method, uint32_t param)
+{
+    if (method < 0x0B80) {
+        uint32_t component = ((method - 0x0B00) >> 2) & 3u;
+        if (s_gpu.vp_load < 136) {
+            s_gpu.vp_program[s_gpu.vp_load][component] = param;
+            s_gpu.vp_valid[s_gpu.vp_load] |= 1u << component;
+        }
+        s_gpu.vp_words++;
+        if (component == 3)
+            s_gpu.vp_load++;
+    } else {
+        uint32_t component = ((method - 0x0B80) >> 2) & 3u;
+        if (s_gpu.constant_load < 192)
+            memcpy(&s_gpu.vp_constants[s_gpu.constant_load][component], &param, 4);
+        if (s_gpu.constant_load < 4)
+            s_gpu.composite_valid |= 1u << (s_gpu.constant_load * 4 + component);
+        s_gpu.constant_words++;
+        if (component == 3)
+            s_gpu.constant_load++;
+    }
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -4064,6 +4201,44 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (slot >= 0 && shown[slot]++ < 4)
             fprintf(stderr, "  [GPU] subch %u method 0x%04X param 0x%08X\n",
                     subch, method, param);
+    }
+
+    /* The bulk of a frame's words, straight to their handlers: index lists,
+     * inline vertices, vertex-program and constant uploads, and the zero
+     * no-ops D3D pads with -- three quarters of all words in Turok
+     * Evolution's levels. Below they would each pass a hundred-odd tests
+     * first; none of those tests claims these methods on subchannel 0, so
+     * this is the same dispatch, earlier. */
+    if (subch == 0 && !verbose) {
+        switch (method) {
+        case 0x0100:   /* NO_OPERATION: only a nonzero one does anything */
+            if (!param) return;
+            break;
+        case NV097_ARRAY_ELEMENT16:
+            if (require_index_capacity(2, method)) {
+                append_vertex_index(param & 0xFFFFu);
+                append_vertex_index(param >> 16);
+                s_gpu.array16_indices += 2;
+            }
+            return;
+        case NV097_ARRAY_ELEMENT32:
+            if (require_index_capacity(1, method)) {
+                append_vertex_index(param);
+                s_gpu.array32_indices++;
+                s_gpu.batch_array32_count++;
+            }
+            return;
+        case NV097_INLINE_ARRAY:
+            if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE)
+                s_gpu.inline_buf[s_gpu.inline_count++] = param;
+            return;
+        default:
+            if (method >= 0x0B00 && method < 0x0C00) {
+                vertex_program_upload(method, param);
+                return;
+            }
+            break;
+        }
     }
 
     if (xbox_Nv2aNativeFencesEnabled() && subch < 8) {
@@ -4470,26 +4645,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     #endif
         return;
     }
-    if (method >= 0x0B00 && method < 0x0B80) {
-        uint32_t component = ((method - 0x0B00) >> 2) & 3u;
-        if (s_gpu.vp_load < 136) {
-            s_gpu.vp_program[s_gpu.vp_load][component] = param;
-            s_gpu.vp_valid[s_gpu.vp_load] |= 1u << component;
-        }
-        s_gpu.vp_words++;
-        if (component == 3)
-            s_gpu.vp_load++;
-        return;
-    }
-    if (method >= 0x0B80 && method < 0x0C00) {
-        uint32_t component = ((method - 0x0B80) >> 2) & 3u;
-        if (s_gpu.constant_load < 192)
-            memcpy(&s_gpu.vp_constants[s_gpu.constant_load][component], &param, 4);
-        if (s_gpu.constant_load < 4)
-            s_gpu.composite_valid |= 1u << (s_gpu.constant_load * 4 + component);
-        s_gpu.constant_words++;
-        if (component == 3)
-            s_gpu.constant_load++;
+    if (method >= 0x0B00 && method < 0x0C00) {
+        vertex_program_upload(method, param);
         return;
     }
     if (method >= 0x0A20 && method < 0x0A30) {
