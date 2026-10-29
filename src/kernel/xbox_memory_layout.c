@@ -3598,6 +3598,8 @@ static uint32_t g_contig_next = XBOX_CONTIG_BASE + 0x1000u;
 static struct { uint32_t addr, size; int free; } g_contig_blocks[CONTIG_MAX_BLOCKS];
 static int g_contig_block_count;
 static SRWLOCK g_contig_lock = SRWLOCK_INIT;
+/* Bumped by every change to the block table (see xbox_ContigOwnsOffset). */
+static volatile LONG g_contig_generation;
 
 static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
 {
@@ -3622,6 +3624,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
      * provenance queries need to tell a genuine contiguous allocation from an
      * ordinary-RAM numeric collision at all times. */
     AcquireSRWLockExclusive(&g_contig_lock);
+    InterlockedIncrement(&g_contig_generation);
     size = (size + 4095u) & ~4095u;
     if (size == 0) size = 4096;
 
@@ -3682,6 +3685,7 @@ int xbox_ContiguousFree(uint32_t addr)
     if (!xbox_HeapReclaimEnabled())
         return 0;
     AcquireSRWLockExclusive(&g_contig_lock);
+    InterlockedIncrement(&g_contig_generation);
     for (i = 0; i < g_contig_block_count; i++) {
         if (g_contig_blocks[i].addr != addr || g_contig_blocks[i].free)
             continue;
@@ -3839,8 +3843,25 @@ int xbox_ContiguousOwnsHead(uint32_t offset)
 
 int xbox_ContigOwnsOffset(uint64_t physical)
 {
-    return (physical < CONTIG_ARENA_BYTES)
-        ? contig_block_at((uint32_t)physical, NULL, NULL) : 0;
+    /* The GPU executor asks this for every vertex array and texture it
+     * binds, mostly about the same few blocks: the last block found, kept
+     * per thread, answers without the lock until any allocation or free
+     * (g_contig_generation) could have changed it. */
+    static __declspec(thread) LONG cached_generation = -1;
+    static __declspec(thread) uint32_t cached_start, cached_end;
+    uint32_t start, size;
+    LONG generation;
+    if (physical >= CONTIG_ARENA_BYTES)
+        return 0;
+    generation = InterlockedCompareExchange(&g_contig_generation, 0, 0);
+    if (generation == cached_generation && (uint32_t)physical >= cached_start && (uint32_t)physical < cached_end)
+        return 1;
+    if (!contig_block_at((uint32_t)physical, &start, &size))
+        return 0;
+    cached_generation = generation;
+    cached_start = start;
+    cached_end = start + size;
+    return 1;
 }
 
 /* Pages the APU actually wrote through the redirect (clash diagnostic). */

@@ -2846,9 +2846,12 @@ static int gpu_decode_volume_texture(void *context, uint32_t level, uint32_t hor
     return sample_texture_bound(&texture, horizontal, vertical, color);
 }
 
-/* Vertices already appended in this chunk, by index (low 16 bits): one
- * entry's tag, full index and offset share a cache line. */
-static struct { uint32_t tag, key, offset; } gpu_vertex_seen[65536];
+/* Vertices already appended in this chunk, by index (low 13 bits): one
+ * entry's tag, full index and offset share a cache line, and the table
+ * (96 KB) stays in cache -- at 65536 entries every look-up missed. Two
+ * indices that share a slot only cost a vertex appended twice. */
+#define GPU_VERTEX_SEEN 8192u
+static struct { uint32_t tag, key, offset; } gpu_vertex_seen[GPU_VERTEX_SEEN];
 static uint32_t gpu_vertex_serial;
 static uint32_t gpu_attribute_mask;
 
@@ -3027,7 +3030,7 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
 
         for (vertex = 0; vertex < vertex_count; vertex++) {
             uint32_t index = indices[vertex];
-            uint32_t slot = index & 65535u;
+            uint32_t slot = index & (GPU_VERTEX_SEEN - 1u);
             Nv2aGpuVertex *destination;
             if (gpu_vertex_seen[slot].tag == gpu_vertex_serial && gpu_vertex_seen[slot].key == index) {
                 gpu_indices[gpu_index_count++] = gpu_vertex_seen[slot].offset;
@@ -3191,9 +3194,20 @@ static int gpu_raster_batch(void)
             const char *value = getenv("RECOMP_NV2A_VERTEX_FETCH_ALL");
             fetch_all = value && *value && strcmp(value, "0") != 0;
         }
-        /* Position is retained for the native vertex snapshot even if the program does not read it. */
-        gpu_attribute_mask = fetch_all ? 0xFFFFu :
-            nv_cpu_vertex_input_mask(s_gpu.vp_program, s_gpu.vp_valid, s_gpu.vp_start) | 1u;
+        /* Position is retained for the native vertex snapshot even if the program does not read it.
+         * The mask is the program's: worked out again only after a program
+         * word was loaded (vp_words counts them) or the start moved, not for
+         * every batch. */
+        {
+            static uint64_t mask_words = ~0ull;
+            static uint32_t mask_start = ~0u, mask;
+            if (mask_words != (uint64_t)s_gpu.vp_words || mask_start != s_gpu.vp_start) {
+                mask = nv_cpu_vertex_input_mask(s_gpu.vp_program, s_gpu.vp_valid, s_gpu.vp_start) | 1u;
+                mask_words = (uint64_t)s_gpu.vp_words;
+                mask_start = s_gpu.vp_start;
+            }
+            gpu_attribute_mask = fetch_all ? 0xFFFFu : mask;
+        }
     } else if ((s_gpu.transform_execution_mode & 3u) == 0u && s_gpu.composite_valid == 0xFFFFu) {
         state.fixed_transform = 1; state.vertex_constants = s_gpu.vp_constants;
         state.lighting_enable = s_gpu.lighting_enable; state.specular_enable = s_gpu.specular_enable;
