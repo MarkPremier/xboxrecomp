@@ -101,6 +101,44 @@ static void fb_frame_shown(void)
             last = now;
         }
     }
+    {
+        /* RECOMP_FPS_LOG=<seconds>: one line per period with the frame rate
+         * and the worst frame -- cheap enough to leave on while measuring,
+         * unlike a hitch threshold low enough to log every frame (the
+         * unbuffered writes then cost the flip thread as much as its work). */
+        static double period = -1.0, frequency;
+        static LARGE_INTEGER start, last;
+        static long long frames;
+        static double worst;
+        LARGE_INTEGER now;
+        if (period < 0.0) {
+            const char *e = getenv("RECOMP_FPS_LOG");
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            frequency = (double)f.QuadPart;
+            period = e ? atof(e) : 0.0;
+        }
+        if (period > 0.0) {
+            QueryPerformanceCounter(&now);
+            if (!start.QuadPart) start = now;
+            if (last.QuadPart) {
+                double ms = (double)(now.QuadPart - last.QuadPart) * 1000.0 / frequency;
+                if (ms > worst) worst = ms;
+            }
+            last = now;
+            frames++;
+            {
+                double seconds = (double)(now.QuadPart - start.QuadPart) / frequency;
+                if (seconds >= period) {
+                    fprintf(stderr, "[FPS] %.1f fps (%lld frames in %.2f s), worst %.1f ms\n",
+                            frames / seconds, frames, seconds, worst);
+                    start = now;
+                    frames = 0;
+                    worst = 0.0;
+                }
+            }
+        }
+    }
 }
 
 /* A flip the GPU backend showed straight from its surface. */
