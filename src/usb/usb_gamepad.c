@@ -561,6 +561,27 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+/* Rumble: only changes reach the host (titles resend every frame), and
+ * RECOMP_RUMBLE=0 keeps the motors still. */
+void usb_gamepad_rumble(int pad, uint16_t left, uint16_t right)
+{
+    static int enabled = -1;
+    static uint32_t last[4] = {~0u, ~0u, ~0u, ~0u};
+    uint32_t now = ((uint32_t)left << 16) | right;
+    XBOX_VIBRATION vibration;
+    if (enabled < 0) enabled = !getenv("RECOMP_RUMBLE") || strcmp(getenv("RECOMP_RUMBLE"), "0") != 0;
+    if (!enabled || pad < 0 || pad > 3 || last[pad] == now) return;
+    last[pad] = now;
+    {
+        static unsigned shown;
+        if (shown++ < 6)
+            fprintf(stderr, "[PAD] pad %d rumble %u %u\n", pad + 1, left, right);
+    }
+    vibration.wLeftMotorSpeed = left;
+    vibration.wRightMotorSpeed = right;
+    xbox_InputSetState((DWORD)pad, &vibration);
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;

@@ -677,6 +677,14 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
          * engine-rev rumble on the Crash countdown and then paused with the
          * pad unresponsive. */
         moved = len;
+        /* A rumble report -- 00 06, then the left (large) and right (small)
+         * motor speeds, little-endian -- whether it came on the interrupt
+         * OUT pipe or as SET_REPORT's data stage: on to the host pad. */
+        if (len >= 6) {
+            const uint8_t *p = guest_ptr(cbp, 6);
+            if (p && p[0] == 0x00 && p[1] == 0x06)
+                usb_gamepad_rumble(pad, (uint16_t)(p[2] | (p[3] << 8)), (uint16_t)(p[4] | (p[5] << 8)));
+        }
         if (endpoint == 0) {
             g_setup_pending = 0;
             s_n_out_ep0++;
