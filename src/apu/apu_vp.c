@@ -1073,7 +1073,7 @@ static void voice_process(MCPXAPUState *d,
                           float sample_buf[NUM_SAMPLES_PER_FRAME][2],
                           uint16_t v, int voice_list)
 {
-    assert(v < MCPX_HW_MAX_VOICES);
+    if (v >= MCPX_HW_MAX_VOICES) return;
     bool stereo = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                  NV_PAVS_VOICE_CFG_FMT_STEREO) != 0;
     unsigned int channels = stereo ? 2 : 1;
@@ -1291,6 +1291,20 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             }
 
             uint16_t v = (uint16_t)d->regs[current];
+            /* DirectSound relinks its lists while this walk runs (it does not
+             * take d->lock), so a link read mid-update can name a voice that
+             * does not exist. Following it indexed the per-voice tables out of
+             * bounds -- a crash in Turok Evolution's flying level. End the list
+             * for this frame instead; the next frame walks it whole again. */
+            if (v >= MCPX_HW_MAX_VOICES) {
+                static unsigned reported;
+                if (reported < 16) {
+                    reported++;
+                    fprintf(stderr, "[APU] voice list %d links to voice %u: list ends here this frame\n",
+                            list, v);
+                }
+                break;
+            }
             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
             /* RECOMP_APU_VOICE_TRACE: each list's voices once a second --
