@@ -3986,14 +3986,15 @@ static bool make_sampler(const Nv2aGpuTexture &binding, ComPtr<ID3D11SamplerStat
  * amount, so a heat haze (Turok Evolution's flamethrower: a 128x128 noise
  * map over a 256x256 copy of the screen) breaks into hard-edged blocks, the
  * sharper the higher the render scale. Read filtered instead, the offsets
- * blend and the haze ripples. RECOMP_SMOOTH_BUMP=0 keeps the title's filter. */
+ * blend and the haze ripples. That is not the original look -- the console
+ * draws the blocks too -- so it is opt-in: RECOMP_SMOOTH_BUMP=1. */
 static bool bump_source_smoothing(const Nv2aGpuDraw *state, uint32_t stage, const Nv2aGpuTexture &binding,
                                   Nv2aGpuTexture &smoothed)
 {
     static int enabled = -1;
     if (enabled < 0) {
         const char *value = std::getenv("RECOMP_SMOOTH_BUMP");
-        enabled = !(value && *value == '0');
+        enabled = value && *value && *value != '0';
     }
     if (!enabled) return false;
     bool source = false;
