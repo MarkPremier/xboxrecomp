@@ -3979,6 +3979,40 @@ extern "C" void nv2a_gpu_set_anisotropy(int level)
     forced_anisotropy.store(level >= 16 ? 16u : level >= 8 ? 8u : level >= 4 ? 4u : level >= 2 ? 2u : 1u);
 }
 
+static bool make_sampler(const Nv2aGpuTexture &binding, ComPtr<ID3D11SamplerState> &result);
+
+/* A texture whose texels offset a later stage's lookup (BUMPENVMAP, modes 6
+ * and 7) read point-sampled: each texel moves a square of the screen by one
+ * amount, so a heat haze (Turok Evolution's flamethrower: a 128x128 noise
+ * map over a 256x256 copy of the screen) breaks into hard-edged blocks, the
+ * sharper the higher the render scale. Read filtered instead, the offsets
+ * blend and the haze ripples. RECOMP_SMOOTH_BUMP=0 keeps the title's filter. */
+static bool bump_source_smoothing(const Nv2aGpuDraw *state, uint32_t stage, const Nv2aGpuTexture &binding,
+                                  Nv2aGpuTexture &smoothed)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = std::getenv("RECOMP_SMOOTH_BUMP");
+        enabled = !(value && *value == '0');
+    }
+    if (!enabled) return false;
+    bool source = false;
+    for (uint32_t later = stage + 1; later < 4 && !source; later++) {
+        uint32_t mode = (state->stage_program >> (later * 5)) & 31u;
+        uint32_t from = later == 1 ? 0 : (state->shader_other_stage_input >> (later * 4 + 8)) & 15u;
+        source = (mode == 6 || mode == 7) && from == stage;
+    }
+    if (!source) return false;
+    uint32_t minimum = (binding.filter >> 16) & 255u, maximum = (binding.filter >> 24) & 15u;
+    /* point -> linear: MIN 1 -> 2, 3 -> 4, 5 -> 6; MAG 1 -> 2 */
+    uint32_t smooth_minimum = minimum == 1 || minimum == 3 || minimum == 5 ? minimum + 1 : minimum;
+    uint32_t smooth_maximum = maximum == 1 ? 2u : maximum;
+    if (smooth_minimum == minimum && smooth_maximum == maximum) return false;
+    smoothed = binding;
+    smoothed.filter = (binding.filter & ~0x0FFF0000u) | (smooth_maximum << 24) | (smooth_minimum << 16);
+    return true;
+}
+
 static bool make_sampler(const Nv2aGpuTexture &binding, ComPtr<ID3D11SamplerState> &result)
 {
     uint32_t minimum = (binding.filter >> 16) & 255u, maximum = (binding.filter >> 24) & 15u;
@@ -4630,7 +4664,9 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             shadow_func = 7;                       /* ALWAYS */
         }
         if (!views[stage]) return reject("texture upload or resource alias");
-        if (!make_sampler(binding, samplers[stage])) {
+        Nv2aGpuTexture smoothed;
+        if (bump_source_smoothing(state, stage, binding, smoothed) ? !make_sampler(smoothed, samplers[stage])
+                                                                    : !make_sampler(binding, samplers[stage])) {
             static unsigned shown;   /* which state was refused, not just that one was */
             if (shown++ < 8)
                 std::fprintf(stderr, "[GPU-D3D11] sampler: stage %u filter %08X address %u/%u/%u control0 %08X valid %u\n",
