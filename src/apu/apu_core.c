@@ -114,6 +114,40 @@ uint8_t *mcpx_apu_ram_address(uint64_t addr, uint32_t bytes)
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
 }
 
+/* DirectSound's own structures -- the voice array (VPVADDR), the SGE and SSL
+ * tables, the notifiers, the front end's semaphore -- are contiguous
+ * allocations, written by the title through the contiguous window. The
+ * kernel tags each physical page with its latest translation (last writer
+ * wins), and Turok keeps that rule for the voice processor
+ * (RECOMP_APU_NO_REDIR: its music buffers are ordinary RAM sharing page
+ * numbers with contiguous blocks). So an ordinary page given the number of the
+ * voice array's would have the voice processor read that RAM as voices and
+ * write its envelopes and offsets into it. A flying-level soak showed that
+ * pattern after nine clean level restarts -- every voice suddenly garbage
+ * (links to voice 20866, 29-channel ADPCM), then the game crashing in its
+ * heap -- though not yet caught in the act (RECOMP_APU_DS_TRACE reports it).
+ * These structures resolve as the DSPs' scratch does: a live contiguous block
+ * owning the page wins. Sample data keeps the mapper. */
+extern uint8_t *xbox_ApuScratchPointer(uint64_t physical, uint32_t bytes);
+
+uint8_t *mcpx_apu_ds_address(uint64_t addr, uint32_t bytes)
+{
+    uint8_t *pointer = g_state && g_state->physical_mapper ? xbox_ApuScratchPointer(addr, bytes) : NULL;
+    static int trace = -1;   /* RECOMP_APU_DS_TRACE: when the two would differ */
+    if (trace < 0) trace = getenv("RECOMP_APU_DS_TRACE") != NULL;
+    if (trace && pointer && pointer != g_state->physical_mapper(addr, bytes)) {
+        static uint32_t last_page = ~0u;
+        static unsigned int reported;
+        if ((uint32_t)(addr >> 12) != last_page && reported < 64) {
+            last_page = (uint32_t)(addr >> 12);
+            reported++;
+            fprintf(stderr, "[APU-DS] page 0x%llX: an ordinary retag, kept on its contiguous block\n",
+                    (unsigned long long)addr & ~0xFFFull);
+        }
+    }
+    return pointer ? pointer : mcpx_apu_ram_address(addr, bytes);
+}
+
 /* `bytes` from physical `addr`, a page at a time: consecutive physical pages
  * need not be stored together here (see xbox_DmaPhysicalPointer), so an
  * extent across a page boundary is looked up page by page. */
@@ -331,7 +365,7 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case NV_PAPU_FEMEMDATA:
         /* 'magic write' - value written to FEMEMADDR on notify completion */
-        stl_le_phys(address_space_memory, d->regs[NV_PAPU_FEMEMADDR], (uint32_t)val);
+        ds_stl(d->regs[NV_PAPU_FEMEMADDR], (uint32_t)val);
         qatomic_set(&d->regs[addr], (uint32_t)val);
         break;
     default:
@@ -650,6 +684,66 @@ static void throttle(MCPXAPUState *d)
 
 static double g_apu_yield_s;     /* RECOMP_APU_DIAG: time given away to the title */
 
+/* Containment. The emulated APU walks voice lists, SGE tables and DSP code
+ * that the title is rewriting as it goes, with no lock between them (on
+ * hardware a half-written value only plays a wrong sample); each crash so
+ * far was such a value used as an index or a size. Those found are checked
+ * (out_of_range in apu_vp.c, dsp_out_of_range, fifo_empty_range); a fault
+ * still raised by the voice processor, the DSPs or a register write costs
+ * that frame's or write's sound instead of the game -- none of them takes a
+ * lock of its own, so none is left held. The VEH still logs each fault in
+ * full before it comes here. After 64 the stage is left off: sound stops,
+ * the game goes on (register writes still run, as DirectSound waits on them). */
+static volatile LONG g_apu_faults;
+
+static int apu_fault_filter(unsigned long code)
+{
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static bool apu_fault_limit(void)
+{
+    return g_apu_faults >= 64;
+}
+
+static void apu_fault_report(const char *where, unsigned long code)
+{
+    LONG n = InterlockedIncrement(&g_apu_faults);
+    fprintf(stderr, "[APU] fault %08lX in %s contained (%ld so far)%s\n", code, where, n,
+            n == 64 ? ": audio emulation stopped, the game goes on" : "");
+}
+
+static void se_stage(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], bool dsp)
+{
+    unsigned long code = 0;
+    if (apu_fault_limit()) return;
+    __try {
+        if (dsp) mcpx_apu_dsp_frame(d, mixbins);
+        else mcpx_apu_vp_frame(d, mixbins);
+    } __except (apu_fault_filter(code = GetExceptionCode())) {
+        memset(mixbins, 0, sizeof(float) * NUM_MIXBINS * NUM_SAMPLES_PER_FRAME);
+        apu_fault_report(dsp ? "the DSP frame" : "the voice processor", code);
+    }
+}
+
+static void apu_write_guarded(void (*write)(void *, hwaddr, uint64_t, unsigned int),
+                              MCPXAPUState *d, hwaddr addr, uint64_t val, unsigned int size)
+{
+    unsigned long code = 0;
+    __try {   /* not skipped past the limit: DirectSound waits on its writes */
+        write(d, addr, val, size);
+    } __except (apu_fault_filter(code = GetExceptionCode())) {
+        apu_fault_report("a register write", code);
+    }
+}
+
 static void se_frame(MCPXAPUState *d)
 {
     mcpx_apu_update_dsp_preference(d);
@@ -681,9 +775,9 @@ static void se_frame(MCPXAPUState *d)
         if (diag < 0) diag = getenv("RECOMP_APU_DIAG") != NULL;
         if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
         QueryPerformanceCounter(&t0);
-        mcpx_apu_vp_frame(d, mixbins);
+        se_stage(d, mixbins, false);
         QueryPerformanceCounter(&t1);
-        mcpx_apu_dsp_frame(d, mixbins);
+        se_stage(d, mixbins, true);
         QueryPerformanceCounter(&t2);
         mcpx_apu_monitor_frame(d);
         QueryPerformanceCounter(&t3);
@@ -932,27 +1026,27 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
         /* VP region */
         hwaddr vp_addr = addr - 0x20000;
         if (is_write) {
-            mcpx_apu_vp_write(d, vp_addr, val, size);
+            apu_write_guarded(mcpx_apu_vp_write, d, vp_addr, val, size);
         }
         /* VP reads handled by caller if needed */
     } else if (addr >= 0x30000 && addr < 0x40000) {
         /* GP region */
         if (is_write) {
             qemu_mutex_lock(&d->lock);
-            mcpx_apu_gp_write(d, addr - 0x30000, val, size);
+            apu_write_guarded(mcpx_apu_gp_write, d, addr - 0x30000, val, size);
             qemu_mutex_unlock(&d->lock);
         }
     } else if (addr >= 0x50000 && addr < 0x60000) {
         /* EP region */
         if (is_write) {
             qemu_mutex_lock(&d->lock);
-            mcpx_apu_ep_write(d, addr - 0x50000, val, size);
+            apu_write_guarded(mcpx_apu_ep_write, d, addr - 0x50000, val, size);
             qemu_mutex_unlock(&d->lock);
         }
     } else if (addr < 0x20000) {
         /* Main APU registers */
         if (is_write) {
-            mcpx_apu_write(d, addr, val, size);
+            apu_write_guarded(mcpx_apu_write, d, addr, val, size);
         }
     }
 }

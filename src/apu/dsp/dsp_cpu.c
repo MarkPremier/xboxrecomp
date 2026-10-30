@@ -658,10 +658,12 @@ void dsp56k_execute_instruction(dsp_core_t* dsp)
     }
 
     if (dsp->cur_inst < 0x100000) {
-        const OpcodeEntry *op = dsp->pram_opcache[dsp->pc];
+        /* The cache covers program memory; code run from past it (see
+         * dsp_out_of_range) is looked up each time. */
+        const OpcodeEntry *op = dsp->pc < DSP_PRAM_SIZE ? dsp->pram_opcache[dsp->pc] : NULL;
         if (op == NULL) {
             op = lookup_opcode(dsp->cur_inst);
-            dsp->pram_opcache[dsp->pc] = op;
+            if (dsp->pc < DSP_PRAM_SIZE) dsp->pram_opcache[dsp->pc] = op;
         }
         if (op == NULL) {
             /* No entry for the word (garbage run as code): an illegal
@@ -955,10 +957,26 @@ static void dsp_postexecute_interrupts(dsp_core_t* dsp)
  *  Read/Write memory functions
  **********************************/
 
+/* Out-of-range DSP addresses: garbage the title or a stray DMA node left as
+ * code or as a transfer's target (Turok Evolution's flying level ran the GP
+ * on such code). With the asserts compiled out, a write past an array landed
+ * in the rest of the DSP state; it is dropped, and a read past program
+ * memory sees 0, a NOP. The first few are logged. */
+static void dsp_out_of_range(const char *what, uint32_t address)
+{
+    static unsigned int reported;
+    if (reported < 16) {
+        reported++;
+        fprintf(stderr, "[APU-DSP] %s at %06X is past its memory: ignored\n", what, address);
+    }
+}
+
 static uint32_t read_memory_p(dsp_core_t* dsp, uint32_t address)
 {
-    assert((address & 0xFF000000) == 0);
-    assert(address < DSP_PRAM_SIZE);
+    if (address >= DSP_PRAM_SIZE) {
+        dsp_out_of_range("p read", address);
+        return 0;
+    }
     uint32_t r = ldl_le_p(&dsp->pram[address]);
     assert((r & 0xFF000000) == 0);
     return r;
@@ -1021,14 +1039,23 @@ static void write_memory_raw(dsp_core_t* dsp, int space, uint32_t address, uint3
         } else if (address >= 0xc00 && address < 0xc00+DSP_MIXBUFFER_SIZE) {
             dsp->mixbuffer[address-0xc00] = value;
         } else {
-            assert(address < DSP_XRAM_SIZE);
+            if (address >= DSP_XRAM_SIZE) {
+                dsp_out_of_range("x write", address);
+                return;
+            }
             dsp->xram[address] = value;
         }
     } else if (space == DSP_SPACE_Y) {
-        assert(address < DSP_YRAM_SIZE);
+        if (address >= DSP_YRAM_SIZE) {
+            dsp_out_of_range("y write", address);
+            return;
+        }
         dsp->yram[address] = value;
     } else if (space == DSP_SPACE_P) {
-        assert(address < DSP_PRAM_SIZE);
+        if (address >= DSP_PRAM_SIZE) {
+            dsp_out_of_range("p write", address);
+            return;
+        }
         stl_le_p(&dsp->pram[address], value);
         dsp->pram_opcache[address] = NULL;
     } else {

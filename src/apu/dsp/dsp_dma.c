@@ -105,7 +105,17 @@ static void dsp_dma_run(DSPDMAState *s)
         return;
     }
 
+    /* A node list the title is still writing can lead back on itself; the
+     * walk would never end, and it runs on the audio thread holding the APU
+     * lock. A frame's list is a handful of nodes. */
+    unsigned int nodes = 0;
     while (!(s->next_block & NODE_POINTER_EOL)) {
+        if (++nodes > 4096) {
+            static unsigned int reported;
+            if (reported++ < 16)
+                fprintf(stderr, "[APU-DSP] DMA node list runs past 4096 nodes: stopped\n");
+            break;
+        }
         uint32_t addr = s->next_block & NODE_POINTER_VAL;
         uint32_t block_addr = 0;
         int block_space = DSP_SPACE_X;

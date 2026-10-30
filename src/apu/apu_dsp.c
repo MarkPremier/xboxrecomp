@@ -484,6 +484,25 @@ static void ep_scratch_rw(void *opaque, uint8_t *ptr, uint32_t addr, size_t len,
                       ptr, addr, len, dir);
 }
 
+/* A FIFO whose end is not past its base -- a register the title had not
+ * finished writing -- has no room: a transfer through it divided by zero
+ * (cur % (end - base)) or copied nothing forever. It is skipped, a read
+ * seeing silence. */
+static bool fifo_empty_range(MCPXAPUState *d, const char *dsp, bool dir, unsigned int index,
+                             uint32_t base, uint32_t end, uint8_t *ptr, size_t len)
+{
+    static unsigned int reported;
+    (void)d;
+    if (end > base) return false;
+    if (reported < 16) {
+        reported++;
+        fprintf(stderr, "[APU] %s %s FIFO %u has no room (base %06X end %06X): skipped\n",
+                dsp, dir ? "output" : "input", index, base, end);
+    }
+    if (!dir) memset(ptr, 0, len);
+    return true;
+}
+
 static uint32_t circular_scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
                                            unsigned int max_sge, uint8_t *ptr,
                                            uint32_t base, uint32_t end,
@@ -543,8 +562,12 @@ static void gp_fifo_rw(void *opaque, uint8_t *ptr, unsigned int index,
 
     uint32_t cur = GET_MASK(d->regs[cur_reg], NV_PAPU_GPOFCUR0_VALUE);
 
+    if (fifo_empty_range(d, "GP", dir, index, base, end, ptr, len)) return;
+
     /* DSP hangs if current >= end; but forces current >= base */
-    assert(cur < end);
+    if (cur >= end) {
+        cur = base;
+    }
     if (cur < base) {
         cur = base;
     }
@@ -599,11 +622,14 @@ static void ep_fifo_rw(void *opaque, uint8_t *ptr, unsigned int index,
     if (dir && index == 0) {
         bool did_sink = ep_sink_samples(d, ptr, len);
         if (did_sink) {
-            /* Since we are sinking, push silence out */
-            assert(len <= sizeof(ep_silence));
-            ptr = (uint8_t*)ep_silence;
+            /* Since we are sinking, push silence out (a longer transfer
+             * keeps its own bytes rather than read past the silence) */
+            if (len <= sizeof(ep_silence))
+                ptr = (uint8_t*)ep_silence;
         }
     }
+
+    if (fifo_empty_range(d, "EP", dir, index, base, end, ptr, len)) return;
 
     /* DSP hangs if current >= end; but forces current >= base */
     if (cur >= end) {

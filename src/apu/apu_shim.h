@@ -97,6 +97,12 @@ extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
 /* Where a physical address the title handed the APU lives. See apu_core.c. */
 uint8_t *mcpx_apu_phys(uint64_t addr);
 uint8_t *mcpx_apu_ram_address(uint64_t addr, uint32_t bytes);
+/* DirectSound's own structures (voices, SGE and SSL tables, notifiers): a
+ * live contiguous block owning the page wins over a later retag. See apu_core.c. */
+uint8_t *mcpx_apu_ds_address(uint64_t addr, uint32_t bytes);
+static inline uint32_t ds_ldl(hwaddr addr) { return *(uint32_t *)mcpx_apu_ds_address(addr, 4); }
+static inline void ds_stl(hwaddr addr, uint32_t val) { *(uint32_t *)mcpx_apu_ds_address(addr, 4) = val; }
+static inline void ds_stb(hwaddr addr, uint8_t val) { *mcpx_apu_ds_address(addr, 1) = val; }
 /* A copy of `bytes` from physical `addr` that may cross pages. */
 void mcpx_apu_ram_copy(uint64_t addr, void *destination, uint32_t bytes);
 
