@@ -85,9 +85,22 @@ uint8_t *mcpx_apu_ram_address(uint64_t addr, uint32_t bytes)
         uint8_t *pointer = g_state->physical_mapper(addr, bytes);
         if (pointer)
             return pointer;
-        fprintf(stderr, "[APU] unmapped DMA address 0x%llX + %u\n",
-                (unsigned long long)addr, bytes);
-        abort();
+        /* An address the mapper cannot place costs that access, not the
+         * game: reads see silence, writes go nowhere. (It used to abort,
+         * which took the whole program down for one bad audio fetch.) */
+        static uint8_t junk[65536];
+        static unsigned reported;
+        if (reported < 16) {
+            reported++;
+            fprintf(stderr, "[APU] unmapped DMA address 0x%llX + %u: silence\n",
+                    (unsigned long long)addr, bytes);
+        }
+        if (bytes > sizeof junk) {
+            fprintf(stderr, "[APU] unmapped DMA extent too large to stand in for\n");
+            abort();
+        }
+        memset(junk, 0, bytes);
+        return junk;
     }
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
     size_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
@@ -99,6 +112,22 @@ uint8_t *mcpx_apu_ram_address(uint64_t addr, uint32_t bytes)
     if (a < mapped)
         return g_apu_ram_ptr + a;
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+}
+
+/* `bytes` from physical `addr`, a page at a time: consecutive physical pages
+ * need not be stored together here (see xbox_DmaPhysicalPointer), so an
+ * extent across a page boundary is looked up page by page. */
+void mcpx_apu_ram_copy(uint64_t addr, void *destination, uint32_t bytes)
+{
+    uint8_t *out = (uint8_t *)destination;
+    while (bytes) {
+        uint32_t chunk = 4096u - (uint32_t)(addr & 4095u);
+        if (chunk > bytes) chunk = bytes;
+        memcpy(out, mcpx_apu_ram_address(addr, chunk), chunk);
+        out += chunk;
+        addr += chunk;
+        bytes -= chunk;
+    }
 }
 
 /* The interrupt line, as the frame thread sees it. update_irq used to call
