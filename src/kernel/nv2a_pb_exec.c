@@ -420,7 +420,13 @@ typedef struct {
 
 #define NV_VERTEX_ATTRS 16
 #define NV_VERTEX_CACHE_SIZE 4096
-#define NV_MAX_INLINE   4096            /* dwords of INLINE_ARRAY per batch */
+/* Dwords of INLINE_ARRAY per batch. The NV2A has no such limit: at 4096 a
+ * batch of particle quads stopped at 682 vertices and the rest were dropped
+ * unseen -- Turok's blood splats, which Keep decals lets pile up, vanished
+ * by where the camera looked. 1 MB holds 43690 such vertices, within the
+ * backend's NV2A_GPU_MAX_VERTICES. */
+#define NV_MAX_INLINE   (1u << 18)
+#define NV_MAX_IMMEDIATE 4096          /* dwords of immediate-mode vertices per batch */
 
 /* Texture stage 0, decoded from what the title programmed.
  *
@@ -463,7 +469,7 @@ static struct {
     uint32_t   imm_diffuse;
     float      imm_tex[2];
     uint32_t   imm_count;
-    float      imm_attributes[NV_MAX_INLINE / IMM_VERTEX_DWORDS][NV_VERTEX_ATTRS][4];
+    float      imm_attributes[NV_MAX_IMMEDIATE / IMM_VERTEX_DWORDS][NV_VERTEX_ATTRS][4];
     int        immediate_active;
     int        inline_active;
     uint32_t   draws, verts, nonzero_draws;
@@ -4002,7 +4008,7 @@ static void imm_emit_vertex(void)
 {
     uint32_t at = s_gpu.imm_count * IMM_VERTEX_DWORDS;
 
-    if (!s_gpu.prim || at + IMM_VERTEX_DWORDS > NV_MAX_INLINE)
+    if (!s_gpu.prim || at + IMM_VERTEX_DWORDS > NV_MAX_IMMEDIATE)
         return;
     for (uint32_t attribute = 0; attribute < NV_VERTEX_ATTRS; attribute++) {
         float *value = s_gpu.imm_attributes[s_gpu.imm_count][attribute];

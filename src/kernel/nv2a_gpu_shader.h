@@ -360,7 +360,11 @@ PixelOutput finish_pixel(float4 color,Pixel input,bool frontFacing) {
  output.color=color;
  float depth=NV_W_DEPTH?input.depthW:input.depthZ;
  if(NV_W_DEPTH && (!(depth>0) || !isfinite(depth)))depth=3.402823466e38;
- else if((frontFacing?depthOffset.z:depthOffset.w)!=0) {
+ /* The depth range clips the primitive as it is; polygon offset comes
+    after and is only clamped. Clipping the offset depth threw away decals
+    seen at a grazing angle -- their slope term is large -- whole. */
+ float clipDepth=depth;
+ if(!(NV_W_DEPTH && depth==3.402823466e38) && (frontFacing?depthOffset.z:depthOffset.w)!=0) {
   float slopeOffset=0;
   if(depthOffset.x!=0) {
    slopeOffset=depthOffset.x*input.depthSlope;
@@ -370,9 +374,8 @@ PixelOutput finish_pixel(float4 color,Pixel input,bool frontFacing) {
   depth+=slopeOffset;
   if(NV_W_DEPTH && isnan(depth))depth=3.402823466e38;
  }
- if(depthRange.z==0) {
-  if(depth<depthRange.x || depth>depthRange.y)discard;
- } else depth=clamp(depth,depthRange.x,depthRange.y);
+ if(depthRange.z==0 && (clipDepth<depthRange.x || clipDepth>depthRange.y))discard;
+ depth=clamp(depth,depthRange.x,depthRange.y);
 #if defined(NV_DEPTH_ENABLED) && !NV_DEPTH_ENABLED
  output.depth=0;
 #else
