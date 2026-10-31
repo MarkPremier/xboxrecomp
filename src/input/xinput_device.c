@@ -26,6 +26,10 @@
 
 #include <xinput.h>
 #pragma comment(lib, "xinput.lib")
+#include "dualsense.h"
+
+/* The host slot a Sony pad (dualsense.c) stands in, beside XInput's 0-3. */
+#define SONY_SLOT 0x100u
 
 static LONG g_reported_slot[XBOX_MAX_CONTROLLERS] = { -1, -1, -1, -1 };
 static int g_host_slot = -1;
@@ -860,6 +864,12 @@ static DWORD poll_host(DWORD port, XINPUT_STATE *state, DWORD *host_slot)
     if (g_host_slot >= 0 && port == 0) {
         DWORD result = XInputGetState((DWORD)g_host_slot, state);
         LONG selected = result == ERROR_SUCCESS ? g_host_slot : -1;
+        if (result == ERROR_DEVICE_NOT_CONNECTED && xbox_SonyPadState(state)) {
+            if (InterlockedExchange(&g_reported_slot[port], (LONG)SONY_SLOT) != (LONG)SONY_SLOT)
+                fprintf(stderr, "[XINPUT] Sony pad -> Xbox port 0\n");
+            *host_slot = SONY_SLOT;
+            return ERROR_SUCCESS;
+        }
         LONG previous = InterlockedExchange(&g_reported_slot[port], selected);
         if (selected >= 0 && previous != selected)
             fprintf(stderr, "[XINPUT] selected host slot %d -> Xbox port 0\n", g_host_slot);
@@ -886,6 +896,13 @@ static DWORD poll_host(DWORD port, XINPUT_STATE *state, DWORD *host_slot)
             *host_slot = slot;
             return ERROR_SUCCESS;
         }
+    }
+    /* A Sony pad takes the first port no XInput pad has. */
+    if (connected == wanted && xbox_SonyPadState(state)) {
+        if (InterlockedExchange(&g_reported_slot[port], (LONG)SONY_SLOT) != (LONG)SONY_SLOT)
+            fprintf(stderr, "[XINPUT] Sony pad -> Xbox port %lu\n", port);
+        *host_slot = SONY_SLOT;
+        return ERROR_SUCCESS;
     }
     if (InterlockedExchange(&g_reported_slot[port], -1) != -1)
         fprintf(stderr, "[XINPUT] Xbox port %lu disconnected\n", port);
@@ -1002,6 +1019,10 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 
     result = poll_host(dwPort, &state, &slot);
     if (result != ERROR_SUCCESS) return result;
+    if (slot == SONY_SLOT) {
+        xbox_SonyPadRumble(pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed);
+        return ERROR_SUCCESS;
+    }
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
     return XInputSetState(slot, &xi_vib);
@@ -1027,6 +1048,12 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 
     result = poll_host(dwPort, &state, &slot);
     if (result != ERROR_SUCCESS) return result;
+    if (slot == SONY_SLOT) {
+        memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
+        pCaps->Type = XINPUT_DEVTYPE_GAMEPAD;
+        pCaps->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+        return ERROR_SUCCESS;
+    }
     result = XInputGetCapabilities(slot, dwFlags, &xi_caps);
     if (result != ERROR_SUCCESS) return result;
 
