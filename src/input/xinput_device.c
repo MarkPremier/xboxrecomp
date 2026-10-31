@@ -26,10 +26,10 @@
 
 #include <xinput.h>
 #pragma comment(lib, "xinput.lib")
-#include "dualsense.h"
+#include "hid_pads.h"
 
-/* The host slot a Sony pad (dualsense.c) stands in, beside XInput's 0-3. */
-#define SONY_SLOT 0x100u
+/* The host slot a HID pad (hid_pads.c) stands in, beside XInput's 0-3. */
+#define HIDPAD_SLOT 0x100u
 
 static LONG g_reported_slot[XBOX_MAX_CONTROLLERS] = { -1, -1, -1, -1 };
 static int g_host_slot = -1;
@@ -864,10 +864,10 @@ static DWORD poll_host(DWORD port, XINPUT_STATE *state, DWORD *host_slot)
     if (g_host_slot >= 0 && port == 0) {
         DWORD result = XInputGetState((DWORD)g_host_slot, state);
         LONG selected = result == ERROR_SUCCESS ? g_host_slot : -1;
-        if (result == ERROR_DEVICE_NOT_CONNECTED && xbox_SonyPadState(state)) {
-            if (InterlockedExchange(&g_reported_slot[port], (LONG)SONY_SLOT) != (LONG)SONY_SLOT)
-                fprintf(stderr, "[XINPUT] Sony pad -> Xbox port 0\n");
-            *host_slot = SONY_SLOT;
+        if (result == ERROR_DEVICE_NOT_CONNECTED && xbox_HidPadState(state)) {
+            if (InterlockedExchange(&g_reported_slot[port], (LONG)HIDPAD_SLOT) != (LONG)HIDPAD_SLOT)
+                fprintf(stderr, "[XINPUT] HID pad -> Xbox port 0\n");
+            *host_slot = HIDPAD_SLOT;
             return ERROR_SUCCESS;
         }
         LONG previous = InterlockedExchange(&g_reported_slot[port], selected);
@@ -897,11 +897,11 @@ static DWORD poll_host(DWORD port, XINPUT_STATE *state, DWORD *host_slot)
             return ERROR_SUCCESS;
         }
     }
-    /* A Sony pad takes the first port no XInput pad has. */
-    if (connected == wanted && xbox_SonyPadState(state)) {
-        if (InterlockedExchange(&g_reported_slot[port], (LONG)SONY_SLOT) != (LONG)SONY_SLOT)
-            fprintf(stderr, "[XINPUT] Sony pad -> Xbox port %lu\n", port);
-        *host_slot = SONY_SLOT;
+    /* A HID pad takes the first port no XInput pad has. */
+    if (connected == wanted && xbox_HidPadState(state)) {
+        if (InterlockedExchange(&g_reported_slot[port], (LONG)HIDPAD_SLOT) != (LONG)HIDPAD_SLOT)
+            fprintf(stderr, "[XINPUT] HID pad -> Xbox port %lu\n", port);
+        *host_slot = HIDPAD_SLOT;
         return ERROR_SUCCESS;
     }
     if (InterlockedExchange(&g_reported_slot[port], -1) != -1)
@@ -1019,8 +1019,8 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 
     result = poll_host(dwPort, &state, &slot);
     if (result != ERROR_SUCCESS) return result;
-    if (slot == SONY_SLOT) {
-        xbox_SonyPadRumble(pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed);
+    if (slot == HIDPAD_SLOT) {
+        xbox_HidPadRumble(pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed);
         return ERROR_SUCCESS;
     }
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
@@ -1048,7 +1048,7 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 
     result = poll_host(dwPort, &state, &slot);
     if (result != ERROR_SUCCESS) return result;
-    if (slot == SONY_SLOT) {
+    if (slot == HIDPAD_SLOT) {
         memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
         pCaps->Type = XINPUT_DEVTYPE_GAMEPAD;
         pCaps->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
