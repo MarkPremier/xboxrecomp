@@ -203,6 +203,39 @@ static int xbox_TiledAliasMappable(uintptr_t base, size_t tiled_size)
     return view != NULL;
 }
 
+/* Are the fixed guest windows the layout maps later -- the contiguous
+ * window, the NV2A, MCPX and flash apertures -- free at the host addresses a
+ * RAM base at `base` puts them? They sit up to 4 GB above it and a failed
+ * one only warns, then faults at the first touch. On Windows the first
+ * candidate base finds them free; under Wine (Proton, the Steam Deck) its
+ * own heaps and thread stacks can sit in that span, differently from run to
+ * run, and the title died at start-up some of the time. A base is taken only
+ * if all of them are free; the caller then tries the next. */
+static int xbox_GuestWindowsFree(uintptr_t base)
+{
+    static const struct { uint32_t guest, size; const char *name; } windows[] = {
+        { XBOX_CONTIG_BASE, XBOX_CONTIG_SIZE, "contiguous" },
+        { XBOX_NV2A_BASE,   XBOX_NV2A_SIZE,   "NV2A" },
+        { XBOX_MCPX_BASE,   XBOX_MCPX_SIZE,   "MCPX" },
+        { XBOX_FLASH_BASE,  XBOX_FLASH_SIZE,  "flash" },
+    };
+    size_t w;
+    for (w = 0; w < sizeof(windows) / sizeof(windows[0]); w++) {
+        uintptr_t at = (uintptr_t)windows[w].guest + (base - XBOX_MAP_START);
+        uintptr_t end = at + windows[w].size;
+        while (at < end) {
+            MEMORY_BASIC_INFORMATION info;
+            if (!VirtualQuery((LPCVOID)at, &info, sizeof(info)) || info.State != MEM_FREE) {
+                fprintf(stderr, "  RAM base candidate %p rejected: the %s window at %p is in use\n",
+                        (void *)base, windows[w].name, (void *)at);
+                return 0;
+            }
+            at = (uintptr_t)info.BaseAddress + info.RegionSize;
+        }
+    }
+    return 1;
+}
+
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
 
@@ -2163,6 +2196,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * -- the title's first surface write then faults and the screen
              * stays black. */
             0x18000000,             /* 384 MB */
+#if UINTPTR_MAX > 0xFFFFFFFFu
+            /* Above 4 GB, where Wine leaves the address space empty (see
+             * xbox_GuestWindowsFree). */
+            (uintptr_t)0x200000000ull,
+            (uintptr_t)0x400000000ull,
+            (uintptr_t)0x800000000ull,
+#endif
             0,                      /* sentinel - let OS choose */
         };
 
@@ -2256,8 +2296,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         if (tiled_size > XBOX_CONTIG_SIZE)
             tiled_size = XBOX_CONTIG_SIZE;
         const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
-        for (size_t i = 0; !g_memory_base && i < n_bases; i++) {
-            LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
+        /* RECOMP_RAM_BASE=<hex>: that base first (a layout question to test). */
+        const char *asked_text = getenv("RECOMP_RAM_BASE");
+        uintptr_t asked = asked_text ? (uintptr_t)_strtoui64(asked_text, NULL, 16) : 0;
+        for (size_t i = asked ? (size_t)-1 : 0; !g_memory_base && (i == (size_t)-1 || i < n_bases); i++) {
+            uintptr_t want = i == (size_t)-1 ? asked : try_bases[i];
+            LPVOID hint = want ? (LPVOID)want : NULL;
             g_memory_base = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,
@@ -2266,7 +2310,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 hint            /* desired base address */
             );
             if (g_memory_base) {
-                if (try_bases[i] != 0 && (uintptr_t)g_memory_base != try_bases[i]) {
+                if (want != 0 && (uintptr_t)g_memory_base != want) {
                     /* OS gave us a different address, retry */
                     UnmapViewOfFile(g_memory_base);
                     g_memory_base = NULL;
@@ -2282,6 +2326,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 if (!xbox_TiledAliasMappable((uintptr_t)g_memory_base, tiled_size)) {
                     fprintf(stderr, "  RAM base candidate %p rejected: tiled "
                             "alias not mappable\n", g_memory_base);
+                    UnmapViewOfFile(g_memory_base);
+                    g_memory_base = NULL;
+                    continue;
+                }
+                if (!xbox_GuestWindowsFree((uintptr_t)g_memory_base)) {
                     UnmapViewOfFile(g_memory_base);
                     g_memory_base = NULL;
                     continue;
