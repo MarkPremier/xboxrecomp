@@ -200,6 +200,8 @@ extern uint32_t xbox_AllocThreadTib(void);
 extern int xbox_IrqlBlocksInterrupts(void);
 extern int xbox_AsyncGateEnter(int force);
 extern void xbox_AsyncGateLeave(void);
+extern int xbox_InterruptLockTry(void);
+extern void xbox_InterruptLockLeave(void);
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
 #if defined(_MSC_VER)
@@ -266,12 +268,25 @@ static void apu_deliver_irq(MCPXAPUState *d)
         qemu_mutex_lock(&d->lock);
         return;
     }
+    /* A KeSynchronizeExecution routine is running: on the console the line
+     * is masked until it returns, so the ISR waits for the next frame. */
+    if (!xbox_InterruptLockTry()) {
+        static unsigned waits;
+        if (!(waits++ & (waits < 10000 ? 1023u : 65535u)))
+            fprintf(stderr, "[APU] interrupt waited for KeSynchronizeExecution (%u times)\n", waits);
+        xbox_GuestAudioGuardLeave();
+        xbox_AsyncGateLeave();
+        xbox_worker_stack_free(slot);
+        qemu_mutex_lock(&d->lock);
+        return;
+    }
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
     g_esp -= 4; *(uint32_t *)(guest_ram + g_esp) = context;
     g_esp -= 4; *(uint32_t *)(guest_ram + g_esp) = kint;
     g_esp -= 4; *(uint32_t *)(guest_ram + g_esp) = 0xDEADBEEFu;
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    xbox_InterruptLockLeave();
     xbox_GuestAudioGuardLeave();
     xbox_AsyncGateLeave();
     xbox_worker_stack_free(slot);

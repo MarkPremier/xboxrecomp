@@ -95,6 +95,41 @@ void xbox_AsyncGateLeave(void)
     InterlockedDecrement(&g_async_running);
 }
 
+/* The interrupt spinlock KeSynchronizeExecution takes on hardware: its
+ * routine runs at the interrupt's level holding the interrupt object's lock,
+ * so the ISR cannot run while it does. That is how DirectSound moves what its
+ * audio ISR queued (0x1B2353, from its DPC 0x1B27F8) onto lists it then works
+ * through unguarded; with no lock here, the ISR, on the APU thread, linked a
+ * voice in mid-move and the list pointed at garbage (a crash in
+ * sub_001B22DA's drain). One lock for every interrupt is stricter than one
+ * per interrupt object, and costs nothing here: the holders are short. */
+static CRITICAL_SECTION g_interrupt_lock;
+static INIT_ONCE g_interrupt_lock_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK interrupt_lock_init(PINIT_ONCE once, PVOID parameter, PVOID *context)
+{
+    (void)once; (void)parameter; (void)context;
+    InitializeCriticalSectionAndSpinCount(&g_interrupt_lock, 4000);
+    return TRUE;
+}
+
+int xbox_InterruptLockTry(void)
+{
+    InitOnceExecuteOnce(&g_interrupt_lock_once, interrupt_lock_init, NULL, NULL);
+    return TryEnterCriticalSection(&g_interrupt_lock) ? 1 : 0;
+}
+
+void xbox_InterruptLockEnter(void)
+{
+    InitOnceExecuteOnce(&g_interrupt_lock_once, interrupt_lock_init, NULL, NULL);
+    EnterCriticalSection(&g_interrupt_lock);
+}
+
+void xbox_InterruptLockLeave(void)
+{
+    LeaveCriticalSection(&g_interrupt_lock);
+}
+
 int xbox_DpcGateEnter(void)
 {
     static ULONGLONG blocked_since;

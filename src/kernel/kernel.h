@@ -810,6 +810,13 @@ int     xbox_DpcGateEnter(void);   /* 0: a guest thread is at DISPATCH, try late
 void    xbox_DpcGateLeave(void);
 int     xbox_AsyncGateEnter(int force);   /* same gate, for an ISR; 0: hold off */
 void    xbox_AsyncGateLeave(void);
+/* An interrupt's service routine and KeSynchronizeExecution's routines, one
+ * at a time (the one processor's interrupt spinlock). A device model takes
+ * it with Try around its ISR and holds the interrupt off when it cannot;
+ * KeSynchronizeExecution waits for it. The same thread may take it again. */
+int     xbox_InterruptLockTry(void);
+void    xbox_InterruptLockEnter(void);
+void    xbox_InterruptLockLeave(void);
 int     xbox_IrqlRaisedCount(void);
 int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
 void    xbox_IrqlLeaveInterrupt(int saved);
