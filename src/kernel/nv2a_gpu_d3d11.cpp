@@ -537,6 +537,34 @@ static bool screen_shaped(uint32_t width, uint32_t height)
            (width == screen_width || width == 2 * screen_width);
 }
 
+/* Heat haze (nv2a_gpu_set_heat_haze): 0 as the console draws it; 1 smooth,
+ * the offsets of a bump stage read filtered (bump_source_smoothing); 2 sharp,
+ * smooth and the small targets the title copies the screen into for such an
+ * effect (Turok: 256x256) drawn at the screen's own pixel density instead of
+ * a fraction of it. RECOMP_SMOOTH_BUMP=1 starts at 1. */
+static int heat_haze = -1;
+static std::atomic<int> pending_heat_haze{-1};
+
+static int heat_haze_mode()
+{
+    if (heat_haze < 0) {
+        const char *value = std::getenv("RECOMP_SMOOTH_BUMP");
+        heat_haze = value && *value && *value != '0' ? 1 : 0;
+    }
+    return heat_haze;
+}
+
+/* How much finer than the render scale a target is drawn: with a sharp heat
+ * haze, one well under the screen's size gets the screen's density, up to 4x. */
+static float effect_target_factor(uint32_t width, uint32_t height)
+{
+    if (heat_haze_mode() != 2 || width > 512 || height > 512 || !width || !height) return 1.0f;
+    uint32_t screen_width = 640, screen_height = 480;
+    xbox_FramebufferSize(&screen_width, &screen_height);
+    float factor = std::max((float)screen_width / (float)width, (float)screen_height / (float)height);
+    return std::min(std::max(factor, 1.0f), 4.0f);
+}
+
 static UINT extent_at(uint32_t size, float factor)
 {
     if (factor == 1.0f) return size;
@@ -547,7 +575,9 @@ static UINT extent_at(uint32_t size, float factor)
 static void texture_size(uint32_t width, uint32_t height, bool scaled, UINT &texture_width, UINT &texture_height)
 {
     float scale = scaled ? render_scale() : 1.0f;
-    float wide = scaled && wide_frames && screen_shaped(width, height) ? wide_factor : 1.0f;
+    bool screen = screen_shaped(width, height);
+    float wide = scaled && wide_frames && screen ? wide_factor : 1.0f;
+    if (scaled && !screen) scale *= effect_target_factor(width, height);
     texture_width = extent_at(width, scale * wide);
     texture_height = extent_at(height, scale);
 }
@@ -2068,6 +2098,14 @@ static void apply_target_sizes()
                       *why ? ", " : "", wide_factor, requested);
         wide_factor = requested;
     }
+    int haze = pending_heat_haze.exchange(-1);
+    if (haze >= 0 && haze != heat_haze_mode()) {
+        bool resize = (haze == 2) != (heat_haze == 2);
+        heat_haze = haze;
+        if (resize)
+            std::snprintf(why + std::strlen(why), sizeof why - std::strlen(why), "%sheat haze %s",
+                          *why ? ", " : "", haze == 2 ? "sharp" : "at the render scale");
+    }
     int samples = pending_msaa.exchange(-1);
     if (samples > 0 && (UINT)samples != msaa_samples) {
         UINT quality = 0;
@@ -2098,6 +2136,11 @@ static void apply_target_sizes()
 extern "C" void nv2a_gpu_set_msaa(int samples)
 {
     pending_msaa.store(samples >= 8 ? 8 : samples >= 4 ? 4 : samples >= 2 ? 2 : 1);
+}
+
+extern "C" void nv2a_gpu_set_heat_haze(int mode)
+{
+    pending_heat_haze.store(mode >= 2 ? 2 : mode == 1 ? 1 : 0);
 }
 
 extern "C" void nv2a_gpu_set_render_scale(float scale)
@@ -3987,16 +4030,11 @@ static bool make_sampler(const Nv2aGpuTexture &binding, ComPtr<ID3D11SamplerStat
  * map over a 256x256 copy of the screen) breaks into hard-edged blocks, the
  * sharper the higher the render scale. Read filtered instead, the offsets
  * blend and the haze ripples. That is not the original look -- the console
- * draws the blocks too -- so it is opt-in: RECOMP_SMOOTH_BUMP=1. */
+ * draws the blocks too -- so it is a choice: nv2a_gpu_set_heat_haze. */
 static bool bump_source_smoothing(const Nv2aGpuDraw *state, uint32_t stage, const Nv2aGpuTexture &binding,
                                   Nv2aGpuTexture &smoothed)
 {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *value = std::getenv("RECOMP_SMOOTH_BUMP");
-        enabled = value && *value && *value != '0';
-    }
-    if (!enabled) return false;
+    if (!heat_haze_mode()) return false;
     bool source = false;
     for (uint32_t later = stage + 1; later < 4 && !source; later++) {
         uint32_t mode = (state->stage_program >> (later * 5)) & 31u;

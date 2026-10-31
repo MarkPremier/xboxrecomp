@@ -44,6 +44,10 @@ void nv2a_gpu_set_texture_replacements(int on);
  * samples for the screen's targets, 1 (off) to 8, from the next flip. Any thread. */
 void nv2a_gpu_set_anisotropy(int level);
 void nv2a_gpu_set_msaa(int samples);
+/* Heat haze: 0 as the console draws it, 1 smooth (bump offsets filtered), 2
+ * sharp (smooth, and small screen-copy targets at the screen's density).
+ * From the next flip; any thread. */
+void nv2a_gpu_set_heat_haze(int mode);
 void nv2a_gpu_surface_modified(const void *addr, size_t bytes);
 void nv2a_gpu_surface_publish(const void *addr, size_t bytes);
 void nv2a_gpu_invalidate(void);
