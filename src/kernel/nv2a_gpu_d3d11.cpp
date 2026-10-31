@@ -29,6 +29,37 @@
 
 using Microsoft::WRL::ComPtr;
 
+/* The HLSL compiler. Proton's d3dcompiler_47 (vkd3d-shader) rejects these
+ * shaders -- isnan, isfinite and an array size it cannot evaluate -- so on
+ * the Steam Deck nothing 3D drew. Microsoft's compiler beside the executable
+ * as d3dcompiler_ms.dll (the Windows SDK's redistributable d3dcompiler_47.dll
+ * under a name Wine has no builtin for, so it cannot be swapped out) is used
+ * when there; otherwise the system's. Every compile here goes through it. */
+typedef HRESULT (WINAPI *ShaderCompiler)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *, ID3DInclude *,
+                                         LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **, ID3DBlob **);
+
+static HRESULT shader_compile(LPCVOID source, SIZE_T size, LPCSTR name, const D3D_SHADER_MACRO *defines,
+                              ID3DInclude *include, LPCSTR entry, LPCSTR profile, UINT flags1, UINT flags2,
+                              ID3DBlob **code, ID3DBlob **errors)
+{
+    static ShaderCompiler bundled;
+    static std::once_flag once;
+    std::call_once(once, []() {
+        wchar_t path[MAX_PATH];
+        DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        wchar_t *slash = length && length < MAX_PATH ? wcsrchr(path, L'\\') : nullptr;
+        if (slash && (size_t)(slash - path) + 20 < MAX_PATH) {
+            wcscpy(slash + 1, L"d3dcompiler_ms.dll");
+            HMODULE module = LoadLibraryW(path);
+            if (module) bundled = (ShaderCompiler)GetProcAddress(module, "D3DCompile");
+        }
+        std::fprintf(stderr, "[GPU-D3D11] shader compiler: %s\n",
+                     bundled ? "d3dcompiler_ms.dll beside the program" : "the system's d3dcompiler_47");
+    });
+    return bundled ? bundled(source, size, name, defines, include, entry, profile, flags1, flags2, code, errors)
+                   : D3DCompile(source, size, name, defines, include, entry, profile, flags1, flags2, code, errors);
+}
+
 /* Clear the NV2A WC-flush/idle handshake bits the guest spins on (KickOff).
  * Called from the GPU-wait spins so a long wait inside one packet does not
  * hold up the guest's next kick. Register write only, so any thread may call. */
@@ -986,7 +1017,7 @@ static HRESULT compile_shader_cached(const char *source, size_t size, const char
         }
     }
     if (!compile) return E_PENDING;
-    HRESULT result = D3DCompile(source, size, name, defines, nullptr, entry, profile, flags, 0, &code, &errors);
+    HRESULT result = shader_compile(source, size, name, defines, nullptr, entry, profile, flags, 0, &code, &errors);
     if (SUCCEEDED(result) && !path.empty()) {
         /* Written under a unique name and renamed into place, so a reader
          * (or a second compile of the same shader) never sees half a file. */
@@ -1558,13 +1589,13 @@ static bool scale_blit(ID3D11ShaderResourceView *source, ID3D11RenderTargetView 
             "float depth_ps(V v):SV_Depth{return image.SampleLevel(nearest,v.uv,0).r;}";
         BlitPipeline created;
         ComPtr<ID3DBlob> vertex, color_pixel, depth_pixel, errors;
-        HRESULT result = D3DCompile(text, sizeof text - 1, "NV2A scale blit", nullptr, nullptr, "vs", "vs_5_0",
+        HRESULT result = shader_compile(text, sizeof text - 1, "NV2A scale blit", nullptr, nullptr, "vs", "vs_5_0",
                                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vertex, &errors);
         if (SUCCEEDED(result))
-            result = D3DCompile(text, sizeof text - 1, "NV2A scale blit", nullptr, nullptr, "color_ps", "ps_5_0",
+            result = shader_compile(text, sizeof text - 1, "NV2A scale blit", nullptr, nullptr, "color_ps", "ps_5_0",
                                 D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &color_pixel, &errors);
         if (SUCCEEDED(result))
-            result = D3DCompile(text, sizeof text - 1, "NV2A scale blit", nullptr, nullptr, "depth_ps", "ps_5_0",
+            result = shader_compile(text, sizeof text - 1, "NV2A scale blit", nullptr, nullptr, "depth_ps", "ps_5_0",
                                 D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &depth_pixel, &errors);
         if (SUCCEEDED(result))
             result = device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(), nullptr, &created.vertex);
@@ -1922,8 +1953,8 @@ static void resolve_depth(DepthSurface &surface)
             "float4 vs(uint id:SV_VertexID):SV_Position{float2 t=float2((id<<1)&2,id&2);return float4(t*float2(2,-2)+float2(-1,1),0,1);}"
             "float ps(float4 p:SV_Position):SV_Depth{return image.Load(int2(p.xy),0);}";
         ComPtr<ID3DBlob> vs, ps, errors;
-        HRESULT result = D3DCompile(text, sizeof text - 1, "MSAA depth resolve", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, &errors);
-        if (SUCCEEDED(result)) result = D3DCompile(text, sizeof text - 1, "MSAA depth resolve", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, &errors);
+        HRESULT result = shader_compile(text, sizeof text - 1, "MSAA depth resolve", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, &errors);
+        if (SUCCEEDED(result)) result = shader_compile(text, sizeof text - 1, "MSAA depth resolve", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, &errors);
         if (SUCCEEDED(result)) result = device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &vertex);
         if (SUCCEEDED(result)) result = device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &pixel);
         D3D11_DEPTH_STENCIL_DESC depth = {};
@@ -2930,10 +2961,10 @@ static bool presenter_ready(HWND window)
         "v.position=float4(t*float2(2,-2)+float2(-1,1),0,1);v.uv=t*extent.xy;return v;}"
         "float4 ps(V v):SV_Target{return float4(image.SampleLevel(smooth,v.uv,0).rgb,1);}";
     ComPtr<ID3DBlob> vertex, pixel, errors;
-    result = D3DCompile(source, sizeof source - 1, "NV2A present", nullptr, nullptr, "vs", "vs_5_0",
+    result = shader_compile(source, sizeof source - 1, "NV2A present", nullptr, nullptr, "vs", "vs_5_0",
                         D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vertex, &errors);
     if (SUCCEEDED(result))
-        result = D3DCompile(source, sizeof source - 1, "NV2A present", nullptr, nullptr, "ps", "ps_5_0",
+        result = shader_compile(source, sizeof source - 1, "NV2A present", nullptr, nullptr, "ps", "ps_5_0",
                             D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pixel, &errors);
     if (FAILED(result)) {
         std::fprintf(stderr, "[GPU-D3D11] present shader compile: %s\n",
@@ -4222,10 +4253,10 @@ static bool clear_target_rectangle(const Nv2aGpuDraw &state, Surface *surface, D
             "float4 ps():SV_Target{return clearColor;}";
         ClearPipeline created;
         ComPtr<ID3DBlob> vertex, pixel, errors;
-        HRESULT result = D3DCompile(source, sizeof source - 1, "NV2A clear", nullptr, nullptr,
+        HRESULT result = shader_compile(source, sizeof source - 1, "NV2A clear", nullptr, nullptr,
                                    "vs", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vertex, &errors);
         if (SUCCEEDED(result))
-            result = D3DCompile(source, sizeof source - 1, "NV2A clear", nullptr, nullptr,
+            result = shader_compile(source, sizeof source - 1, "NV2A clear", nullptr, nullptr,
                                 "ps", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pixel, &errors);
         if (FAILED(result)) {
             std::fprintf(stderr, "[GPU-D3D11] rectangle clear shader compile: 0x%08X %s\n",
