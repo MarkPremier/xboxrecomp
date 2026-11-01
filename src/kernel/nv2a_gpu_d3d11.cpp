@@ -426,7 +426,7 @@ struct TargetExtent {
  * (drawn up into the texture by a refresh). */
 struct Surface {
     uint8_t *memory;
-    uint32_t width, height, pitch;
+    uint32_t width, height, pitch, bytes;
     uint32_t texture_width, texture_height;
     ComPtr<ID3D11Texture2D> resolve, upload;
     ComPtr<ID3D11RenderTargetView> resolve_target;
@@ -1583,6 +1583,36 @@ static bool prepare_surface_snapshot(SurfaceType &surface, uint32_t bytes)
     return true;
 }
 
+static uint16_t pack_rgb565(uint32_t color)
+{
+    return (uint16_t)(((color >> 8) & 0xF800u) | ((color >> 5) & 0x07E0u) | ((color >> 3) & 31u));
+}
+
+template<typename Coverage>
+static void publish_rgb565(Surface &surface, const D3D11_MAPPED_SUBRESOURCE &mapped,
+                          const Coverage &coverage, bool keep_snapshot)
+{
+    bool snapshot = keep_snapshot && prepare_surface_snapshot(surface, 2);
+    const size_t row_bytes = (size_t)surface.width * 2;
+    if (snapshot && !surface.snapshot_valid)
+        for (uint32_t y = 0; y < surface.height; y++)
+            std::memcpy(surface.source_snapshot.data() + y * row_bytes,
+                        surface.memory + (size_t)y * surface.pitch, row_bytes);
+    for (uint32_t y = coverage.written_region.top; y < coverage.written_region.bottom; y++) {
+        const uint32_t *source = (const uint32_t *)((const uint8_t *)mapped.pData + (size_t)y * mapped.RowPitch);
+        uint16_t *destination = (uint16_t *)(surface.memory + (size_t)y * surface.pitch);
+        uint16_t *cached = snapshot ? (uint16_t *)(surface.source_snapshot.data() + y * row_bytes) : nullptr;
+        for_each_written_span(coverage, y, [&](uint32_t first, uint32_t end) {
+            for (uint32_t x = first; x < end; x++) {
+                destination[x] = pack_rgb565(source[x]);
+                if (cached) cached[x] = destination[x];
+            }
+            gpu_timing.color_publish_bytes += (uint64_t)(end - first) * 2;
+        });
+    }
+    surface.snapshot_valid = snapshot;
+}
+
 template<typename SurfaceType>
 static bool surface_memory_matches(const SurfaceType &surface, uint32_t bytes)
 {
@@ -1744,6 +1774,34 @@ static void refresh_surface(Surface &surface)
      * went lazy. Keep the GPU copy; the surface is published at the next real
      * fence, and the texture path samples the GPU view while it is dirty. */
     if (surface.dirty) { surface.needs_refresh = false; return; }
+    if (surface.bytes == 2) {
+        /* RGB565 guest storage, BGRA8 GPU storage. Keep the snapshot in the
+         * guest format so alias/reuse detection compares the right bytes. */
+        const size_t row_bytes = (size_t)surface.width * 2;
+        bool changed = !surface.snapshot_valid;
+        if (!changed)
+            for (uint32_t y = 0; y < surface.height && !changed; y++)
+                changed = std::memcmp(surface.memory + (size_t)y * surface.pitch,
+                                      surface.source_snapshot.data() + y * row_bytes, row_bytes) != 0;
+        if (changed) {
+            std::vector<uint32_t> pixels((size_t)surface.width * surface.height);
+            for (uint32_t y = 0; y < surface.height; y++) {
+                const uint16_t *source = (const uint16_t *)(surface.memory + (size_t)y * surface.pitch);
+                for (uint32_t x = 0; x < surface.width; x++) {
+                    uint32_t p = source[x], r = (p >> 11) & 31, g = (p >> 5) & 63, b = p & 31;
+                    pixels[(size_t)y * surface.width + x] = 0xFF000000u |
+                        (((r << 3) | (r >> 2)) << 16) | (((g << 2) | (g >> 4)) << 8) | (b << 3) | (b >> 2);
+                }
+            }
+            upload_surface(surface, nullptr, pixels.data(), surface.width * 4);
+            surface.clear_value_valid = false;
+            surface.alias_copy_serial = 0;
+            surface.snapshot_valid = false;
+            gpu_timing.color_refreshed++;
+        } else gpu_timing.color_refresh_reused++;
+        surface.needs_refresh = false;
+        return;
+    }
     if (surface.snapshot_valid && !surface.dirty) {
         size_t row_bytes = (size_t)surface.width * 4;
         D3D11_BOX changed = {surface.width, surface.height, 0, 0, 0, 1};
@@ -1853,7 +1911,8 @@ static Surface *get_surface(const Nv2aGpuDraw &state, bool preserve = true, Targ
 {
     if (!extent.width) extent = {state.width, state.height};
     for (auto &surface : surfaces)
-        if (surface.memory == state.color && surface.width == extent.width && surface.height == extent.height && surface.pitch == state.pitch) {
+        if (surface.memory == state.color && surface.width == extent.width && surface.height == extent.height &&
+            surface.pitch == state.pitch && surface.bytes == state.bytes_per_pixel) {
             surface.last_used = ++surface_use_serial;
             surface.used_frame = surface_frame_serial;
             if (preserve) refresh_surface(surface);
@@ -1862,12 +1921,13 @@ static Surface *get_surface(const Nv2aGpuDraw &state, bool preserve = true, Targ
         }
     Surface surface = {};
     surface.memory = state.color; surface.width = extent.width; surface.height = extent.height; surface.pitch = state.pitch;
+    surface.bytes = state.bytes_per_pixel;
     texture_size(extent.width, extent.height, true, surface.texture_width, surface.texture_height);
     surface.last_used = ++surface_use_serial;
     surface.used_frame = surface_frame_serial;
     bool scaled = is_scaled(surface);
     D3D11_SUBRESOURCE_DATA data = {state.color, state.pitch, 0};
-    if (!create_color_textures(surface, preserve ? &data : nullptr) || !create_ms_color(surface)) return nullptr;
+    if (!create_color_textures(surface, preserve && surface.bytes == 4 ? &data : nullptr) || !create_ms_color(surface)) return nullptr;
     D3D11_TEXTURE2D_DESC description = {};
     description.Width = extent.width; description.Height = extent.height;
     description.MipLevels = description.ArraySize = 1;
@@ -1877,7 +1937,7 @@ static Surface *get_surface(const Nv2aGpuDraw &state, bool preserve = true, Targ
     surfaces.push_back(std::move(surface));
     gpu_timing.color_created++;
     Surface &created = surfaces.back();
-    if (preserve && scaled) {
+    if (preserve && (scaled || created.bytes == 2)) {
         created.needs_refresh = true;
         refresh_surface(created);
     }
@@ -2428,7 +2488,7 @@ static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_
         }
         return;
     }
-    for (auto &surface : surfaces) abandoned_surface(surface, 4);
+    for (auto &surface : surfaces) abandoned_surface(surface, surface.bytes);
     for (auto &surface : depth_surfaces) abandoned_surface(surface, surface.format == 1 ? 2 : 4);
     ID3D11RenderTargetView *empty = nullptr;
     context->OMSetRenderTargets(1, &empty, nullptr);
@@ -2492,8 +2552,8 @@ static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_
         if (surface.clear_value_valid) {
             GpuTimer publish_timer(gpu_timing.sync_publish);
             GpuTimer color_timer(gpu_timing.color_publish);
-            publish_known_clear(surface, 4);
-            gpu_timing.color_publish_bytes += (uint64_t)surface.width * surface.height * 4;
+            publish_known_clear(surface, surface.bytes);
+            gpu_timing.color_publish_bytes += (uint64_t)surface.width * surface.height * surface.bytes;
             gpu_timing.color_clear_publications++;
             continue;
         }
@@ -2505,6 +2565,13 @@ static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_
         }
         if (FAILED(result)) readback_failed("color", result);
         gpu_timing.color_readbacks++;
+        if (surface.bytes == 2) {
+            publish_rgb565(surface, mapped, surface, true);
+            context->Unmap(surface.staging.Get(), 0);
+            mark_target_aliases(&surface, surface.memory, (size_t)surface.pitch * surface.height);
+            surface.dirty = false;
+            continue;
+        }
         {
             GpuTimer publish_timer(gpu_timing.sync_publish);
             GpuTimer color_timer(gpu_timing.color_publish);
@@ -2773,6 +2840,13 @@ static void publish_staged_color(Surface &surface, ID3D11Texture2D *staging,
     if (FAILED(context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) return;
     GpuTimer publish_timer(gpu_timing.sync_publish);
     GpuTimer color_timer(gpu_timing.color_publish);
+    if (surface.bytes == 2) {
+        publish_rgb565(surface, mapped, coverage, present_snapshot());
+        context->Unmap(staging, 0);
+        mark_target_aliases(&surface, surface.memory, (size_t)surface.pitch * surface.height);
+        if (current) surface.dirty = false;
+        return;
+    }
     bool snapshot = present_snapshot() && prepare_surface_snapshot(surface, 4);
     bool initialize_snapshot = snapshot && !surface.snapshot_valid;
     const auto &region = coverage.written_region;
@@ -3227,7 +3301,7 @@ extern "C" void nv2a_gpu_invalidate(void)
 static bool matches_color_target(const Surface &surface, const Nv2aGpuDraw &state, TargetExtent extent)
 {
     return surface.memory == state.color && surface.width == extent.width &&
-        surface.height == extent.height && surface.pitch == state.pitch;
+        surface.height == extent.height && surface.pitch == state.pitch && surface.bytes == state.bytes_per_pixel;
 }
 
 static bool matches_depth_target(const DepthSurface &surface, const Nv2aGpuDraw &state, TargetExtent extent)
@@ -3260,7 +3334,7 @@ static TargetExtent reusable_target_extent(const Nv2aGpuDraw &state)
     };
     if (state.color) {
         for (const auto &surface : surfaces)
-            if (surface.memory == state.color && surface.pitch == state.pitch)
+            if (surface.memory == state.color && surface.pitch == state.pitch && surface.bytes == state.bytes_per_pixel)
                 consider(surface.width, surface.height);
     } else if (needs_depth) {
         for (const auto &surface : depth_surfaces)
@@ -3336,8 +3410,9 @@ extern "C" int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t
     if ((flags & ~0xF3u) || !state->width || !state->height || state->width > 4096 || state->height > 4096 ||
         state->clip_x || state->clip_y || state->clip_width != state->width || state->clip_height != state->height)
         return cpu_path();
-    if (clear_color && ((flags & 0xF0u) != 0xF0u || !state->color || state->bytes_per_pixel != 4 ||
-        state->pitch < state->width * 4)) return cpu_path();
+    if (clear_color && ((flags & 0xF0u) != 0xF0u || !state->color ||
+        (state->bytes_per_pixel != 4 && state->bytes_per_pixel != 2) ||
+        state->pitch < state->width * state->bytes_per_pixel)) return cpu_path();
     if ((flags & 3u) && (!state->depth || (state->depth_format != 1 && state->depth_format != 2) ||
         (state->control0 & 0x1000u) || state->depth_pitch < state->width * depth_bytes)) return cpu_path();
     // Arbitrary Z24 integers need a bit-exact CPU clear, not a floating-point clear value.
@@ -3402,7 +3477,10 @@ extern "C" int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t
     }
     if (surface) {
         mark_written_region(*surface, region);
-        if (known_clears && !partial) { surface->clear_value = color; surface->clear_value_valid = true; }
+        if (known_clears && !partial) {
+            surface->clear_value = surface->bytes == 2 ? pack_rgb565(color) : color;
+            surface->clear_value_valid = true;
+        }
     }
     if (depth) {
         bool known = known_clears && !partial && (depth->format == 1 ? clear_depth :
@@ -3710,14 +3788,17 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
     }();
     bool swizzled_view = swizzled_views ? (binding.format == 0x06 || binding.format == 0x07)
                                         : binding.format == 0x07;
-    bool surface_viewable = (binding.format == 0x12 || binding.format == 0x1E)
-                                ? binding.linear : swizzled_view;
-    uint32_t want_pitch = swizzled_view && swizzled_views ? binding.width * 4 : binding.pitch;
+    bool rgb565_view = binding.format == 0x05 || (binding.linear && binding.format == 0x11);
+    bool surface_viewable = rgb565_view || ((binding.format == 0x12 || binding.format == 0x1E)
+                                ? binding.linear : swizzled_view);
+    uint32_t want_bytes = rgb565_view ? 2u : 4u;
+    uint32_t want_pitch = !binding.linear && (rgb565_view || (swizzled_view && swizzled_views))
+                        ? binding.width * want_bytes : binding.pitch;
     if (levels == 1 && !binding.cube && !binding.depth && surface_viewable)
         for (auto &surface : surfaces) {
             gpu_timing.surface_scan_iters++;
             if (surface.memory == binding.source && surface.width == binding.width &&
-                surface.height == binding.height && surface.pitch == want_pitch) {
+                surface.height == binding.height && surface.pitch == want_pitch && surface.bytes == want_bytes) {
                 direct = &surface;
                 break;
             }
@@ -3730,7 +3811,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         if (begin >= surface_end || end <= surface_begin) continue;
         if (&surface != direct && surface.dirty) {
             dirty_alias = true;
-            if (!direct || surface.memory != direct->memory || surface.pitch != direct->pitch)
+            if (!direct || surface.memory != direct->memory || surface.pitch != direct->pitch || surface.bytes != direct->bytes)
                 copyable_aliases = false;
             alias_serial = std::max(alias_serial, surface.content_serial);
         }
@@ -3749,7 +3830,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
             if (direct->alias_copy_serial != alias_serial) {
                 for (auto &surface : surfaces) {
                     if (&surface == direct || !surface.dirty || surface.memory != direct->memory ||
-                        surface.pitch != direct->pitch) continue;
+                        surface.pitch != direct->pitch || surface.bytes != direct->bytes) continue;
                     resolve_color(surface);
                     resolve_color(*direct);
                     if (direct->ms_texture) direct->ms_stale = true;
@@ -4443,7 +4524,8 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     bool depth_only = state && !state->color && state->bytes_per_pixel == 2;
     if (!state || !vertices || !count || count > NV2A_GPU_MAX_VERTICES || (!state->color && !depth_only) ||
         !state->width || !state->height || state->width > 4096 || state->height > 4096 ||
-        (!depth_only && (state->pitch < state->width * 4 || state->bytes_per_pixel != 4)) ||
+        (!depth_only && (state->pitch < state->width * state->bytes_per_pixel ||
+                        (state->bytes_per_pixel != 4 && state->bytes_per_pixel != 2))) ||
         (state->combiners.control & 255u) > 8 || !initialize_pipeline()) return 0;
     if (depth_only && !state->depth_enable && !state->stencil_enable) return 1;   /* nothing it can change */
     if (state->topology > NV2A_GPU_TOPOLOGY_POINTS) return reject("primitive topology");

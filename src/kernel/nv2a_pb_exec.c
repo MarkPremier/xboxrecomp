@@ -1464,6 +1464,16 @@ static void note_drawn_surface(void)
     s_gpu.drawn_height = (s_gpu.clip_y + s_gpu.clip_h) * sy;
 }
 
+static int cpu_rgb565(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("RECOMP_CPU_RGB565");
+        enabled = value && *value && strcmp(value, "0") != 0;
+    }
+    return enabled;
+}
+
 static int gpu_clear_surface(uint32_t param)
 {
     static int enabled = -1;
@@ -1488,9 +1498,8 @@ static int gpu_clear_surface(uint32_t param)
     state.depth_pitch = s_gpu.depth_pitch;
     state.depth_format = (s_gpu.format >> 4) & 15u;
     state.control0 = s_gpu.control0;
-    /* A 16-bit target only ever has depth on the GPU (gpu_raster_batch):
-     * clear that here and leave its colour bytes to clear_surface. */
-    if ((param & NV097_CLEAR_COLOR_MASK) && state.bytes_per_pixel == 2 && (param & 3u)) {
+    int native_565 = (s_gpu.format & 15u) == 3u && !cpu_rgb565();
+    if ((param & NV097_CLEAR_COLOR_MASK) && state.bytes_per_pixel == 2 && !native_565 && (param & 3u)) {
         uint32_t base = dma_resolve(s_gpu.depth_offset);
         uint32_t bytes = state.depth_format == 1 ? 2u : state.depth_format == 2 ? 4u : 0u;
         if (!s_gpu.depth_offset || !state.depth_pitch || !bytes || (state.control0 & 0x1000u) ||
@@ -1506,6 +1515,8 @@ static int gpu_clear_surface(uint32_t param)
         }
         return result > 0 ? 2 : 0;
     }
+    if ((param & NV097_CLEAR_COLOR_MASK) && state.bytes_per_pixel == 2 && !native_565)
+        return 0;
     if (param & NV097_CLEAR_COLOR_MASK) {
         uint32_t base = dma_resolve(s_gpu.color_offset);
         if (!s_gpu.color_offset || !state.pitch || !state.bytes_per_pixel ||
@@ -3171,10 +3182,8 @@ int nv2a_pb_exec_batch_spans(float width)
 
 static int gpu_raster_batch(void)
 {
-    /* The native backend's 16-bit path binds depth only. Serious Sam uses
-     * RGB565 for its display buffer, so accepting those colour draws there
-     * silently discards the entire picture. The CPU path writes RGB565. */
-    if ((s_gpu.format & 15u) == 3u && (s_gpu.color_mask & 0x01010101u))
+    /* Explicit A/B fallback; normally RGB565 colour targets stay on D3D11. */
+    if ((s_gpu.format & 15u) == 3u && (s_gpu.color_mask & 0x01010101u) && cpu_rgb565())
         return 0;
     uint8_t *memory = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t count = 0, index, stage;
@@ -3200,17 +3209,16 @@ static int gpu_raster_batch(void)
     gpu_begin_chunk();
     gpu_fast_attr_ready = 0;
     if (!s_gpu.combiners_configured) return gpu_batch_rejected("unconfigured combiners");
-    /* 16-bit colour targets draw depth only (state.color stays NULL). The
-     * backend's colour surfaces are 32-bit throughout, and the 16-bit pass
-     * that matters -- Turok Evolution's 512x512 R5G6B5 + Z16 shadow pass --
-     * is sampled for its depth alone; its colour writes are dropped. */
+    /* RGB565 with colour writes uses a BGRA8 GPU target with 16-bit guest
+     * publication. Other 16-bit passes retain their depth-only path. */
     if (surface_bpp() != 4 && surface_bpp() != 2) return gpu_batch_rejected("surface pixel format");
     if (!s_gpu.clip_w || !s_gpu.clip_h || !surface_begin_batch(memory)) return gpu_batch_rejected("surface mapping or clip extent");
     {
         uint32_t sx, sy, bpp = surface_bpp();
         surface_aa_scale(&sx, &sy);
         state.aa_scale_x = sx; state.aa_scale_y = sy;
-        state.color = bpp == 4 ? s_surface : NULL;
+        state.color = bpp == 4 || ((s_gpu.format & 15u) == 3u &&
+                      (s_gpu.color_mask & 0x01010101u)) ? s_surface : NULL;
         state.width = (s_gpu.clip_x + s_gpu.clip_w) * sx; state.height = (s_gpu.clip_y + s_gpu.clip_h) * sy;
         if (state.width > s_gpu.pitch / bpp) state.width = s_gpu.pitch / bpp;
         state.pitch = s_gpu.pitch; state.bytes_per_pixel = bpp;

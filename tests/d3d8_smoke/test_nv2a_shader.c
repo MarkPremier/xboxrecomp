@@ -1253,6 +1253,7 @@ int main(int argument_count, char **arguments)
     memory[0x1000 / 4 + 32] = 0x12345678;
     method(0x1D94, 0xF0);
     draw(5, 3);
+    if (getenv("NV2A_GPU_RGB565_ONLY")) nv2a_gpu_sync();
     check("RGB565 colour draw reaches guest framebuffer",
           ((uint16_t *)((uint8_t *)memory + 0x1000))[3 * 8 + 3] == 0x4084);
     check("RGB565 colour draw preserves following memory",
@@ -1267,8 +1268,51 @@ int main(int argument_count, char **arguments)
                 vertices[index].diffuse[attribute] = 1;
         method(0x1D94, 0xF0);
         draw(5, 3);
+        nv2a_gpu_sync();
         check("YUY2 movie texture reaches RGB565 framebuffer",
               ((uint16_t *)((uint8_t *)memory + 0x1000))[3 * 8 + 3] == 0xF800);
+        nv2a_gpu_invalidate();
+        method(0x020C, 20u | (32u << 16)); /* Guest rows include four padding bytes. */
+        memset((uint8_t *)memory + 0x1000, 0xA5, 20 * 8 + 4);
+        method(0x1D90, 0xFF00FF00);
+        method(0x1D94, 0xF0);
+        draw(5, 3);
+        nv2a_gpu_sync();
+        check("RGB565 padded rows publish drawn colour",
+              *(uint16_t *)((uint8_t *)memory + 0x1000 + 3 * 20 + 3 * 2) == 0xF800);
+        check("RGB565 clear preserves background outside geometry",
+              *(uint16_t *)((uint8_t *)memory + 0x1000 + 7 * 20 + 7 * 2) == 0x07E0);
+        for (index = 0; index < 8; index++)
+            check("RGB565 publication preserves row padding",
+                  *(uint32_t *)((uint8_t *)memory + 0x1000 + index * 20 + 16) == 0xA5A5A5A5);
+        check("RGB565 padded surface preserves trailing guard",
+              *(uint32_t *)((uint8_t *)memory + 0x1000 + 20 * 8) == 0xA5A5A5A5);
+        /* A guest lock/write must be uploaded before the next partial draw. */
+        nv2a_gpu_surface_modified((uint8_t *)memory + 0x1000, 20 * 8);
+        *(uint16_t *)((uint8_t *)memory + 0x1000 + 7 * 20 + 7 * 2) = 0x001F;
+        draw(5, 3);
+        nv2a_gpu_sync();
+        check("RGB565 partial draw preserves a guest CPU edit",
+              *(uint16_t *)((uint8_t *)memory + 0x1000 + 7 * 20 + 7 * 2) == 0x001F);
+        {
+            /* Assert native acceptance too: a silent CPU fallback must not
+             * make the pixel regression pass while losing the speedup. */
+            Nv2aGpuDraw native = {0};
+            Nv2aGpuVertex triangle[3] = {0};
+            native.color = (uint8_t *)memory + 0x1000;
+            native.width = native.height = native.clip_width = native.clip_height = 8;
+            native.pitch = 20; native.bytes_per_pixel = 2;
+            native.color_mask = 0x01010101;
+            triangle[1].position[0] = 8; triangle[2].position[1] = 8;
+            for (index = 0; index < 3; index++) {
+                triangle[index].position[3] = 1;
+                triangle[index].diffuse[0] = triangle[index].diffuse[3] = 1;
+            }
+            check("D3D11 accepts an RGB565 colour target", nv2a_gpu_draw(&native, triangle, 3));
+            nv2a_gpu_sync();
+            check("native RGB565 draw publishes red",
+                  *(uint16_t *)((uint8_t *)memory + 0x1000 + 3 * 20 + 3 * 2) == 0xF800);
+        }
         printf("nv2a_shader_rgb565: %s\n", failures ? "FAILED" : "ALL PASS");
         return failures ? 1 : 0;
     }
