@@ -1634,6 +1634,9 @@ static uint32_t *s_watchdog_esp;
  * registers are the thing being asked about. */
 static uint32_t *s_watchdog_regs[6];
 static unsigned  s_watchdog_secs;
+#if defined(_WIN32) && defined(_M_X64)
+static DWORD s_watchdog_tid;
+#endif
 
 /* Can RECOMP_PEEK dereference this guest address?
  *
@@ -1950,6 +1953,34 @@ static void watchdog_sample(const char *tag)
     const uint8_t *mem;
     uint32_t esp, i;
 
+#if defined(_WIN32) && defined(_M_X64)
+    if (getenv("RECOMP_WATCH_NATIVE")) {
+        CONTEXT context = {0};
+        uintptr_t stack[64] = {0};
+        SIZE_T bytes = 0;
+        BOOL captured = FALSE;
+        HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                                   FALSE, s_watchdog_tid);
+        if (thread && SuspendThread(thread) != (DWORD)-1) {
+            context.ContextFlags = CONTEXT_CONTROL;
+            captured = GetThreadContext(thread, &context);
+            if (captured)
+                ReadProcessMemory(GetCurrentProcess(), (void *)context.Rsp,
+                                  stack, sizeof stack, &bytes);
+            /* Resume before stdio: the guest may own the CRT's output lock. */
+            ResumeThread(thread);
+        }
+        if (thread) CloseHandle(thread);
+        if (captured) {
+            fprintf(stderr, "[%s NATIVE] RIP=0x%llX RSP=0x%llX\n", tag,
+                    (unsigned long long)context.Rip, (unsigned long long)context.Rsp);
+            for (i = 0; i < bytes / sizeof stack[0]; i++)
+                if (stack[i] >= 0x140000000ULL && stack[i] < 0x150000000ULL)
+                    fprintf(stderr, "    NS %u 0x%llX\n", i, (unsigned long long)stack[i]);
+        }
+    }
+#endif
+
     mem = (const uint8_t *)g_memory_offset;
     esp = s_watchdog_esp ? *s_watchdog_esp : 0;
     fprintf(stderr, "[%s] guest esp=0x%08X\n"
@@ -2091,6 +2122,9 @@ void xbox_WatchdogStart(void)
      * to be handed the address of the one that matters rather than reading
      * its own, which is always zero. */
     s_watchdog_esp = &g_esp;
+#if defined(_WIN32) && defined(_M_X64)
+    s_watchdog_tid = GetCurrentThreadId();
+#endif
     s_watchdog_regs[0] = &g_eax; s_watchdog_regs[1] = &g_ecx;
     s_watchdog_regs[2] = &g_edx; s_watchdog_regs[3] = &g_ebx;
     s_watchdog_regs[4] = &g_esi; s_watchdog_regs[5] = &g_edi;
