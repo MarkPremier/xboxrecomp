@@ -3174,6 +3174,11 @@ int nv2a_pb_exec_batch_spans(float width)
 
 static int gpu_raster_batch(void)
 {
+    /* The native backend's 16-bit path binds depth only. Serious Sam uses
+     * RGB565 for its display buffer, so accepting those colour draws there
+     * silently discards the entire picture. The CPU path writes RGB565. */
+    if ((s_gpu.format & 15u) == 3u && (s_gpu.color_mask & 0x01010101u))
+        return 0;
     uint8_t *memory = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t count = 0, index, stage;
     uint32_t prior_batches = s_gpu.gpu_batches;
@@ -3512,9 +3517,7 @@ volatile LONG g_nv2a_capture_request;
 
 static void raster_batch(void)
 {
-#ifndef _WIN32
     uint32_t i;
-#endif
 
     if (s_gpu.idx_count < (s_gpu.prim == NV_PRIM_POINTS ? 1u : s_gpu.prim <= NV_PRIM_LINE_STRIP ? 2u : 3u))
         return;
@@ -3698,7 +3701,7 @@ static void raster_batch(void)
     int rendered = gpu_raster_batch();
     s_gpu.gpu_prepare_seconds += gpu_clock_seconds() - started - (s_gpu.gpu_submit_seconds - prior_submit);
     if (rendered) return;
-    {
+    if ((s_gpu.format & 15u) != 3u || !(s_gpu.color_mask & 0x01010101u)) {
         static uint32_t unsupported_shown;
         if (unsupported_shown++ < 32) {
             fprintf(stderr, "[GPU-D3D11] unsupported batch: primitive %u count %u; skipping (no hardware path)\n", s_gpu.prim, s_gpu.idx_count);
@@ -3710,8 +3713,12 @@ static void raster_batch(void)
             }
             fflush(stderr);
         }
+        return;
     }
-#else
+    /* Preserve pending native depth/texture writes before the RGB565 path
+     * reads or modifies guest memory. Other formats keep their existing path. */
+    nv2a_gpu_sync();
+#endif
     s_gpu.cpu_batches++;
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
@@ -3758,7 +3765,6 @@ static void raster_batch(void)
 
     if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
-#endif
 }
 
 /* What a batch actually contains. Before anything can be rasterised, the

@@ -1180,8 +1180,10 @@ int main(int argument_count, char **arguments)
     _putenv_s("RECOMP_FB_DUMP", "");
     _putenv_s("RECOMP_TEX_DUMP", "");
     _putenv_s("RECOMP_RASTER_TEST", "");
-    test_invalid_pushbuffer_packets();
-    test_split_pushbuffer_packet();
+    if (!getenv("NV2A_GPU_RGB565_ONLY")) {
+        test_invalid_pushbuffer_packets();
+        test_split_pushbuffer_packet();
+    }
     method(0x0200, 8u << 16);
     method(0x0204, 8u << 16);
     method(0x0208, 0x28);
@@ -1216,8 +1218,39 @@ int main(int argument_count, char **arguments)
     method(0x0288, 0x0000000C);
     method(0x028C, 0x00001C80);
     draw(5, 3);
+    if (getenv("NV2A_GPU_RGB565_ONLY")) nv2a_gpu_sync();
     check("uploaded vertex program translates geometry", pixel(1, 1) == 0xFF000000);
     check("guest combiner computes lit pixel", pixel(3, 3) == 0xFF401020);
+    /* Serious Sam presents RGB565. Native 16-bit depth passes must not
+     * swallow colour writes, and publication must respect the guest pitch. */
+    method(0x0208, 0x23);
+    method(0x020C, 16u | (32u << 16));
+    memory[0x1000 / 4 + 32] = 0x12345678;
+    method(0x1D94, 0xF0);
+    draw(5, 3);
+    check("RGB565 colour draw reaches guest framebuffer",
+          ((uint16_t *)((uint8_t *)memory + 0x1000))[3 * 8 + 3] == 0x4084);
+    check("RGB565 colour draw preserves following memory",
+          memory[0x1000 / 4 + 32] == 0x12345678);
+    if (getenv("NV2A_GPU_RGB565_ONLY")) {
+        /* The boot movie uses a linear packed YUY2 texture, not ARGB. */
+        memory[0x3000 / 4] = 0xF0525A52; /* Y=82, U=90, V=240: red */
+        method(0x1B04, 0x24u << 8);
+        method(0x1B1C, 0x00020001);
+        for (index = 0; index < 3; index++)
+            for (attribute = 0; attribute < 4; attribute++)
+                vertices[index].diffuse[attribute] = 1;
+        method(0x1D94, 0xF0);
+        draw(5, 3);
+        check("YUY2 movie texture reaches RGB565 framebuffer",
+              ((uint16_t *)((uint8_t *)memory + 0x1000))[3 * 8 + 3] == 0xF800);
+        printf("nv2a_shader_rgb565: %s\n", failures ? "FAILED" : "ALL PASS");
+        return failures ? 1 : 0;
+    }
+    method(0x0208, 0x28);
+    method(0x020C, 32u | (32u << 16));
+    method(0x1D94, 0xF0);
+    draw(5, 3);
     bind_texture(1, 0x3010, 0xFF202040);
     method(0x1E70, 0x21);
     method(0x0AC0, 0x08090000);
