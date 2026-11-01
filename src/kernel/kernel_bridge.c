@@ -10322,8 +10322,9 @@ void xbox_kernel_bridge_init(void)
      * Halo that hung main() in a file-enumeration loop before it reached any
      * initialisation.
      *
-     * Only entries still carrying the ordinal marker are touched, so scanning
-     * back over unrelated .rdata is harmless.
+     * The marker alone is insufficient: Serious Sam has negative floating-point
+     * constants immediately before its import table. Only valid kernel ordinals
+     * may be rewritten, or this scan corrupts ordinary .rdata.
      */
     {
         const int LOOKBEHIND = 16;   /* entries, i.e. 64 bytes */
@@ -10338,7 +10339,9 @@ void xbox_kernel_bridge_init(void)
             uint32_t current = BRIDGE_MEM32(va);
             int slot;
 
-            if (!(current & 0x80000000)) {
+            if (!(current & 0x80000000) ||
+                !(current & 0x7FFFFFFF) ||
+                (current & 0x7FFFFFFF) > XBOX_KERNEL_THUNK_TABLE_SIZE) {
                 continue;            /* NULL separator or ordinary data */
             }
             slot = g_thunk_table_count + i;   /* park these above the main run */

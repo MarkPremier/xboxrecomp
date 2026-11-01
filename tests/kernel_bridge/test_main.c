@@ -71,8 +71,23 @@ int main(void)
 
     /* One import, in the form an XBE stores it: 0x80000000 | ordinal. */
     *(uint32_t *)(mem + THUNK_VA) = 0x80000000u | 173u;
+    /* Serious Sam stores signed constants just before its import table.
+     * Preserve them, while still finding a valid extra run across a NULL. */
+    *(uint32_t *)(mem + THUNK_VA - 8) = 0x80000000u | 173u;
+    *(uint32_t *)(mem + THUNK_VA - 12) = 0x80000000u;
+    *(uint32_t *)(mem + THUNK_VA - 16) = 0x8000017Bu;
+    *(uint32_t *)(mem + THUNK_VA - 20) = 0xD151E880u;
     xbox_kernel_set_thunk_address(THUNK_VA, 1);
     xbox_kernel_bridge_init();
+
+    check(recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA - 8)) != NULL,
+          "valid extra import found across a NULL separator", NULL);
+    check(*(uint32_t *)(mem + THUNK_VA - 12) == 0x80000000u,
+          "ordinal zero marker preserved as ordinary data", NULL);
+    check(*(uint32_t *)(mem + THUNK_VA - 16) == 0x8000017Bu,
+          "ordinal above kernel export range preserved", NULL);
+    check(*(uint32_t *)(mem + THUNK_VA - 20) == 0xD151E880u,
+          "Serious Sam signed constant preserved", NULL);
 
     /* bridge_init rewrites the entry in place to a synthetic VA. */
     recomp_func_t fn = recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA));
