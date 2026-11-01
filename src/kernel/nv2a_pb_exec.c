@@ -675,15 +675,12 @@ failure:
  * if a title ever needs true occlusion culling. */
 static void report_zpass(uint32_t offset)
 {
-    uint32_t ramin_offset = s_gpu.report_context;
-    if (!ramin_offset)
+    uint32_t ramin_offset;
+    /* SET_CONTEXT_DMA_REPORT supplies an object handle, even when it is
+     * numerically small (Serious Sam uses 12). Resolve it through RAMHT just
+     * like a semaphore context; it is never a direct RAMIN byte offset. */
+    if (!ramht_instance(s_gpu.report_context, &ramin_offset))
         goto failure;
-    if (ramin_offset >= 0x100000u) {
-        uint32_t instance;
-        if (!ramht_instance(ramin_offset, &instance))
-            goto failure;
-        ramin_offset = instance;
-    }
     volatile uint32_t *descriptor = xbox_Nv2aRegisterPointer(0x700000 + ramin_offset, 12);
     if (!descriptor)
         goto failure;
@@ -4874,7 +4871,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * report; the count itself is answered in report_zpass. */
         return;
     case NV097_GET_REPORT:
-        if ((param & NV097_GET_REPORT_TYPE) == NV097_GET_REPORT_TYPE_ZPASS_PIXEL_CNT)
+        if (((param & NV097_GET_REPORT_TYPE) >> 24) == NV097_GET_REPORT_TYPE_ZPASS_PIXEL_CNT)
             report_zpass(param & NV097_GET_REPORT_OFFSET);
         return;
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:

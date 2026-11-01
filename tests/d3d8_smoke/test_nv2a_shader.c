@@ -1143,6 +1143,31 @@ int main(int argument_count, char **arguments)
     TestVertex *vertices = (TestVertex *)((uint8_t *)memory + 0x4000);
     const uint32_t attributes[] = {0, 3, 9, 10};
     uint32_t index, attribute;
+    if (getenv("NV2A_GPU_REPORT_ONLY")) {
+        /* GET_REPORT type is in bits 24..31; the enum is an unshifted value.
+         * Serious Sam polls +12 for the completion sentinel to change. */
+        uint32_t *report = memory + 0x6000 / 4;
+        uint32_t *descriptor = nv2a_registers + 0x700200 / 4;
+        descriptor[0] = 0x0000003D;
+        descriptor[1] = sizeof memory - 1;
+        descriptor[2] = 0;
+        /* Small handles must still go through RAMHT, not be read as offsets. */
+        nv2a_registers[0x700000 / 4] = 12;
+        nv2a_registers[0x700004 / 4] = 0x80000020; /* instance 0x200, channel 0 */
+        method(0x01A8, 12);
+        method(0x0200, 640u << 16);
+        method(0x0204, 480u << 16);
+        for (index = 0; index < 5; index++) report[index] = 0xFFFFFFFF;
+        method(0x17D0, 0x02006000); /* Unsupported type must not signal. */
+        check("unknown report type preserves pending result", report[3] == 0xFFFFFFFF);
+        method(0x17D0, 0x01006000);
+        check("zpass report replaces pending timestamp", report[0] != 0xFFFFFFFF || report[1] != 0xFFFFFFFF);
+        check("zpass report supplies conservative visibility", report[2] == 640 * 480);
+        check("zpass report completes the query", report[3] == 0);
+        check("zpass report preserves following memory", report[4] == 0xFFFFFFFF);
+        printf("nv2a_shader_report: %s\n", failures ? "FAILED" : "ALL PASS");
+        return failures ? 1 : 0;
+    }
     check("DMA resolves harness memory",
           xbox_DmaPhysicalPointer(0x1000, 4) == (uint8_t *)memory + 0x1000);
     check("DMA rejects out-of-bounds span",
