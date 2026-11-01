@@ -5020,8 +5020,9 @@ static void bridge_KeAlertThread(void)
 /* ── KeWaitForMultipleObjects (ordinal 158, 8 args)
  *
  * KeWaitForSingleObject is routed; the multiple-object sibling was not. Like
- * NtWaitForMultipleObjectsEx, the Objects[] array in guest memory holds 32-bit
- * handle tokens, so each is resolved before the native wait sees it. */
+ * NtWaitForMultipleObjectsEx, the Objects[] array uses 32-bit values. Ke waits
+ * also accept guest dispatcher-object addresses: Serious Sam's multimedia
+ * worker waits on an event and a set of KTIMERs, not NT handle tokens. */
 #define BRIDGE_MAXIMUM_WAIT_OBJECTS 64
 
 static void bridge_KeWaitForMultipleObjects(void)
@@ -5032,6 +5033,7 @@ static void bridge_KeWaitForMultipleObjects(void)
     uint32_t alertable  = STACK_ARG(5);   /* 3=WaitReason, 4=WaitMode */
     uint32_t timeout_va = STACK_ARG(6);
     HANDLE handles[BRIDGE_MAXIMUM_WAIT_OBJECTS];
+    uint32_t guest_events[BRIDGE_MAXIMUM_WAIT_OBJECTS] = {0};
     uint32_t i;
 
     if (count == 0) {
@@ -5040,15 +5042,34 @@ static void bridge_KeWaitForMultipleObjects(void)
     }
     if (count > BRIDGE_MAXIMUM_WAIT_OBJECTS)
         count = BRIDGE_MAXIMUM_WAIT_OBJECTS;
-    for (i = 0; i < count; i++)
-        handles[i] = bridge_resolve_handle(
-            objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
+    for (i = 0; i < count; i++) {
+        uint32_t object = objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0;
+        int type;
+        handles[i] = ke_guest_event(object, &type);
+        if (handles[i]) {
+            if (BRIDGE_MEM32(object + 4))
+                SetEvent(handles[i]);
+            else {
+                ResetEvent(handles[i]);
+                if (BRIDGE_MEM32(object + 4)) SetEvent(handles[i]);
+            }
+            if (type == 1) guest_events[i] = object;
+        } else {
+            handles[i] = ke_shadow_lookup(object);
+            if (!handles[i]) handles[i] = bridge_resolve_handle(object);
+        }
+    }
 
     g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
         count, (PVOID *)handles, wait_type,
         STACK_ARG(3), (KPROCESSOR_MODE)STACK_ARG(4),
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
         XBOX_TO_NATIVE(STACK_ARG(7)));
+    if (g_eax < count) {
+        for (i = 0; i < count; i++)
+            if (guest_events[i] && (wait_type == 0 || i == g_eax))
+                BRIDGE_MEM32(guest_events[i] + 4) = 0;
+    }
 }
 
 #undef BRIDGE_MAXIMUM_WAIT_OBJECTS

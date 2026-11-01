@@ -77,7 +77,9 @@ int main(void)
     *(uint32_t *)(mem + THUNK_VA - 12) = 0x80000000u;
     *(uint32_t *)(mem + THUNK_VA - 16) = 0x8000017Bu;
     *(uint32_t *)(mem + THUNK_VA - 20) = 0xD151E880u;
-    xbox_kernel_set_thunk_address(THUNK_VA, 1);
+    *(uint32_t *)(mem + THUNK_VA + 4) = 0x80000000u | 113u;
+    *(uint32_t *)(mem + THUNK_VA + 8) = 0x80000000u | 158u;
+    xbox_kernel_set_thunk_address(THUNK_VA, 3);
     xbox_kernel_bridge_init();
 
     check(recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA - 8)) != NULL,
@@ -116,6 +118,39 @@ int main(void)
                  g_esp, STACK_VA + 8);
         check(g_esp == STACK_VA + 8,
               "ordinal 173 pops its stdcall argument", detail);
+    }
+
+    /* A guest KTIMER is an object VA, not a host handle. The multimedia
+     * worker in Serious Sam waits on these through the multiple-object API. */
+    {
+        const uint32_t timer = 0x30000, list = 0x31000, timeout = 0x32000;
+        uint32_t *sp = (uint32_t *)(mem + STACK_VA);
+        recomp_func_t init = recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA + 4));
+        recomp_func_t wait = recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA + 8));
+        check(init != NULL && wait != NULL, "timer and multiple-wait imports resolve", NULL);
+        if (init && wait) {
+            sp[0] = 0xBEEF0001u; sp[1] = timer; sp[2] = 1;
+            g_esp = STACK_VA;
+            init = recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA + 4));
+            init();
+            *(uint32_t *)(mem + list) = timer;
+            for (int pass = 0; pass < 2; pass++) {
+                if (pass) {
+                    extern int xbox_KeObjectSignal(uint32_t guest_va);
+                    check(xbox_KeObjectSignal(timer) == 0, "guest timer object signaled", NULL);
+                }
+                sp[0] = 0xBEEF0001u;
+                sp[1] = 1; sp[2] = list; sp[3] = 1; sp[4] = 6;
+                sp[5] = 1; sp[6] = 0; sp[7] = timeout; sp[8] = 0;
+                g_esp = STACK_VA;
+                wait = recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA + 8));
+                wait();
+                check(g_eax == (pass ? 0u : 0x102u),
+                      pass ? "multiple wait observes signaled guest timer" :
+                             "multiple wait times out on unsignaled guest timer", NULL);
+                check(g_esp == STACK_VA + 36, "multiple wait pops all eight arguments", NULL);
+            }
+        }
     }
 
     VirtualFree(mem, 0, MEM_RELEASE);
