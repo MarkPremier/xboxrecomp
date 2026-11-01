@@ -435,6 +435,7 @@ struct Surface {
     bool clear_value_valid;
     uint32_t clear_value;
     uint64_t last_used, content_serial, alias_copy_serial;
+    uint64_t used_frame;   /* surface_frame_serial when last bound or sampled */
     D3D11_BOX written_region;
     std::vector<uint64_t> written_mask;
     std::vector<uint8_t> source_snapshot;
@@ -471,6 +472,7 @@ struct DepthSurface {
     bool clear_value_valid;
     uint32_t clear_value;
     uint64_t last_used, content_serial;
+    uint64_t used_frame;   /* as Surface */
     D3D11_BOX written_region;
     std::vector<uint64_t> written_mask;
     std::vector<uint8_t> source_snapshot;
@@ -669,6 +671,7 @@ static_assert(sizeof(Constants) % 16 == 0 && sizeof(Constants) <= 65536, "D3D11 
 static std::vector<Surface> surfaces;
 static std::vector<DepthSurface> depth_surfaces;
 static uint64_t surface_use_serial;
+static uint64_t surface_frame_serial = 1;   /* advances on every flip */
 static uint64_t target_content_serial;
 static std::vector<CachedTexture> textures;
 /* Bind-time lookup is limited to entries with the same guest source address.
@@ -1822,6 +1825,7 @@ static Surface *get_surface(const Nv2aGpuDraw &state, bool preserve = true, Targ
     for (auto &surface : surfaces)
         if (surface.memory == state.color && surface.width == extent.width && surface.height == extent.height && surface.pitch == state.pitch) {
             surface.last_used = ++surface_use_serial;
+            surface.used_frame = surface_frame_serial;
             if (preserve) refresh_surface(surface);
             else surface.needs_refresh = false;
             return &surface;
@@ -1830,6 +1834,7 @@ static Surface *get_surface(const Nv2aGpuDraw &state, bool preserve = true, Targ
     surface.memory = state.color; surface.width = extent.width; surface.height = extent.height; surface.pitch = state.pitch;
     texture_size(extent.width, extent.height, true, surface.texture_width, surface.texture_height);
     surface.last_used = ++surface_use_serial;
+    surface.used_frame = surface_frame_serial;
     bool scaled = is_scaled(surface);
     D3D11_SUBRESOURCE_DATA data = {state.color, state.pitch, 0};
     if (!create_color_textures(surface, preserve ? &data : nullptr) || !create_ms_color(surface)) return nullptr;
@@ -2046,6 +2051,7 @@ static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, T
             surface.pitch == state.depth_pitch && surface.format == state.depth_format &&
             surface.texture_width == texture_width && surface.texture_height == texture_height) {
             surface.last_used = ++surface_use_serial;
+            surface.used_frame = surface_frame_serial;
             if (!preserve) { surface.needs_refresh = false; return &surface; }
             return refresh_depth(surface) ? &surface : nullptr;
         }
@@ -2053,6 +2059,7 @@ static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, T
     surface.memory = state.depth; surface.width = extent.width; surface.height = extent.height; surface.pitch = state.depth_pitch; surface.format = state.depth_format;
     surface.texture_width = texture_width; surface.texture_height = texture_height;
     surface.last_used = ++surface_use_serial;
+    surface.used_frame = surface_frame_serial;
     if (!create_depth_textures(surface) || !create_ms_depth(surface)) return nullptr;
     D3D11_TEXTURE2D_DESC description = {};
     description.Width = extent.width; description.Height = extent.height;
@@ -2316,6 +2323,41 @@ static void wait_ordering_completion(void)
     }
 }
 
+/* Publication is lazy: a target that is not presented stays dirty on the GPU
+ * until some later full sync, which can come long after the title stopped
+ * using it -- after it freed the memory and put something else there. On
+ * hardware the GPU wrote that memory when it ran the commands, before the
+ * title's fence let it reuse the block; publishing then wrote the old target
+ * over the new owner. Turok Evolution's 256x256 shadow-map depth, cleared in
+ * one level, was published over the next load's vertex data and recorded
+ * pushbuffer: the executor ran the cleared words as commands, skipped to PUT
+ * past fence releases, and the game waited on them forever.
+ *
+ * So a dirty surface not used for two frames whose guest RAM no longer holds
+ * what was last published there belongs to someone else now: forget its GPU
+ * content (the next use uploads RAM) rather than publish it. A live target is
+ * used every frame and never reaches the comparison. */
+template<typename SurfaceType>
+static bool abandoned_surface(SurfaceType &surface, uint32_t bytes)
+{
+    if (!surface.dirty || !surface.snapshot_valid || surface_frame_serial - surface.used_frame < 2) return false;
+    size_t row_bytes = (size_t)surface.width * bytes;
+    for (uint32_t row = 0; row < surface.height; row++)
+        if (std::memcmp(surface.memory + (size_t)row * surface.pitch,
+                        surface.source_snapshot.data() + (size_t)row * row_bytes, row_bytes)) {
+            static unsigned reported;
+            if (reported++ < 16)
+                std::fprintf(stderr, "[GPU-D3D11] %ux%u target %p reused by the title; not published\n",
+                             surface.width, surface.height, (const void *)surface.memory);
+            surface.dirty = false;
+            surface.clear_value_valid = false;
+            surface.snapshot_valid = false;
+            surface.needs_refresh = true;
+            return true;
+        }
+    return false;
+}
+
 static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_bytes = 0)
 {
     GpuTimer sync_timer(gpu_timing.sync);
@@ -2345,6 +2387,8 @@ static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_
         }
         return;
     }
+    for (auto &surface : surfaces) abandoned_surface(surface, 4);
+    for (auto &surface : depth_surfaces) abandoned_surface(surface, surface.format == 1 ? 2 : 4);
     ID3D11RenderTargetView *empty = nullptr;
     context->OMSetRenderTargets(1, &empty, nullptr);
     bool has_readback = false;
@@ -2789,6 +2833,7 @@ static void flip_bookkeeping()
     for (auto &stream : vertex_streams) release_stream(stream);
     release_stream(constant_stream);
     s_texture_validate_serial++;
+    surface_frame_serial++;
     for (auto &surface : surfaces)
         if (!surface.dirty) surface.needs_refresh = true;
     for (auto &surface : depth_surfaces)
@@ -3560,6 +3605,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                          (const void *)shadow->memory, candidates, shadow->texture_width, shadow->texture_height);
         if (!shadow->dirty && !refresh_depth(*shadow)) return nullptr;
         shadow->last_used = ++surface_use_serial;
+        shadow->used_frame = surface_frame_serial;
         resolve_depth(*shadow);
         return shadow->sample_view.Get();
     }
