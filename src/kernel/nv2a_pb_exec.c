@@ -3631,12 +3631,13 @@ static void raster_batch(void)
                     s_gpu.fog_parameters[0], s_gpu.fog_parameters[1], s_gpu.fog_parameters[2], s_gpu.combiners.fog_color[0],
                     s_gpu.combiners.fog_color[1], s_gpu.combiners.fog_color[2], s_gpu.cull_enable,
                     s_gpu.cull_face);
-            fprintf(info_out, "[BINFO]   stencil %u/%X ref %X mask %X/%X ops %X/%X/%X offset %X %g,%g cmask %08X zeta %06X\n",
+            fprintf(info_out, "[BINFO]   stencil %u/%X ref %X mask %X/%X ops %X/%X/%X offset %X %g,%g cmask %08X zeta %06X control0 %08X%s\n",
                     s_gpu.stencil_enable, s_gpu.stencil_func,
                     s_gpu.stencil_ref, s_gpu.stencil_read_mask, s_gpu.stencil_write_mask,
                     s_gpu.stencil_fail, s_gpu.stencil_depth_fail, s_gpu.stencil_pass,
                     s_gpu.polygon_offset_enable, s_gpu.polygon_offset_scale, s_gpu.polygon_offset_bias,
-                    s_gpu.color_mask, s_gpu.depth_offset & 0x0FFFFFFFu);
+                    s_gpu.color_mask, s_gpu.depth_offset & 0x0FFFFFFFu, s_gpu.control0,
+                    (s_gpu.control0 & 0x10000u) ? " w-buffer" : "");
             if ((s_gpu.transform_execution_mode & 3u) == 2u) {
                 /* Where the batch lands (logical pixels) and the oFog its
                  * vertex program wrote, from the CPU interpreter. */

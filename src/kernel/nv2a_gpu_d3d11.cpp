@@ -4611,6 +4611,16 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     }
     constants.depth_range[0] = depth_clip_min; constants.depth_range[1] = depth_clip_max;
     constants.depth_range[2] = (float)depth_clamp;
+    {   /* How many times its own offset a decal pulled forward takes (the
+         * shader's finish_pixel): RECOMP_DECAL_OFFSET_SCALE, default 16. */
+        static float scale = -1.0f;
+        if (scale < 0) {
+            const char *text = std::getenv("RECOMP_DECAL_OFFSET_SCALE");
+            scale = text && *text ? (float)std::atof(text) : 16.0f;
+            if (!(scale >= 1)) scale = 1.0f;
+        }
+        constants.depth_range[3] = scale;
+    }
     if (front_offset || back_offset) {
         constants.depth_offset[0] = state->polygon_offset_scale; constants.depth_offset[1] = state->polygon_offset_bias;
         constants.depth_offset[2] = front_offset ? 1.0f : 0.0f; constants.depth_offset[3] = back_offset ? 1.0f : 0.0f;

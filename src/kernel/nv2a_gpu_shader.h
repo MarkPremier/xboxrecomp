@@ -370,8 +370,13 @@ PixelOutput finish_pixel(float4 color,Pixel input,bool frontFacing) {
    slopeOffset=depthOffset.x*input.depthSlope;
    if(NV_W_DEPTH) {slopeOffset*=depth; slopeOffset*=depth;}
   }
-  depth+=depthOffset.y;
-  depth+=slopeOffset;
+  /* A decal pulled forward (Turok's blood and bullet holes: bias -1, scale
+     -0.25) wins against its ground on the NV2A; here, flying low over it,
+     patches of the ground won (Combat Flight). Its whole offset is taken
+     depthRange.w times (RECOMP_DECAL_OFFSET_SCALE) with a z-buffer. */
+  float decalScale=!NV_W_DEPTH && (depthOffset.y<0 || depthOffset.x<0)?depthRange.w:1;
+  depth+=depthOffset.y*decalScale;
+  depth+=slopeOffset*decalScale;
   if(NV_W_DEPTH && isnan(depth))depth=3.402823466e38;
  }
  if(depthRange.z==0 && (clipDepth<depthRange.x || clipDepth>depthRange.y))discard;
