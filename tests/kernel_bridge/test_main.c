@@ -71,7 +71,7 @@ int main(void)
 
     /* One import, in the form an XBE stores it: 0x80000000 | ordinal. */
     *(uint32_t *)(mem + THUNK_VA) = 0x80000000u | 173u;
-    /* Serious Sam stores signed constants just before its import table.
+    /* Serious Sam has XPP instruction words just before its import table.
      * Preserve them, while still finding a valid extra run across a NULL. */
     *(uint32_t *)(mem + THUNK_VA - 8) = 0x80000000u | 173u;
     *(uint32_t *)(mem + THUNK_VA - 12) = 0x80000000u;
@@ -87,7 +87,7 @@ int main(void)
     check(*(uint32_t *)(mem + THUNK_VA - 16) == 0x8000017Bu,
           "ordinal above kernel export range preserved", NULL);
     check(*(uint32_t *)(mem + THUNK_VA - 20) == 0xD151E880u,
-          "Serious Sam signed constant preserved", NULL);
+          "Serious Sam XPP instruction word preserved", NULL);
 
     /* bridge_init rewrites the entry in place to a synthetic VA. */
     recomp_func_t fn = recomp_lookup_kernel(*(uint32_t *)(mem + THUNK_VA));

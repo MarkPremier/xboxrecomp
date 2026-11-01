@@ -10322,9 +10322,9 @@ void xbox_kernel_bridge_init(void)
      * Halo that hung main() in a file-enumeration loop before it reached any
      * initialisation.
      *
-     * The marker alone is insufficient: Serious Sam has negative floating-point
-     * constants immediately before its import table. Only valid kernel ordinals
-     * may be rewritten, or this scan corrupts ordinary .rdata.
+     * The marker alone is insufficient: Serious Sam's XPP instructions end
+     * immediately before its import table. Only valid kernel ordinals may be
+     * rewritten, or this scan corrupts unrelated guest image bytes.
      */
     {
         const int LOOKBEHIND = 16;   /* entries, i.e. 64 bytes */
