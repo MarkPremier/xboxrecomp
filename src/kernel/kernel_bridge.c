@@ -1743,17 +1743,25 @@ static void bridge_NtWaitForSingleObjectEx(void)
     uint32_t alertable   = STACK_ARG(2);
     uint32_t timeout_ptr = STACK_ARG(3);
 
-    static int logged = 0;
-    if (logged++ < 20) {
+    static LONG logged = 0;
+    int trace = InterlockedIncrement(&logged) <= 20;
+    uint32_t caller = g_xbox_kernel_caller;
+    uint32_t token = STACK_ARG(0);
+    if (trace) {
         fprintf(stderr, "  [KERNEL] NtWaitForSingleObjectEx: token=0x%08X "
-                "handle=%p timeout=%s\n",
-                STACK_ARG(0), handle, timeout_ptr ? "finite" : "INFINITE");
+                "handle=%p timeout=%s caller=%08X esp=%08X\n",
+                token, handle, timeout_ptr ? "finite" : "INFINITE", caller, g_esp);
         fflush(stderr);
     }
 
     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
+    if (trace) {
+        fprintf(stderr, "  [KERNEL] NtWaitForSingleObjectEx returned: token=%08X "
+                "caller=%08X status=%08X\n", token, caller, g_eax);
+        fflush(stderr);
+    }
 }
 
 /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
@@ -4522,6 +4530,16 @@ static void bridge_RtlRaiseException(void)
     if (raise_count <= 10) {
         fprintf(stderr, "  [KERNEL] RtlRaiseException: record=0x%08X code=0x%08X (#%d)\n",
                 record_ptr, code, raise_count);
+        if (code == 0xE06D7363u && getenv("RECOMP_EXCEPTION_TRACE")) {
+            uint32_t object = BRIDGE_MEM32(record_ptr + 24);
+            fprintf(stderr, "  [CXX] object=%08X info=%08X caller=%08X\n",
+                object, BRIDGE_MEM32(record_ptr + 28), g_xbox_kernel_caller);
+            if (object >= 0x10000 && object < XBOX_TOTAL_RAM - 1024) {
+                uint32_t text = BRIDGE_MEM32(object);
+                if (text >= 0x10000 && text < XBOX_TOTAL_RAM - 1024)
+                    fprintf(stderr, "  [CXX] text: %.1024s\n", (const char *)XBOX_TO_NATIVE(text));
+            }
+        }
         fflush(stderr);
     }
 

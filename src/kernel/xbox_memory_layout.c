@@ -1986,6 +1986,20 @@ static void watchdog_sample(const char *tag)
      * CPU loop polling a global is exactly the case neither of those covers.
      */
     xbox_PeekSample("peek");
+    /* A worker can stall while the main thread sleeps. Allow its known guest
+     * stack range to be sampled as well; never dereference an unmapped page. */
+    {
+        const char *worker_stack = getenv("RECOMP_WATCH_STACK");
+        if (worker_stack) {
+            uint32_t start = (uint32_t)strtoul(worker_stack, NULL, 0);
+            for (i = 0; start && i < 256; i++) {
+                uint32_t slot = start + i * 4u;
+                if (slot < start || !peek_readable(slot)) break;
+                fprintf(stderr, "    WS %08X %08X\n", slot,
+                        *(const uint32_t *)(mem + slot));
+            }
+        }
+    }
     /* The pushbuffer pointers, unconditionally.
      *
      * "Extend the table as more handshakes turn up -- run the title and the
