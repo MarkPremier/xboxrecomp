@@ -629,6 +629,36 @@ static bool depth_scaled(const uint8_t *memory)
     return !depth_only_targets.count(memory);
 }
 
+/* Shadow maps (depth-only targets) drawn 1, 2 or 4 times the title's size on
+ * each axis, apart from the render scale: the title keeps its own map in
+ * guest RAM, the GPU draws and samples a finer one (the shadow compare's
+ * four-tap filter reads the texture's own size), so shadow edges are sharper
+ * and less blocky. nv2a_gpu_set_shadow_scale changes it at the next flip;
+ * RECOMP_SHADOW_SCALE sets the start. */
+static float current_shadow_scale = 0.0f;
+static std::atomic<int> pending_shadow_scale{-1};
+
+static float shadow_scale()
+{
+    if (current_shadow_scale == 0.0f) {
+        const char *value = std::getenv("RECOMP_SHADOW_SCALE");
+        int factor = value ? std::atoi(value) : 1;
+        current_shadow_scale = factor >= 4 ? 4.0f : factor >= 2 ? 2.0f : 1.0f;
+    }
+    return current_shadow_scale;
+}
+
+/* A depth target's texture size: the render scale's, or a shadow map's own. */
+static void depth_texture_size(const uint8_t *memory, uint32_t width, uint32_t height, UINT &texture_width, UINT &texture_height)
+{
+    if (depth_scaled(memory)) {
+        texture_size(width, height, true, texture_width, texture_height);
+        return;
+    }
+    texture_width = extent_at(width, shadow_scale());
+    texture_height = extent_at(height, shadow_scale());
+}
+
 /* One edge of a rectangle, from one target's pixels to another's. */
 static LONG scale_edge(LONG value, uint32_t from, uint32_t to)
 {
@@ -2045,7 +2075,7 @@ static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, T
         return nullptr;
     }
     UINT texture_width, texture_height;
-    texture_size(extent.width, extent.height, depth_scaled(state.depth), texture_width, texture_height);
+    depth_texture_size(state.depth, extent.width, extent.height, texture_width, texture_height);
     for (auto &surface : depth_surfaces)
         if (surface.memory == state.depth && surface.width == extent.width && surface.height == extent.height &&
             surface.pitch == state.depth_pitch && surface.format == state.depth_format &&
@@ -2098,9 +2128,8 @@ static void resize_targets(const char *why)
     }
     for (size_t index = 0; index < depth_surfaces.size();) {
         DepthSurface &surface = depth_surfaces[index];
-        bool scaled = depth_scaled(surface.memory);
         UINT width, height;
-        texture_size(surface.width, surface.height, scaled, width, height);
+        depth_texture_size(surface.memory, surface.width, surface.height, width, height);
         if (width == surface.texture_width && height == surface.texture_height) { index++; continue; }
         resolve_depth(surface);
         ComPtr<ID3D11ShaderResourceView> old = surface.sample_view;
@@ -2144,6 +2173,12 @@ static void apply_target_sizes()
             std::snprintf(why + std::strlen(why), sizeof why - std::strlen(why), "%sheat haze %s",
                           *why ? ", " : "", haze == 2 ? "sharp" : "at the render scale");
     }
+    int shadow = pending_shadow_scale.exchange(-1);
+    if (shadow > 0 && (float)shadow != shadow_scale()) {
+        std::snprintf(why + std::strlen(why), sizeof why - std::strlen(why), "%sshadow maps %gx -> %dx",
+                      *why ? ", " : "", shadow_scale(), shadow);
+        current_shadow_scale = (float)shadow;
+    }
     int samples = pending_msaa.exchange(-1);
     if (samples > 0 && (UINT)samples != msaa_samples) {
         UINT quality = 0;
@@ -2179,6 +2214,12 @@ extern "C" void nv2a_gpu_set_msaa(int samples)
 extern "C" void nv2a_gpu_set_heat_haze(int mode)
 {
     pending_heat_haze.store(mode >= 2 ? 2 : mode == 1 ? 1 : 0);
+}
+
+/* Shadow maps drawn 1, 2 or 4 times the title's size, from the next flip. */
+extern "C" void nv2a_gpu_set_shadow_scale(int factor)
+{
+    pending_shadow_scale.store(factor >= 4 ? 4 : factor >= 2 ? 2 : 1);
 }
 
 extern "C" void nv2a_gpu_set_render_scale(float scale)
@@ -3192,7 +3233,7 @@ static bool matches_color_target(const Surface &surface, const Nv2aGpuDraw &stat
 static bool matches_depth_target(const DepthSurface &surface, const Nv2aGpuDraw &state, TargetExtent extent)
 {
     UINT texture_width, texture_height;
-    texture_size(extent.width, extent.height, depth_scaled(state.depth), texture_width, texture_height);
+    depth_texture_size(state.depth, extent.width, extent.height, texture_width, texture_height);
     return surface.memory == state.depth && surface.width == extent.width &&
         surface.height == extent.height && surface.pitch == state.depth_pitch && surface.format == state.depth_format &&
         surface.texture_width == texture_width && surface.texture_height == texture_height;

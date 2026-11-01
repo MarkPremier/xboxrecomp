@@ -48,6 +48,7 @@ void nv2a_gpu_set_msaa(int samples);
  * sharp (smooth, and small screen-copy targets at the screen's density).
  * From the next flip; any thread. */
 void nv2a_gpu_set_heat_haze(int mode);
+void nv2a_gpu_set_shadow_scale(int factor);
 void nv2a_gpu_surface_modified(const void *addr, size_t bytes);
 void nv2a_gpu_surface_publish(const void *addr, size_t bytes);
 void nv2a_gpu_invalidate(void);
