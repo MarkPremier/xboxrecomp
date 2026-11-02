@@ -155,6 +155,11 @@ static int present_interval(void)
     }
     return s_present_interval;
 }
+
+int xbox_GetPresentInterval(void)
+{
+    return present_interval();
+}
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
 /* Would writing this surface land on the title's own image?

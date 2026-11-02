@@ -10,6 +10,8 @@ extern "C" {
 
 int nv2a_gpu_available(void);
 int nv2a_gpu_compile(void);
+/* Current native presentation interval, including live window changes. */
+int xbox_GetPresentInterval(void);
 void nv2a_gpu_sync(void);
 void nv2a_gpu_wait(void);
 void nv2a_gpu_flush(void);
