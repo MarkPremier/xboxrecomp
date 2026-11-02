@@ -3408,7 +3408,8 @@ extern "C" int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t
     uint32_t depth_bytes = state->depth_format == 1 ? 2u : 4u;
     auto cpu_path = []() { gpu_timing.clear_fallbacks++; return 0; };
     if ((flags & ~0xF3u) || !state->width || !state->height || state->width > 4096 || state->height > 4096 ||
-        state->clip_x || state->clip_y || state->clip_width != state->width || state->clip_height != state->height)
+        state->clip_x > state->width || state->clip_y > state->height ||
+        state->clip_width > state->width - state->clip_x || state->clip_height > state->height - state->clip_y)
         return cpu_path();
     if (clear_color && ((flags & 0xF0u) != 0xF0u || !state->color ||
         (state->bytes_per_pixel != 4 && state->bytes_per_pixel != 2) ||
@@ -3431,7 +3432,8 @@ extern "C" int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t
     targets.stencil_enable = clear_stencil;
     if (!targets.depth_enable) targets.depth = nullptr;
     TargetExtent extent = reusable_target_extent(targets);
-    bool partial = extent.width != state->width || extent.height != state->height;
+    bool partial = extent.width != state->width || extent.height != state->height ||
+        state->clip_x || state->clip_y || state->clip_width != state->width || state->clip_height != state->height;
     prepare_target_cache(targets, extent);
     Surface *surface = clear_color ? get_surface(targets, partial, extent) : nullptr;
     if (clear_color && !surface) return -1;
@@ -3442,7 +3444,8 @@ extern "C" int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t
         const char *value = std::getenv("RECOMP_NV2A_KNOWN_CLEARS");
         return !value || std::strcmp(value, "0") != 0;
     }();
-    D3D11_BOX region = {0, 0, 0, state->width, state->height, 1};
+    D3D11_BOX region = {state->clip_x, state->clip_y, 0,
+                       state->clip_x + state->clip_width, state->clip_y + state->clip_height, 1};
     if (partial) {
         if (!clear_target_rectangle(*state, surface, depth, clear_depth, clear_stencil, color, depth_value)) return -1;
         gpu_timing.partial_target_clears++;
@@ -4501,9 +4504,12 @@ static bool clear_target_rectangle(const Nv2aGpuDraw &state, Surface *surface, D
     uint32_t guest_width = surface ? surface->width : depth->width, guest_height = surface ? surface->height : depth->height;
     uint32_t texture_width = surface ? surface->texture_width : depth->texture_width;
     uint32_t texture_height = surface ? surface->texture_height : depth->texture_height;
-    D3D11_RECT clip = {0, 0, scale_edge((LONG)state.width, guest_width, texture_width),
-                       scale_edge((LONG)state.height, guest_height, texture_height)};
-    D3D11_VIEWPORT viewport = {0, 0, (float)clip.right, (float)clip.bottom, 0, 1};
+    D3D11_RECT clip = {scale_edge((LONG)state.clip_x, guest_width, texture_width),
+                      scale_edge((LONG)state.clip_y, guest_height, texture_height),
+                      scale_edge((LONG)(state.clip_x + state.clip_width), guest_width, texture_width),
+                      scale_edge((LONG)(state.clip_y + state.clip_height), guest_height, texture_height)};
+    D3D11_VIEWPORT viewport = {0, 0, (float)scale_edge((LONG)state.width, guest_width, texture_width),
+                              (float)scale_edge((LONG)state.height, guest_height, texture_height), 0, 1};
     context->RSSetState(pipeline.raster.Get());
     context->RSSetViewports(1, &viewport);
     context->RSSetScissorRects(1, &clip);

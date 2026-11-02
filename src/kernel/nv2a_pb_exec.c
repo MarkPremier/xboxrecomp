@@ -494,12 +494,10 @@ static struct {
     uint32_t window_clip_valid, window_clip_type;
     uint32_t window_clip_horizontal[8], window_clip_vertical[8];
     uint32_t clear_color;
-    /* Clear rectangle (SET_CLEAR_RECT_*): the region CLEAR_SURFACE is meant to
-     * touch. Recorded, not applied -- the software clear uses the surface clip,
-     * which the title sets to the same region when it matters.
-     * ponytail: honour clear_rect_* here if a title is ever seen clearing a
-     * sub-region it expects the rest of the surface to survive. */
-    uint32_t clear_rect_x, clear_rect_w, clear_rect_y, clear_rect_h;
+    /* CLEAR_RECT stores inclusive minimum/maximum edges, not a width/height.
+     * Serious Sam uses these to fill sliders without erasing the menu. */
+    uint32_t clear_rect_x, clear_rect_right, clear_rect_y, clear_rect_bottom;
+    uint32_t clear_rect_valid;
     /* Benign render state captured so it is classified rather than counted.
      * The software rasteriser does not act on any of it. */
     uint32_t anti_alias_control, swath_width, stipple_enable, occlude_zstencil_en;
@@ -1474,7 +1472,8 @@ static int cpu_rgb565(void)
     return enabled;
 }
 
-static int gpu_clear_surface(uint32_t param)
+static int gpu_clear_surface(uint32_t param, uint32_t left, uint32_t top,
+                             uint32_t right, uint32_t bottom)
 {
     static int enabled = -1;
     Nv2aGpuDraw state = {0};
@@ -1484,14 +1483,16 @@ static int gpu_clear_surface(uint32_t param)
         const char *setting = getenv("RECOMP_NV2A_NATIVE_CLEARS");
         enabled = !setting || strcmp(setting, "0") != 0;
     }
-    if (!enabled || s_gpu.clip_x || s_gpu.clip_y || !s_gpu.clip_w || !s_gpu.clip_h)
+    if (!enabled || !s_gpu.clip_w || !s_gpu.clip_h)
         return 0;
     {   /* the whole real surface, not its left (or top) part */
         uint32_t sx, sy;
         surface_aa_scale(&sx, &sy);
         state.aa_scale_x = sx; state.aa_scale_y = sy;
-        state.width = state.clip_width = s_gpu.clip_w * sx;
-        state.height = state.clip_height = s_gpu.clip_h * sy;
+        state.width = (s_gpu.clip_x + s_gpu.clip_w) * sx;
+        state.height = (s_gpu.clip_y + s_gpu.clip_h) * sy;
+        state.clip_x = left; state.clip_y = top;
+        state.clip_width = right - left; state.clip_height = bottom - top;
     }
     state.bytes_per_pixel = surface_bpp();
     state.pitch = s_gpu.pitch;
@@ -1532,7 +1533,16 @@ static int gpu_clear_surface(uint32_t param)
             surface_write_refused(base, state.height * state.depth_pitch, "depth clear")) return 0;
         state.depth = memory + base;
     }
-    result = nv2a_gpu_clear(&state, param, s_gpu.clear_color, s_gpu.depth_clear);
+    /* COLOR_CLEAR_VALUE is already packed in the target format. The native
+     * backend accepts ARGB, so expand RGB565 here rather than treating its raw
+     * 0xCCC0 (Sam's gold slider) as the cyan ARGB value 0x0000CCC0. */
+    uint32_t color = s_gpu.clear_color;
+    if ((s_gpu.format & 15u) == 3u) {
+        uint32_t r = (color >> 11) & 31u, g = (color >> 5) & 63u, b = color & 31u;
+        color = 0xFF000000u | ((r * 255u / 31u) << 16) |
+                ((g * 255u / 63u) << 8) | (b * 255u / 31u);
+    }
+    result = nv2a_gpu_clear(&state, param, color, s_gpu.depth_clear);
     if (result < 0) {
         fprintf(stderr, "  [GPU] native clear failed: flags 0x%08X, color 0x%08X, depth 0x%08X\n",
                 param, s_gpu.color_offset, s_gpu.depth_offset);
@@ -1548,10 +1558,25 @@ static void clear_surface(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x, width;
+    uint32_t sx, sy, left, top, right, bottom;
     int native_clear = 0;
 
+    left = s_gpu.clip_x; top = s_gpu.clip_y;
+    right = left + s_gpu.clip_w; bottom = top + s_gpu.clip_h;
+    if (s_gpu.clear_rect_valid & 1u) {
+        if (left < s_gpu.clear_rect_x) left = s_gpu.clear_rect_x;
+        if (right > s_gpu.clear_rect_right + 1u) right = s_gpu.clear_rect_right + 1u;
+    }
+    if (s_gpu.clear_rect_valid & 2u) {
+        if (top < s_gpu.clear_rect_y) top = s_gpu.clear_rect_y;
+        if (bottom > s_gpu.clear_rect_bottom + 1u) bottom = s_gpu.clear_rect_bottom + 1u;
+    }
+    if (right <= left || bottom <= top) return;
+    surface_aa_scale(&sx, &sy);
+    left *= sx; right *= sx; top *= sy; bottom *= sy;
+
 #ifdef _WIN32
-    native_clear = gpu_clear_surface(param);
+    native_clear = gpu_clear_surface(param, left, top, right, bottom);
 #endif
     if (native_clear == 2) {
         /* Depth cleared on the GPU; the 16-bit colour bytes no draw ever
@@ -1565,11 +1590,11 @@ static void clear_surface(uint32_t param)
         uint32_t depth_bpp = format == 1 ? 2u : format == 2 ? 4u : 0u;
         uint32_t base = dma_resolve(s_gpu.depth_offset);
         if (depth_bpp && !(s_gpu.control0 & 0x1000u) &&
-            s_gpu.depth_pitch >= (s_gpu.clip_x + s_gpu.clip_w) * depth_bpp &&
-            !surface_write_refused(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.depth_pitch, "depth clear")) {
-            for (y = s_gpu.clip_y; y < s_gpu.clip_y + s_gpu.clip_h; y++) {
+            s_gpu.depth_pitch >= right * depth_bpp &&
+            !surface_write_refused(base, bottom * s_gpu.depth_pitch, "depth clear")) {
+            for (y = top; y < bottom; y++) {
                 uint8_t *row = mem + base + (size_t)y * s_gpu.depth_pitch;
-                for (x = s_gpu.clip_x; x < s_gpu.clip_x + s_gpu.clip_w; x++) {
+                for (x = left; x < right; x++) {
                     if (depth_bpp == 2) {
                         if (param & 1u) ((uint16_t *)row)[x] = (uint16_t)s_gpu.depth_clear;
                     } else {
@@ -1583,33 +1608,29 @@ static void clear_surface(uint32_t param)
     }
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
-    if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0 || s_gpu.clip_x >= s_gpu.pitch / bpp)
+    if (!s_gpu.color_offset || !s_gpu.pitch || bpp == 0 || left >= s_gpu.pitch / bpp)
         return;
-    width = s_gpu.clip_w;
-    if (width > s_gpu.pitch / bpp - s_gpu.clip_x) width = s_gpu.pitch / bpp - s_gpu.clip_x;
+    width = right - left;
+    if (width > s_gpu.pitch / bpp - left) width = s_gpu.pitch / bpp - left;
     {
         uint32_t base = dma_resolve(s_gpu.color_offset);
         if (surface_write_refused(base,
-                                  (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch,
+                                  bottom * s_gpu.pitch,
                                   "clear"))
             return;
         s_gpu.color_base = base;
     }
 
-    for (y = 0; !native_clear && y < s_gpu.clip_h; y++) {
+    for (y = top; !native_clear && y < bottom; y++) {
         uint8_t *row = mem + s_gpu.color_base
-                     + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+                     + (size_t)y * s_gpu.pitch;
         if (bpp == 4) {
-            uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
+            uint32_t *p = (uint32_t *)row + left;
             for (x = 0; x < width; x++)
                 p[x] = s_gpu.clear_color;
         } else if (bpp == 2) {
-            /* The clear value is always given as A8R8G8B8; a 16-bit surface
-             * takes the same colour reduced to 5:6:5. */
-            uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
-                                  | ((s_gpu.clear_color >> 5) & 0x07E0)
-                                  | ((s_gpu.clear_color >> 3) & 0x001F));
-            uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
+            uint16_t v = (uint16_t)s_gpu.clear_color;
+            uint16_t *p = (uint16_t *)row + left;
             for (x = 0; x < width; x++)
                 p[x] = v;
         }
@@ -5234,12 +5255,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.dither_enable = param;
         break;
     case NV097_SET_CLEAR_RECT_HORIZONTAL:
-        s_gpu.clear_rect_x = param & 0xFFFF;
-        s_gpu.clear_rect_w = (param >> 16) & 0xFFFF;
+        s_gpu.clear_rect_x = param & 0xFFF;
+        s_gpu.clear_rect_right = (param >> 16) & 0xFFF;
+        s_gpu.clear_rect_valid |= 1u;
         break;
     case NV097_SET_CLEAR_RECT_VERTICAL:
-        s_gpu.clear_rect_y = param & 0xFFFF;
-        s_gpu.clear_rect_h = (param >> 16) & 0xFFFF;
+        s_gpu.clear_rect_y = param & 0xFFF;
+        s_gpu.clear_rect_bottom = (param >> 16) & 0xFFF;
+        s_gpu.clear_rect_valid |= 2u;
         break;
 
     default:
