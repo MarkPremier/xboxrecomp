@@ -1428,6 +1428,11 @@ class Lifter:
         # Addresses loaded as immediates into a register inside the current
         # function, used to resolve `jmp <reg>`. See _lift_jmp.
         self.imm_code_refs = set()
+        # C++ exception handling (cxx_eh.py): the `mov fs:[0], esp` of each
+        # try-block registration in the current function -> its catch
+        # continuations, and the `jmp eax` sites of _JumpToContinuation.
+        self.eh_anchor_sites = {}
+        self.eh_continue_sites = set()
 
     def _call_target_name(self, addr):
         """Get the name for a call target address.
@@ -1459,6 +1464,31 @@ class Lifter:
         m = insn.mnemonic
         ops = insn.operands
         nops = len(ops)
+
+        # ── C++ exception handling (see cxx_eh.py) ──
+        # A try-block registration is live from here: arm the native anchor a
+        # catch continuation longjmps back to, and branch to the continuation.
+        if insn.address in self.eh_anchor_sites and m == "mov":
+            lines = self._lift_mov(insn, ops)
+            lines.append("if (setjmp(*recomp_eh_anchor(esp))) {"
+                         " ebp = g_ebp; /* C++ catch continuation */")
+            for cont in sorted(self.eh_anchor_sites[insn.address]):
+                if self.func_start <= cont < self.func_end:
+                    lines.append(f"    if (g_eh_target == 0x{cont:08X}u)"
+                                 f" goto loc_{cont:08X};")
+                else:            # a separate piece: resume as a tail jump
+                    lines.append(f"    if (g_eh_target == 0x{cont:08X}u) {{"
+                                 f" g_seh_ebp = ebp;"
+                                 f" {self._call_target_name(cont)}(); return; }}")
+            lines.append("    recomp_eh_lost(g_eh_target); return; }")
+            return lines
+        # _JumpToContinuation's `jmp eax`, after esp and ebp were reloaded for
+        # the frame in ebx: longjmp there. Falls through to the plain indirect
+        # jump only when that frame armed no anchor.
+        if insn.address in self.eh_continue_sites and m == "jmp":
+            return (["g_ebp = ebp; recomp_eh_continue(eax, ebx);"
+                     " /* C++ catch continuation */"]
+                    + self._lift_jmp(insn, ops))
 
         # ── NOP ──
         if m == "nop" or (m == "lea" and nops == 2 and

@@ -22,6 +22,7 @@ import sys
 # at startup, so a by-value import would freeze the fallback layout.
 from .config import va_to_file_offset, is_code_address
 from . import config as _config
+from . import cxx_eh
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
@@ -504,6 +505,26 @@ class FunctionTranslator:
         self.jump_table_entry_starts = set()
         self._recovered_cfg = {}
         self._ownership_ready = False
+        self._cxx_eh = None
+
+    def _cxx_eh_tables(self):
+        """C++ try-block registrations and _JumpToContinuation sites, scanned
+        once per run (see cxx_eh.py)."""
+        if self._cxx_eh is None:
+            self._cxx_eh = cxx_eh.scan(self.xbe_data)
+        return self._cxx_eh
+
+    def _eh_leaders(self, instructions, start, end):
+        """Arm the lifter for this function's try blocks and return the catch
+        continuations, which need labels: nothing in the function jumps to
+        them -- the catch funclet's return value does."""
+        frames, continue_sites = self._cxx_eh_tables()
+        sites = cxx_eh.function_sites(instructions, frames, start, end,
+                                      entries=self.func_db)
+        self.lifter.eh_anchor_sites = sites
+        self.lifter.eh_continue_sites = continue_sites
+        return {c for conts in sites.values() for c in conts
+                if start <= c < end}
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover function entries from bounded static callback tables."""
@@ -2053,6 +2074,15 @@ class FunctionTranslator:
                  switch_leaders) = self._control_flow_census(
                      instructions, start, end, coalesced)
 
+        eh_leaders = self._eh_leaders(instructions, start, end)
+        if eh_leaders - {insn.address for insn in instructions}:
+            instructions = self.disasm.disassemble_function(
+                raw_bytes, start, end, resync=eh_leaders)
+            if not instructions:
+                return [], []
+            eh_leaders = self._eh_leaders(instructions, start, end)
+        switch_leaders = set(switch_leaders) | eh_leaders
+
         self.lifter.imm_code_refs = imm_refs
 
         # Build basic blocks
@@ -2167,6 +2197,8 @@ class FunctionTranslator:
              jump_table_targets=(self.lifter.jump_table_targets
                                  if coalesced and start in self._recovered_cfg
                                  else None))
+        switch_leaders = set(switch_leaders) | self._eh_leaders(
+            instructions, start, end)
         last_is_debug_slide = (coalesced
                                and last_insn.address in debug_slide_int3s)
         continues_past_end = last_is_debug_slide or not (

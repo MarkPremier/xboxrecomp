@@ -1611,6 +1611,73 @@ int recomp_guest_longjmp(uint32_t buf_va, uint32_t value)
     return 0;
 }
 
+/* ---- C++ catch continuations -------------------------------------------
+ *
+ * The same problem as longjmp, reached through MSVC's C++ exception handling.
+ * Once a catch funclet has run, the CRT's _JumpToContinuation reloads esp and
+ * ebp for the function that owns the try and jumps into the middle of it. The
+ * recompiled frames between the throw and that function are still on the
+ * native stack, and the continuation is not a function entry at all.
+ *
+ * So every function with a try block takes a native anchor right where it
+ * links its EH registration into fs:[0] (see recomp_types.h), keyed by that
+ * registration's guest address, and the continuation becomes a longjmp back
+ * to it. The resumed function then branches to g_eh_target.
+ *
+ * Registrations live in guest stack frames, which nest. A new one at address A
+ * means every anchor below A belongs to a frame that has already returned.
+ */
+#define RECOMP_EH_ANCHORS 64
+
+typedef struct {
+    uint32_t frame_va;
+    jmp_buf  native;
+} recomp_eh_anchor_slot;
+
+static RECOMP_TLS recomp_eh_anchor_slot s_eh[RECOMP_EH_ANCHORS];
+static RECOMP_TLS int                   s_eh_used;
+RECOMP_TLS uint32_t g_eh_target;
+
+jmp_buf *recomp_eh_anchor(uint32_t frame_va)
+{
+    while (s_eh_used > 0 && s_eh[s_eh_used - 1].frame_va <= frame_va)
+        s_eh_used--;                      /* dead frames, or this one re-armed */
+    if (s_eh_used >= RECOMP_EH_ANCHORS) {
+        /* Deeper than any real try nesting: drop the outermost. */
+        memmove(&s_eh[0], &s_eh[1], sizeof(s_eh[0]) * (RECOMP_EH_ANCHORS - 1));
+        s_eh_used = RECOMP_EH_ANCHORS - 1;
+    }
+    s_eh[s_eh_used].frame_va = frame_va;
+    return &s_eh[s_eh_used++].native;
+}
+
+int recomp_eh_continue(uint32_t target, uint32_t frame_va)
+{
+    int i;
+
+    for (i = s_eh_used - 1; i >= 0; i--) {
+        if (s_eh[i].frame_va != frame_va)
+            continue;
+        /* g_esp was already reloaded from the frame by the lifted
+         * _JumpToContinuation; ebp is a C local, so hand it over too. */
+        g_seh_ebp   = g_ebp;
+        g_eh_target = target;
+        s_eh_used   = i + 1;
+        longjmp(s_eh[i].native, 1);
+    }
+    fprintf(stderr, "  [EH] no anchor for frame 0x%08X (continuation 0x%08X)\n",
+            frame_va, target);
+    fflush(stderr);
+    return 0;
+}
+
+void recomp_eh_lost(uint32_t target)
+{
+    fprintf(stderr, "  [EH] continuation 0x%08X is not a label in its function\n",
+            target);
+    fflush(stderr);
+}
+
 /* Watchdog: dump the guest call stack if the title stops making progress.
  *
  * A hang gives nothing to work from -- no crash, no last log line, no native

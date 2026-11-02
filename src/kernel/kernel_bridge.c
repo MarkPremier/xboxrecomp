@@ -4557,6 +4557,79 @@ static void bridge_RtlRaiseException(void)
         _clearfp();
     }
 
+    /* C++ throws (0xE06D7363) go through the SEH chain as on the console, so
+     * the title's catch blocks run. A handler that catches never returns here:
+     * __CxxFrameHandler unwinds through RtlUnwind above, runs the catch funclet
+     * and leaves through _JumpToContinuation, which the lifter turns into a
+     * native longjmp (recomp_eh_continue). Anything still here was not caught
+     * -- terminate() on the console -- and keeps the old log-and-return.
+     * RECOMP_EH_DISPATCH=0 restores that for every throw. */
+    if (code == 0xE06D7363u && record_ptr) {
+        static int dispatch = -1;
+        if (dispatch < 0) {
+            const char *v = getenv("RECOMP_EH_DISPATCH");
+            dispatch = !(v && v[0] == '0');
+        }
+        if (dispatch) {
+            uint32_t saved_esp = g_esp;
+            uint32_t reg = BRIDGE_MEM32(XBOX_FS_BASE), prev_reg = 0, context;
+            int guard;
+
+            g_esp -= 0x300;              /* CONTEXT the handlers may look at */
+            context = g_esp;
+            memset((uint8_t *)XBOX_TO_NATIVE(context), 0, 0x300);
+            g_eax = 1;                   /* ExceptionContinueSearch */
+
+            for (guard = 0; guard < XBOX_SEH_MAX_FRAMES; guard++) {
+                uint32_t handler, nested;
+                recomp_func_t fn;
+
+                if (reg == XBOX_SEH_END_OF_CHAIN || reg == 0)
+                    break;
+                if ((reg & 3u) || reg < XBOX_STACK_BASE || reg >= XBOX_STACK_TOP)
+                    break;
+                if (prev_reg && reg <= prev_reg)
+                    break;
+
+                handler = BRIDGE_MEM32(reg + 4);
+                fn = handler ? recomp_lookup(handler) : NULL;
+                if (!fn && handler) fn = recomp_lookup_manual(handler);
+                if (fn) {
+                    /* The dispatcher's own registration, as the kernel pushes
+                     * one around each handler: _UnwindNestedFrames relinks it
+                     * above the target frame and _JumpToContinuation pops it.
+                     * No handler, so RtlUnwind steps over it. */
+                    g_esp -= 8;
+                    nested = g_esp;
+                    BRIDGE_MEM32(nested)     = BRIDGE_MEM32(XBOX_FS_BASE);
+                    BRIDGE_MEM32(nested + 4) = 0;
+                    BRIDGE_MEM32(XBOX_FS_BASE) = nested;
+
+                    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;       /* dispatcher ctx */
+                    g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
+                    g_esp -= 4; BRIDGE_MEM32(g_esp) = reg;
+                    g_esp -= 4; BRIDGE_MEM32(g_esp) = record_ptr;
+                    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;       /* return address */
+                    fn();
+                    g_esp += 16;                 /* cdecl: see RtlUnwind above */
+
+                    BRIDGE_MEM32(XBOX_FS_BASE) = BRIDGE_MEM32(nested);
+                    g_esp += 8;
+                    if (g_eax == 0)              /* ExceptionContinueExecution */
+                        break;
+                }
+                prev_reg = reg;
+                reg = BRIDGE_MEM32(reg);
+            }
+            g_esp = saved_esp;
+            if (g_eax != 0) {
+                fprintf(stderr, "  [EH] C++ exception 0x%08X not caught by the title\n",
+                        record_ptr);
+                fflush(stderr);
+            }
+        }
+    }
+
     g_eax = 0;
 }
 

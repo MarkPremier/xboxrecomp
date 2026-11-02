@@ -233,6 +233,14 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
 #include <setjmp.h>
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
+/* C++ catch continuations (see xbox_memory_layout.c). A function with a try
+ * block arms recomp_eh_anchor() where it links its registration into fs:[0];
+ * the lifted _JumpToContinuation calls recomp_eh_continue(), which longjmps
+ * there with g_eh_target set, or returns 0 when no anchor matches. */
+jmp_buf *recomp_eh_anchor(uint32_t frame_va);
+int recomp_eh_continue(uint32_t target, uint32_t frame_va);
+void recomp_eh_lost(uint32_t target);
+extern RECOMP_TLS uint32_t g_eh_target;
 extern RECOMP_TLS uint32_t g_ebp;
 extern RECOMP_TLS uint32_t g_eflags;
 
