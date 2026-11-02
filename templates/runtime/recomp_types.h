@@ -279,7 +279,7 @@ extern RECOMP_TLS uint16_t g_fp_cc;
  * So a plain (float) cast is right only inside float's range -- outside it,
  * it would turn a large intermediate into inf (and inf*0 into NaN) or flush a
  * tiny one to 0, where the x87 carries on. Those go the long way. */
-static inline double recomp_fp_round24(double x) {
+static inline double recomp_fp_round24_slow(double x) {
     double ax = fabs(x);
     int e;
     if ((ax <= 3.4028234663852886e38 && ax >= 1.1754943508222875e-38) || ax == 0.0
@@ -287,6 +287,25 @@ static inline double recomp_fp_round24(double x) {
         return (double)(float)x;
     x = frexp(x, &e);                      /* |x| in [0.5, 1): float-exact range */
     return ldexp((double)(float)x, e);
+}
+/* Keep the ordinary float-range case inline even in large translated model
+ * routines. A single unsigned range check replaces several FP comparisons;
+ * the rare exponent-preserving path stays outside the hot arithmetic. The
+ * conversion still obeys the host rounding mode, just as the old helper did. */
+#if defined(_MSC_VER)
+static __forceinline double recomp_fp_round24(double x) {
+#elif defined(__GNUC__) || defined(__clang__)
+static inline __attribute__((always_inline)) double recomp_fp_round24(double x) {
+#else
+static inline double recomp_fp_round24(double x) {
+#endif
+    uint64_t bits;
+    memcpy(&bits, &x, sizeof bits);
+    bits &= UINT64_C(0x7FFFFFFFFFFFFFFF);
+    if (bits - UINT64_C(0x3810000000000000) <=
+            UINT64_C(0x47EFFFFFE0000000) - UINT64_C(0x3810000000000000) || !bits)
+        return (double)(float)x;
+    return recomp_fp_round24_slow(x);
 }
 #define RECOMP_FP_PC(x) ((g_fp_control_word & 0x300u) ? (double)(x) : recomp_fp_round24(x))
 #define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
