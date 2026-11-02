@@ -60,6 +60,7 @@
  * CMakeLists) -- MSVC's C4013 was emitted and discarded. Same failure as the
  * missing stdlib.h in kernel_bridge.c, in a hotter path. */
 #include <math.h>
+#include <fenv.h>
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
 #include <xmmintrin.h>
 #endif
@@ -452,6 +453,69 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
 
 /** Float/double memory access. */
+/* The host stack holds binary64, but FLD m80 reads the x87 10-byte format,
+ * not the float occupying its low four bytes. In particular the CRT's asin
+ * endpoint constant is extended pi/2. Decode the explicit integer bit and
+ * round once to binary64, including subnormal and directed-rounding cases. */
+static inline uint64_t recomp_ext80_shift(uint64_t significand, unsigned shift, int negative) {
+    uint64_t value = shift < 64 ? significand >> shift : 0;
+    uint64_t lost = shift < 64 ? significand & ((UINT64_C(1) << shift) - 1) : significand;
+    if (!lost) return value;
+    int mode = fegetround(), increment = 0;
+    if (mode == FE_UPWARD) increment = !negative;
+    else if (mode == FE_DOWNWARD) increment = negative;
+    else if (mode != FE_TOWARDZERO && shift <= 64) {
+        uint64_t half = UINT64_C(1) << (shift - 1);
+        increment = lost > half || (lost == half && (value & 1));
+    }
+    return value + increment;
+}
+static inline double recomp_load_ext80(const void *memory) {
+    uint64_t sig, bits; uint16_t se;
+    memcpy(&sig, memory, 8); memcpy(&se, (const uint8_t *)memory + 8, 2);
+    int negative = se >> 15, raw_exp = se & 0x7FFF;
+    uint64_t sign = (uint64_t)negative << 63;
+    if (raw_exp == 0x7FFF) {
+        bits = sign | UINT64_C(0x7FF0000000000000);
+        if (sig != UINT64_C(0x8000000000000000))
+            bits |= UINT64_C(0x8000000000000) | ((sig >> 11) & UINT64_C(0xFFFFFFFFFFFFF));
+    } else if (raw_exp && !(sig >> 63)) bits = UINT64_C(0xFFF8000000000000); /* unsupported unnormal */
+    else if (!sig) bits = sign;
+    else {
+        int exponent = raw_exp ? raw_exp - 16383 : -16382;
+        while (!(sig >> 63)) { sig <<= 1; --exponent; }
+        if (exponent < -1022)
+            bits = sign | recomp_ext80_shift(sig, (unsigned)(11 - 1022 - exponent), negative);
+        else {
+            uint64_t rounded = recomp_ext80_shift(sig, 11, negative);
+            if (rounded == (UINT64_C(1) << 53)) { rounded >>= 1; ++exponent; }
+            if (exponent > 1023) {
+                int mode = fegetround();
+                int finite = mode == FE_TOWARDZERO || (mode == FE_DOWNWARD && !negative) ||
+                             (mode == FE_UPWARD && negative);
+                bits = sign | (finite ? UINT64_C(0x7FEFFFFFFFFFFFFF) : UINT64_C(0x7FF0000000000000));
+            } else bits = sign | ((uint64_t)(exponent + 1023) << 52) | (rounded & UINT64_C(0xFFFFFFFFFFFFF));
+        }
+    }
+    double result; memcpy(&result, &bits, 8); return result;
+}
+static inline void recomp_store_ext80(void *memory, double value) {
+    uint64_t bits, sig; uint16_t se;
+    memcpy(&bits, &value, 8);
+    unsigned exponent = (unsigned)((bits >> 52) & 0x7FF);
+    uint64_t fraction = bits & UINT64_C(0xFFFFFFFFFFFFF);
+    se = (uint16_t)((bits >> 48) & 0x8000);
+    if (exponent == 0x7FF) { se |= 0x7FFF; sig = UINT64_C(0x8000000000000000) | (fraction << 11); }
+    else if (!exponent && !fraction) sig = 0;
+    else {
+        int unbiased = exponent ? (int)exponent - 1023 : -1022;
+        sig = (fraction | (exponent ? UINT64_C(1) << 52 : 0)) << 11;
+        while (!(sig >> 63)) { sig <<= 1; --unbiased; }
+        se |= (uint16_t)(unbiased + 16383);
+    }
+    memcpy(memory, &sig, 8); memcpy((uint8_t *)memory + 8, &se, 2);
+}
+#define MEM80(addr)  recomp_load_ext80((const void *)XBOX_PTR(addr))
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
 #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
 

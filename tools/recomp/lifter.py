@@ -3706,6 +3706,8 @@ class Lifter:
                         return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld float */"]
                     elif ops[0].mem_size == 8:
                         return [f"fp_push(MEMD({_fmt_mem(ops[0])})); /* fld double */"]
+                    elif ops[0].mem_size == 10:
+                        return [f"fp_push(MEM80({_fmt_mem(ops[0])})); /* fld extended */"]
                     return [f"fp_push(MEMF({_fmt_mem(ops[0])})); /* fld */"]
                 if ops[0].type == "reg":
                     # fld st(i) pushes a COPY of st(i). Was a no-op comment,
@@ -3733,6 +3735,8 @@ class Lifter:
                     return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top();{do_pop} /* {m} */"]
                 elif ops[0].mem_size == 8:
                     return [f"MEMD({_fmt_mem(ops[0])}) = fp_top();{do_pop} /* {m} */"]
+                elif ops[0].mem_size == 10:
+                    return [f"recomp_store_ext80((void *)XBOX_PTR({_fmt_mem(ops[0])}), fp_top());{do_pop} /* {m} extended */"]
             # fst/fstp st(i): copy st0 to st(i); fstp then pops. This used to be
             # a bare comment -- a no-op -- which LEAKS the FPU stack. `fstp st(0)`
             # is the common idiom for "pop the value fptan/fsincos just pushed";

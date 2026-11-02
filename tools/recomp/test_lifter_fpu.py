@@ -7,6 +7,16 @@ from .translator import FunctionTranslator
 
 
 class FpuLifterTest(unittest.TestCase):
+    def test_extended_load_and_store_use_ten_byte_format(self):
+        operand = Operand(type="mem", mem_base="esp", mem_disp=0x18, mem_size=10)
+        for mnemonic, expected in (
+            ("fld", "fp_push(MEM80(esp + 0x18)); /* fld extended */"),
+            ("fstp", "recomp_store_ext80((void *)XBOX_PTR(esp + 0x18), fp_top()); fp_pop(); /* fstp extended */"),
+        ):
+            instruction = Instruction(0, 4, mnemonic, "xword ptr [esp + 0x18]", "")
+            instruction.operands = [operand]
+            self.assertEqual(Lifter().lift_instruction(instruction), [expected])
+
     def test_stack_register_load_duplicates_the_old_top(self):
         instruction = Instruction(0, 2, "fld", "st(0)", "d9c0")
         instruction.operands = [Operand(type="reg", reg="st(0)")]
