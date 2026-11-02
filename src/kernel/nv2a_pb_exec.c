@@ -518,6 +518,8 @@ static struct {
     uint32_t semaphore_context, semaphore_offset;
     uint32_t report_context;
     uint64_t report_timestamp;
+    uint32_t zpass_enabled;
+    uint64_t zpass_cpu_count;
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     /* Why a batch came out flat. "Untextured" has two causes that look
@@ -674,10 +676,8 @@ failure:
  * meant to overwrite it with a fresh timestamp plus the number of pixels that
  * passed the depth test. xemu answers exactly that way
  * (pgraph_write_zpass_pixel_cnt_report: u64 timestamp, u32 result, u32 done).
- * There is no real occlusion counter behind the D3D11 path, so report the
- * whole surface as visible -- never cull geometry a real query would have
- * kept. ponytail: fixed count, feed the rasteriser's passing-pixel count here
- * if a title ever needs true occlusion culling. */
+ * Count real depth/alpha-test survivors: reporting the whole surface visible
+ * makes Serious Sam's lens flares shine through occluding walls. */
 static void report_zpass(uint32_t offset)
 {
     uint32_t ramin_offset;
@@ -703,11 +703,21 @@ static void report_zpass(uint32_t offset)
     if (!destination)
         goto failure;
     uint64_t timestamp = ++s_gpu.report_timestamp;
-    uint32_t result = s_gpu.clip_w && s_gpu.clip_h
-                    ? s_gpu.clip_w * s_gpu.clip_h : 1;
+    uint64_t count = s_gpu.zpass_cpu_count;
+#ifdef _WIN32
+    count += nv2a_gpu_zpass_result();
+#endif
+    uint32_t result = count > UINT32_MAX ? UINT32_MAX : (uint32_t)count;
     uint32_t done = 0;
-    memcpy(destination, &timestamp, 8);
     memcpy(destination + 8, &result, 4);
+#ifdef _WIN32
+    MemoryBarrier();
+#endif
+    memcpy(destination, &timestamp, 8);
+    /* The title polls the completion word; publish it after result/stamp. */
+#ifdef _WIN32
+    MemoryBarrier();
+#endif
     memcpy(destination + 12, &done, 4);
     return;
 
@@ -2112,6 +2122,7 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
         return;
     s_gpu.pixels++;
+    if (s_gpu.zpass_enabled) s_gpu.zpass_cpu_count++;
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
     row = s_surface + (size_t)y * s_gpu.pitch;
@@ -4928,9 +4939,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     switch (method) {
     case NV097_CLEAR_REPORT_VALUE:
+        s_gpu.zpass_cpu_count = 0;
+#ifdef _WIN32
+        nv2a_gpu_zpass_reset();
+#endif
+        return;
     case NV097_SET_ZPASS_PIXEL_COUNT_ENABLE:
-        /* Recorded only to keep the occlusion query trio out of the unhandled
-         * report; the count itself is answered in report_zpass. */
+        s_gpu.zpass_enabled = param != 0;
+#ifdef _WIN32
+        nv2a_gpu_zpass_enable(s_gpu.zpass_enabled);
+#endif
         return;
     case NV097_GET_REPORT:
         if (((param & NV097_GET_REPORT_TYPE) >> 24) == NV097_GET_REPORT_TYPE_ZPASS_PIXEL_CNT)
@@ -5627,9 +5645,7 @@ void nv2a_pb_exec_report(void)
 
     /* The ZPASS query trio (0x17C8/0x17CC/0x17D0) is handled above: GET_REPORT
      * resolves the report DMA object (SET_CONTEXT_DMA_REPORT) and writes a
-     * fresh stamp plus a whole-surface count. ponytail: the count is fixed, not
-     * a real occlusion result; feed the rasteriser's passing-pixel count here
-     * if a title ever needs true occlusion culling. */
+     * fresh stamp and the actual passing-pixel count before completion. */
 
     /* Top ten by frequency: selection sort over a small table, once every few
      * seconds, is not worth a better algorithm.

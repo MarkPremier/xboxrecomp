@@ -2302,6 +2302,78 @@ static void readback_failed(const char *kind, HRESULT result, const char *operat
     std::_Exit(EXIT_FAILURE);
 }
 
+struct ZpassSegment {
+    ComPtr<ID3D11Query> query;
+    double pixels_per_sample = 1.0;
+};
+static bool zpass_enabled;
+static ZpassSegment zpass_active;
+static std::vector<ZpassSegment> zpass_segments;
+static std::vector<ComPtr<ID3D11Query>> zpass_pool;
+static double zpass_total;
+
+static void zpass_end_segment()
+{
+    if (!zpass_active.query) return;
+    context->End(zpass_active.query.Get());
+    zpass_segments.push_back(std::move(zpass_active));
+    zpass_active = {};
+}
+
+extern "C" void nv2a_gpu_zpass_enable(int enabled)
+{
+    if (!enabled) zpass_end_segment();
+    zpass_enabled = enabled != 0;
+}
+
+extern "C" void nv2a_gpu_zpass_reset(void)
+{
+    zpass_end_segment();
+    for (auto &segment : zpass_segments) zpass_pool.push_back(std::move(segment.query));
+    zpass_segments.clear();
+    zpass_total = 0;
+}
+
+static void zpass_begin_draw(double pixels_per_sample)
+{
+    if (!zpass_enabled) return;
+    if (zpass_active.query && zpass_active.pixels_per_sample != pixels_per_sample)
+        zpass_end_segment();
+    if (zpass_active.query) return;
+    if (zpass_pool.empty()) {
+        D3D11_QUERY_DESC description = {D3D11_QUERY_OCCLUSION, 0};
+        HRESULT result = device->CreateQuery(&description, &zpass_active.query);
+        if (FAILED(result)) readback_failed("occlusion query", result, "create");
+    } else {
+        zpass_active.query = std::move(zpass_pool.back());
+        zpass_pool.pop_back();
+    }
+    zpass_active.pixels_per_sample = pixels_per_sample;
+    context->Begin(zpass_active.query.Get());
+}
+
+extern "C" uint32_t nv2a_gpu_zpass_result(void)
+{
+    zpass_end_segment();
+    if (!zpass_segments.empty()) context->Flush();
+    for (auto &segment : zpass_segments) {
+        UINT64 samples = 0;
+        HRESULT result;
+        while ((result = context->GetData(segment.query.Get(), &samples, sizeof samples,
+                                         D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE) {
+            xbox_Nv2aAcknowledgeHandshakes();
+            SwitchToThread();
+        }
+        if (FAILED(result)) readback_failed("occlusion query", result, "result");
+        zpass_total += (double)samples * segment.pixels_per_sample;
+        zpass_pool.push_back(std::move(segment.query));
+    }
+    zpass_segments.clear();
+    if (zpass_total >= 4294967295.0) return UINT32_MAX;
+    /* A partially covered logical pixel still establishes visibility. */
+    return zpass_total > 0 && zpass_total < 1 ? 1 : (uint32_t)(zpass_total + 0.5);
+}
+
 static void mark_target_aliases(const void *owner, const uint8_t *memory, size_t bytes)
 {
     uintptr_t begin = (uintptr_t)memory, end = begin + bytes;
@@ -4533,7 +4605,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         (!depth_only && (state->pitch < state->width * state->bytes_per_pixel ||
                         (state->bytes_per_pixel != 4 && state->bytes_per_pixel != 2))) ||
         (state->combiners.control & 255u) > 8 || !initialize_pipeline()) return 0;
-    if (depth_only && !state->depth_enable && !state->stencil_enable) return 1;   /* nothing it can change */
+    if (depth_only && !state->depth_enable && !state->stencil_enable && !zpass_enabled) return 1;
     if (state->topology > NV2A_GPU_TOPOLOGY_POINTS) return reject("primitive topology");
     uint32_t primitive_width = state->topology == NV2A_GPU_TOPOLOGY_TRIANGLES ? 3u :
                                state->topology == NV2A_GPU_TOPOLOGY_LINES ? 2u : 1u;
@@ -5086,6 +5158,10 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     bool writes = region.left < region.right && region.top < region.bottom;
     context->RSSetState(raster_state.Get()); context->RSSetViewports(1, &viewport); context->RSSetScissorRects(1, &clip);
     GpuDrawSample *sample = begin_gpu_sample(*state);
+    zpass_begin_draw(((double)guest_width * guest_height) /
+                     ((double)target_width * target_height *
+                      ((surface && target == surface->ms_target.Get()) ||
+                       (depth && depth_target == depth->ms_view.Get()) ? msaa_samples : 1)));
     if (state->indices) context->DrawIndexed(state->index_count, 0, 0);
     else context->Draw(count, 0);
     end_gpu_sample(sample);

@@ -63,6 +63,19 @@ int main(int argc,char **argv) {
     method(0x1D8C,0xFFFFFF13u);method(0x1D94,1);nv2a_pb_exec_flush();
     pixels(z,4,0xFFFFFF5Au,1,2,3,4); /* Preserve stencil during a depth clear. */
     method(0x1D94,2);nv2a_pb_exec_flush();pixels(z,4,0xFFFFFF13u,1,2,3,4);
+    /* Real report DMA/handle dispatch must not invent visible pixels. */
+    volatile uint32_t *ramht=xbox_Nv2aRegisterPointer(0x700000,8);
+    volatile uint32_t *descriptor=xbox_Nv2aRegisterPointer(0x700200,12);
+    CHECK(ramht && descriptor);
+    ramht[0]=12;ramht[1]=0x80000020;
+    descriptor[0]=0x3D;descriptor[1]=0xFFFF;descriptor[2]=color&0x3FFFFFFu;
+    uint32_t *report=(uint32_t *)(p+0x8000);
+    for(unsigned i=0;i<5;i++)report[i]=0xFFFFFFFF;
+    method(0x01A8,12);method(0x17C8,1);method(0x17CC,0);
+    method(0x17D0,0x02008000);CHECK(report[3]==0xFFFFFFFF);
+    method(0x17D0,0x01008000);
+    CHECK(report[2]==0 && report[3]==0 && report[4]==0xFFFFFFFF);
+    CHECK(report[0]!=0xFFFFFFFF || report[1]!=0xFFFFFFFF);
     puts("PASS: bounded RGB565/ARGB and Z16 clears preserve surrounding pixels");
     return 0;
 }

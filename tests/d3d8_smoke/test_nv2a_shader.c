@@ -1162,7 +1162,7 @@ int main(int argument_count, char **arguments)
         check("unknown report type preserves pending result", report[3] == 0xFFFFFFFF);
         method(0x17D0, 0x01006000);
         check("zpass report replaces pending timestamp", report[0] != 0xFFFFFFFF || report[1] != 0xFFFFFFFF);
-        check("zpass report supplies conservative visibility", report[2] == 640 * 480);
+        check("zpass report with no counted draws is zero", report[2] == 0);
         check("zpass report completes the query", report[3] == 0);
         check("zpass report preserves following memory", report[4] == 0xFFFFFFFF);
         printf("nv2a_shader_report: %s\n", failures ? "FAILED" : "ALL PASS");

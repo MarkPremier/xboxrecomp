@@ -55,6 +55,11 @@ void nv2a_gpu_surface_modified(const void *addr, size_t bytes);
 void nv2a_gpu_surface_publish(const void *addr, size_t bytes);
 void nv2a_gpu_invalidate(void);
 void nv2a_gpu_report(void);
+/* NV097 occlusion counter. Counting survives enable/disable until reset;
+ * result waits for the counted draws and returns logical guest pixels. */
+void nv2a_gpu_zpass_reset(void);
+void nv2a_gpu_zpass_enable(int enabled);
+uint32_t nv2a_gpu_zpass_result(void);
 
 #define NV2A_GPU_MAX_VERTICES 65536u
 #define NV2A_GPU_MAX_INDICES 196608u
