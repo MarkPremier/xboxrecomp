@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(video_pacing_test C)
+set(CMAKE_C_STANDARD 11)
+add_executable(video_pacing_test test_main.c)
+enable_testing()
+add_test(NAME video_pacing COMMAND video_pacing_test)

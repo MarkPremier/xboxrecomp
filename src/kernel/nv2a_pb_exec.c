@@ -34,6 +34,7 @@
 #include <xmmintrin.h>   /* _mm_prefetch */
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
+#include "nv2a_frame_pacing.h"
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
@@ -493,6 +494,7 @@ static struct {
      * FLIP_STALL. Presenting the display buffer at the scene's 5120-byte
      * pitch showed its top half doubled with alternate rows garbled. */
     uint32_t drawn_pitch, drawn_height;
+    uint32_t frame_has_draw, frame_has_video, video_active;
     uint64_t pixels;
     uint32_t pixel_max;   /* brightest value any pixel write carried */
     uint32_t clip_x, clip_w, clip_y, clip_h;
@@ -1414,34 +1416,42 @@ static void flip_wait_vblank(HANDLE timer)
     }
 }
 
-static void flip_fps_cap(void)
+static int video_fps_limit(void)
 {
-    static int hz, inited;
-    static uint64_t deadline;
+    static int hz = -1;
+    if (hz < 0) {
+        const char *value = getenv("RECOMP_VIDEO_FPS_CAP");
+        hz = value ? atoi(value) : 0;
+        if (hz < 0 || hz > 1000) hz = 0;
+    }
+    return hz;
+}
+
+static void flip_fps_cap(int is_video)
+{
+    static int global_hz, inited;
+    static Nv2aFramePacer pacer;
     static HANDLE timer;
-    uint64_t period, now;
+    uint64_t deadline, now;
+    int hz;
 
     if (!inited) {
         const char *e = getenv("RECOMP_FPS_CAP");
         inited = 1;
-        hz = !e ? 0 : strcmp(e, "vblank") == 0 ? -2 : atoi(e);
-        if (hz < -2 || hz > 1000) hz = 0;
-        if (hz)
+        global_hz = !e ? 0 : strcmp(e, "vblank") == 0 ? -2 : atoi(e);
+        if (global_hz < -2 || global_hz > 1000) global_hz = 0;
+        if (global_hz || video_fps_limit())
             timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                            TIMER_ALL_ACCESS);
     }
+    hz = nv2a_frame_limit(global_hz, video_fps_limit(), is_video);
     if (hz == -2) {
         flip_wait_vblank(timer);
         return;
     }
-    if (!hz)
-        return;
-    period = 1000000000ull / (uint64_t)hz;
     now = fps_cap_now_ns();
-    if (!deadline || now > deadline + period) {
-        deadline = now + period;          /* first flip, or resync after a stall */
-        return;
-    }
+    deadline = nv2a_frame_deadline(&pacer, hz, now);
+    if (deadline <= now) return;
     if (timer && deadline > now + 500000u) {
         LARGE_INTEGER due;
         due.QuadPart = -(LONGLONG)((deadline - now - 500000u) / 100u);
@@ -1450,10 +1460,9 @@ static void flip_fps_cap(void)
     }
     while (fps_cap_now_ns() < deadline)
         YieldProcessor();
-    deadline += period;
 }
 #else
-static void flip_fps_cap(void) {}
+static void flip_fps_cap(int is_video) { (void)is_video; }
 #endif
 
 /* Remember the surface just drawn into, with its own geometry (see
@@ -3564,6 +3573,25 @@ static void raster_batch(void)
         return;
     }
 
+    s_gpu.frame_has_draw = 1;
+    /* Sam's XMV frames are full-screen packed-YUV quads. Mark actual draws,
+     * not a lingering texture binding, so the limit ends at the first menu
+     * frame. The coverage check also excludes small in-world video screens. */
+    if (!s_gpu.frame_has_video && s_gpu.tex.valid &&
+        nv2a_video_texture(s_gpu.tex.color, s_gpu.tex.width, s_gpu.tex.height) && s_gpu.idx_count <= 64u) {
+        float left = INFINITY, top = INFINITY, right = -INFINITY, bottom = -INFINITY;
+        for (i = 0; i < s_gpu.idx_count; i++) {
+            Nv2aCpuVertex vertex;
+            if (!fetch_shader_vertex(s_gpu.idx[i], &vertex) || !(vertex.output[0][3] > 0)) break;
+            float x = vertex.output[0][0], y = vertex.output[0][1];
+            if (x < left) left = x; if (x > right) right = x;
+            if (y < top) top = y; if (y > bottom) bottom = y;
+        }
+        if (i == s_gpu.idx_count && nv2a_video_coverage(left, top, right, bottom,
+                                                       (float)s_gpu.clip_w, (float)s_gpu.clip_h))
+            s_gpu.frame_has_video = 1;
+    }
+
     /* Count why, once per batch: the texture stage cannot change inside one. */
     {
         const VertexAttr *tc = texcoord_attr();
@@ -5058,7 +5086,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_FLIP_STALL:
-        flip_fps_cap();
+        s_gpu.video_active = nv2a_video_frame_mode(s_gpu.video_active,
+                                                  s_gpu.frame_has_draw, s_gpu.frame_has_video);
+        flip_fps_cap(s_gpu.video_active || pvideo_overlay_active());
+        s_gpu.frame_has_draw = s_gpu.frame_has_video = 0;
         s_gpu.flush_flip++;
         cloak_marker_idle();
         /* The stall ends when the buffer being read is the one just finished.
