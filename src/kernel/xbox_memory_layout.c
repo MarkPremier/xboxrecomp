@@ -2810,6 +2810,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         MEM32_INIT(XBOX_FS_BASE + 0x28, FAKE_TLS_VA);
         /* TLS[0x28] = pointer to RW data area */
         MEM32_INIT(FAKE_TLS_VA + 0x28, FAKE_RWDATA_VA);
+        /* fs:[0x28] is the current KTHREAD, not the image TLS block. XAPI's
+         * GetCurrentThreadId reads its UniqueThread at +0x12C. Leaving it zero
+         * made Serious Sam's engine locks regard every guest thread as the
+         * same recursive owner. Keep the legacy RW pointer above intact. */
+        MEM32_INIT(FAKE_TLS_VA + 0x12C, GetCurrentThreadId());
 
         /*
          * XBE TLS directory.
@@ -3639,23 +3644,32 @@ uint32_t xbox_AllocThreadTib(void)
     /* XBOX_VA is scoped to the loader; the same arithmetic, spelled here. */
     #define TIB_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
     const uint32_t tib_size = 0x40;
-    uint32_t tib, block, thread_data, total;
+    const uint32_t current_thread_size = 0x200;
+    uint32_t tib, block, thread_data, current_thread, total;
 
     if (!g_tls_total)
         return 0;                    /* image has no TLS; nothing to copy */
 
     total = g_tls_total;
-    tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size, 16);
+    tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size + current_thread_size, 16);
     if (!tib)
         return 0;
     block       = tib + tib_size;
     thread_data = block + total;
+    current_thread = thread_data + g_tls_thread_size;
 
     /* The TIB itself, copied so stack bounds and the fields the title filled
      * in are inherited, then the two that must not be. */
     memcpy(TIB_VA(tib), TIB_VA(XBOX_TIB_MAIN), tib_size);
     memcpy(TIB_VA(block), TIB_VA(g_tls_template_va), total);
     memset(TIB_VA(thread_data), 0, g_tls_thread_size);
+    /* The TIB's current-thread pointer must be private too. Copy the existing
+     * compatibility fields (including the shared RW data pointer), then stamp
+     * the real host thread's unique ID. This allocator runs on the new worker. */
+    memcpy(TIB_VA(current_thread),
+           TIB_VA(*(uint32_t *)TIB_VA(XBOX_TIB_MAIN + 0x28)), current_thread_size);
+    *(uint32_t *)TIB_VA(current_thread + 0x12C) = GetCurrentThreadId();
+    *(uint32_t *)TIB_VA(tib + 0x28) = current_thread;
 
     *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
     *(uint8_t *)TIB_VA(tib + XBOX_KPCR_IRQL_OFFSET) = 0;

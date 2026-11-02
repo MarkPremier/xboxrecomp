@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(thread_identity_test C)
+add_subdirectory(../.. runtime)
+add_executable(thread_identity_test test_main.c)
+target_include_directories(thread_identity_test PRIVATE ../../src/kernel)
+target_link_libraries(thread_identity_test PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME guest_thread_identity COMMAND thread_identity_test)
