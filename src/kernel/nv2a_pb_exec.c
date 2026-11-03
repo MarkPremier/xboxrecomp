@@ -3729,6 +3729,11 @@ static void raster_batch(void)
                 fprintf(info_out, "[BINFO]   tex%u valid %d off %08X raw %08X %ux%u ctl0 %08X filt %08X addr %u/%u/%u\n",
                         st, t->valid, t->offset, t->raw_format, t->width, t->height, t->control0,
                         t->filter, t->addr_u, t->addr_v, t->addr_w);
+                float uv[4] = {0};
+                if (s_gpu.idx_count) fetch_attr(&s_gpu.attr[9 + st], s_gpu.idx[0], uv);
+                fprintf(info_out, "[BINFO]   uv%u %.7g,%.7g,%.7g,%.7g matrix %u texgen %X/%X/%X/%X\n",
+                        st, uv[0], uv[1], uv[2], uv[3], s_gpu.texture_matrix_enable[st],
+                        s_gpu.texgen[st][0], s_gpu.texgen[st][1], s_gpu.texgen[st][2], s_gpu.texgen[st][3]);
             }
             fprintf(info_out, "[BINFO]   combiner control %08X final %08X %08X c0 %.2f,%.2f,%.2f,%.2f c1 %.2f,%.2f,%.2f,%.2f\n",
                     s_gpu.combiners.control, s_gpu.combiners.final_input[0], s_gpu.combiners.final_input[1],
