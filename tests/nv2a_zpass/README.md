@@ -21,3 +21,10 @@ handle, report DMA bounds, unsupported report type, completion and following
 memory. An empty counter must report zero, not whole-surface visibility.
 The native dispatch case also checks that a nonempty report stays pending until
 polled, and completes with 48 pixels even after submission stops.
+
+`nv2a-shader-cache-restart` runs the graphics fixture twice in separate processes
+against a fresh private cache directory. It also draws a partial clear, scales
+targets, and publishes multisampled depth to exercise utility shaders. The cold
+run must invoke the source compiler; the warm run must load disk bytecode with
+zero source compiler calls. Normal query tests disable the disk cache, and the
+restart test never clears or writes the user's shared shader cache.

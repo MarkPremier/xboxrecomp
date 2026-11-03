@@ -37,11 +37,13 @@ using Microsoft::WRL::ComPtr;
  * when there; otherwise the system's. Every compile here goes through it. */
 typedef HRESULT (WINAPI *ShaderCompiler)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *, ID3DInclude *,
                                          LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **, ID3DBlob **);
+static std::atomic<uint64_t> shader_source_compiles{0};
 
 static HRESULT shader_compile(LPCVOID source, SIZE_T size, LPCSTR name, const D3D_SHADER_MACRO *defines,
                               ID3DInclude *include, LPCSTR entry, LPCSTR profile, UINT flags1, UINT flags2,
                               ID3DBlob **code, ID3DBlob **errors)
 {
+    shader_source_compiles.fetch_add(1, std::memory_order_relaxed);
     static ShaderCompiler bundled;
     static std::once_flag once;
     std::call_once(once, []() {
@@ -254,8 +256,10 @@ extern "C" void nv2a_gpu_report(void)
                  (unsigned long long)gpu_timing.pixel_shader_misses,
                  (unsigned long long)gpu_timing.pixel_shader_failures, gpu_timing.pixel_compile,
                  (unsigned long long)gpu_timing.shader_evictions);
-    std::fprintf(stderr, "[GPU-D3D11] shader disk cache: %llu loaded; background compiles: %llu pixel (%llu draws with the generic shader meanwhile), %llu vertex (%llu draws skipped meanwhile)\n",
-                 (unsigned long long)gpu_timing.shader_disk_hits, (unsigned long long)gpu_timing.pixel_async_compiles,
+    std::fprintf(stderr, "[GPU-D3D11] shader disk cache: %llu loaded, %llu source compiles; background compiles: %llu pixel (%llu draws with the generic shader meanwhile), %llu vertex (%llu draws skipped meanwhile)\n",
+                 (unsigned long long)gpu_timing.shader_disk_hits,
+                 (unsigned long long)shader_source_compiles.load(std::memory_order_relaxed),
+                 (unsigned long long)gpu_timing.pixel_async_compiles,
                  (unsigned long long)gpu_timing.pixel_generic_draws, (unsigned long long)gpu_timing.vertex_async_compiles,
                  (unsigned long long)gpu_timing.vertex_skipped_draws);
     std::fprintf(stderr, "[GPU-D3D11] fixed function: %llu draws, %llu lit, %llu skinned, %llu texgen, %llu texture-matrix\n",
@@ -987,7 +991,10 @@ static const std::wstring &shader_cache_directory()
     static const std::wstring directory = [] {
         std::wstring path;
         const char *setting = std::getenv("RECOMP_SHADER_CACHE");
-        if (setting && !std::strcmp(setting, "0")) return path;
+        if (setting && !std::strcmp(setting, "0")) {
+            std::fprintf(stderr, "[GPU-D3D11] shader cache: disabled by RECOMP_SHADER_CACHE=0\n");
+            return path;
+        }
         if (setting && *setting) {
             int length = MultiByteToWideChar(CP_UTF8, 0, setting, -1, nullptr, 0);
             path.resize(length > 0 ? length - 1 : 0);
@@ -1003,6 +1010,7 @@ static const std::wstring &shader_cache_directory()
         CreateDirectoryW(path.c_str(), nullptr);
         DWORD attributes = GetFileAttributesW(path.c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) path.clear();
+        std::fprintf(stderr, "[GPU-D3D11] shader cache: %ls\n", path.empty() ? L"unavailable" : path.c_str());
         return path;
     }();
     return directory;
@@ -1653,14 +1661,14 @@ static bool scale_blit(ID3D11ShaderResourceView *source, ID3D11RenderTargetView 
             "float depth_ps(V v):SV_Depth{return image.SampleLevel(nearest,v.uv,0).r;}";
         BlitPipeline created;
         ComPtr<ID3DBlob> vertex, color_pixel, depth_pixel, errors;
-        HRESULT result = shader_compile(text, sizeof text - 1, "NV2A scale blit", nullptr, nullptr, "vs", "vs_5_0",
-                                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vertex, &errors);
+        HRESULT result = compile_shader_cached(text, sizeof text - 1, "NV2A scale blit", nullptr, "vs", "vs_5_0",
+                                    D3DCOMPILE_OPTIMIZATION_LEVEL3, vertex, errors);
         if (SUCCEEDED(result))
-            result = shader_compile(text, sizeof text - 1, "NV2A scale blit", nullptr, nullptr, "color_ps", "ps_5_0",
-                                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &color_pixel, &errors);
+            result = compile_shader_cached(text, sizeof text - 1, "NV2A scale blit", nullptr, "color_ps", "ps_5_0",
+                                D3DCOMPILE_OPTIMIZATION_LEVEL3, color_pixel, errors);
         if (SUCCEEDED(result))
-            result = shader_compile(text, sizeof text - 1, "NV2A scale blit", nullptr, nullptr, "depth_ps", "ps_5_0",
-                                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &depth_pixel, &errors);
+            result = compile_shader_cached(text, sizeof text - 1, "NV2A scale blit", nullptr, "depth_ps", "ps_5_0",
+                                D3DCOMPILE_OPTIMIZATION_LEVEL3, depth_pixel, errors);
         if (SUCCEEDED(result))
             result = device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(), nullptr, &created.vertex);
         if (SUCCEEDED(result))
@@ -2049,8 +2057,8 @@ static void resolve_depth(DepthSurface &surface)
             "float4 vs(uint id:SV_VertexID):SV_Position{float2 t=float2((id<<1)&2,id&2);return float4(t*float2(2,-2)+float2(-1,1),0,1);}"
             "float ps(float4 p:SV_Position):SV_Depth{return image.Load(int2(p.xy),0);}";
         ComPtr<ID3DBlob> vs, ps, errors;
-        HRESULT result = shader_compile(text, sizeof text - 1, "MSAA depth resolve", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, &errors);
-        if (SUCCEEDED(result)) result = shader_compile(text, sizeof text - 1, "MSAA depth resolve", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, &errors);
+        HRESULT result = compile_shader_cached(text, sizeof text - 1, "MSAA depth resolve", nullptr, "vs", "vs_5_0", 0, vs, errors);
+        if (SUCCEEDED(result)) result = compile_shader_cached(text, sizeof text - 1, "MSAA depth resolve", nullptr, "ps", "ps_5_0", 0, ps, errors);
         if (SUCCEEDED(result)) result = device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &vertex);
         if (SUCCEEDED(result)) result = device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &pixel);
         D3D11_DEPTH_STENCIL_DESC depth = {};
@@ -3247,11 +3255,11 @@ static bool presenter_ready(HWND window)
         "v.position=float4(t*float2(2,-2)+float2(-1,1),0,1);v.uv=t*extent.xy;return v;}"
         "float4 ps(V v):SV_Target{return float4(image.SampleLevel(smooth,v.uv,0).rgb,1);}";
     ComPtr<ID3DBlob> vertex, pixel, errors;
-    result = shader_compile(source, sizeof source - 1, "NV2A present", nullptr, nullptr, "vs", "vs_5_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vertex, &errors);
+    result = compile_shader_cached(source, sizeof source - 1, "NV2A present", nullptr, "vs", "vs_5_0",
+                        D3DCOMPILE_OPTIMIZATION_LEVEL3, vertex, errors);
     if (SUCCEEDED(result))
-        result = shader_compile(source, sizeof source - 1, "NV2A present", nullptr, nullptr, "ps", "ps_5_0",
-                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pixel, &errors);
+        result = compile_shader_cached(source, sizeof source - 1, "NV2A present", nullptr, "ps", "ps_5_0",
+                            D3DCOMPILE_OPTIMIZATION_LEVEL3, pixel, errors);
     if (FAILED(result)) {
         std::fprintf(stderr, "[GPU-D3D11] present shader compile: %s\n",
                      errors ? (const char *)errors->GetBufferPointer() : "");
@@ -4550,11 +4558,11 @@ static bool clear_target_rectangle(const Nv2aGpuDraw &state, Surface *surface, D
             "float4 ps():SV_Target{return clearColor;}";
         ClearPipeline created;
         ComPtr<ID3DBlob> vertex, pixel, errors;
-        HRESULT result = shader_compile(source, sizeof source - 1, "NV2A clear", nullptr, nullptr,
-                                   "vs", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vertex, &errors);
+        HRESULT result = compile_shader_cached(source, sizeof source - 1, "NV2A clear", nullptr,
+                                   "vs", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, vertex, errors);
         if (SUCCEEDED(result))
-            result = shader_compile(source, sizeof source - 1, "NV2A clear", nullptr, nullptr,
-                                "ps", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pixel, &errors);
+            result = compile_shader_cached(source, sizeof source - 1, "NV2A clear", nullptr,
+                                "ps", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, pixel, errors);
         if (FAILED(result)) {
             std::fprintf(stderr, "[GPU-D3D11] rectangle clear shader compile: 0x%08X %s\n",
                          (unsigned)result, errors ? (const char *)errors->GetBufferPointer() : "");

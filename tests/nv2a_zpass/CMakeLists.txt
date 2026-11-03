@@ -10,3 +10,6 @@ if(MSVC)
 endif()
 target_link_libraries(nv2a_zpass_test PRIVATE d3d11 d3dcompiler dxgi)
 add_test(NAME nv2a-zpass COMMAND nv2a_zpass_test)
+add_test(NAME nv2a-shader-cache-restart
+  COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:nv2a_zpass_test>
+    -DCACHE_ROOT=${CMAKE_CURRENT_BINARY_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/cache_restart.cmake)

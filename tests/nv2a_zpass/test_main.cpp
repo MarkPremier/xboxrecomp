@@ -19,8 +19,10 @@ static int quad(Nv2aGpuDraw &state,float z)
     }
     return nv2a_gpu_draw(&state,vertices,6);
 }
-int main()
+int main(int argc,char **argv)
 {
+    _putenv_s("RECOMP_SHADER_CACHE",argc==3?argv[2]:"0");
+    _putenv_s("RECOMP_SHADER_ASYNC","0");
     _putenv_s("RECOMP_RENDER_SCALE","1");_putenv_s("RECOMP_WIDE","1");
     uint32_t color[32*32]={}; uint16_t depth[32*32];
     std::fill(std::begin(depth),std::end(depth),uint16_t(0xFFFF));
@@ -85,5 +87,23 @@ int main()
     uint16_t shadow[32*32];std::fill(std::begin(shadow),std::end(shadow),uint16_t(0xFFFF));
     state.depth=(uint8_t *)shadow;CHECK(quad(state,5000));
     CHECK(!depth_scaled(state.depth));
+    if(argc==3) {
+        // Exercise the real utility shaders too, including a partial clear,
+        // scaled target blits and the MSAA depth-resolve publication path.
+        Nv2aGpuDraw clear={};clear.color=(uint8_t *)color;
+        clear.width=clear.height=32;clear.pitch=128;clear.bytes_per_pixel=4;
+        clear.clip_x=clear.clip_y=4;clear.clip_width=clear.clip_height=8;
+        clear.color_mask=0x01010101;
+        CHECK(nv2a_gpu_clear(&clear,0xF0,0xFF345678,0)==1);
+        nv2a_gpu_set_msaa(2);nv2a_gpu_flip(color,sizeof color,0,128);
+        state.color=(uint8_t *)color;state.depth=(uint8_t *)depth;
+        state.bytes_per_pixel=4;state.depth_mask=1;state.color_mask=0x01010101;
+        CHECK(quad(state,5000));nv2a_gpu_sync();
+        uint64_t compiled=shader_source_compiles.load(std::memory_order_relaxed);
+        std::printf("shader cache %s: %llu source compiles, %llu disk hits\n",argv[1],
+                    (unsigned long long)compiled,(unsigned long long)gpu_timing.shader_disk_hits);
+        if(!std::strcmp(argv[1],"warm")) CHECK(compiled==0 && gpu_timing.shader_disk_hits>0);
+        else CHECK(compiled>0);
+    }
     std::puts("PASS: occluded/visible, reset/enable, cumulative and scaled ZPASS counts");
 }
