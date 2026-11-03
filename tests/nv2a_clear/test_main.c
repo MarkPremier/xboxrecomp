@@ -35,6 +35,14 @@ static void pixels(uint8_t *p,unsigned bytes,uint32_t value,unsigned l,unsigned 
 }
 int main(int argc,char **argv) {
     CHECK(argc==2);
+#ifdef _WIN32
+    env("RECOMP_FPS_CAP","75");CHECK(xbox_GetFrameLimit()==75);
+    xbox_SetFrameLimit(120);CHECK(xbox_GetFrameLimit()==120);
+    xbox_SetFrameLimit(-2);CHECK(xbox_GetFrameLimit()==-2);
+    xbox_SetFrameLimit(5000);CHECK(xbox_GetFrameLimit()==0);
+    xbox_SetFrameLimit(-1);CHECK(xbox_GetFrameLimit()==0);
+    xbox_SetFrameLimit(0);env("RECOMP_FPS_CAP","");
+#endif
     env("RECOMP_NV2A_NATIVE_CLEARS",strcmp(argv[1],"cpu")?"1":"0");
     env("RECOMP_CPU_RGB565","0"); env("RECOMP_RENDER_SCALE","1"); env("RECOMP_FB_WINDOW","0");
     uint8_t xbe[0x2000]={0}; uint32_t *h=(uint32_t *)xbe;

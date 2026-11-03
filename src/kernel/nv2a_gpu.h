@@ -12,6 +12,10 @@ int nv2a_gpu_available(void);
 int nv2a_gpu_compile(void);
 /* Current native presentation interval, including live window changes. */
 int xbox_GetPresentInterval(void);
+/* Live fixed flip limit: 0 unlimited, -2 emulated vblank, 1..1000 Hz.
+ * Reads RECOMP_FPS_CAP until explicitly set; movie pacing remains separate. */
+void xbox_SetFrameLimit(int hz);
+int xbox_GetFrameLimit(void);
 void nv2a_gpu_sync(void);
 void nv2a_gpu_wait(void);
 void nv2a_gpu_flush(void);

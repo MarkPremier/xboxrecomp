@@ -1467,23 +1467,38 @@ static int video_fps_limit(void)
     return hz;
 }
 
+static volatile LONG s_frame_limit = -3; /* Unconfigured; preserve env policy. */
+
+void xbox_SetFrameLimit(int hz)
+{
+    if(hz != -2 && (hz < 0 || hz > 1000)) hz = 0;
+    InterlockedExchange(&s_frame_limit, hz);
+}
+
+int xbox_GetFrameLimit(void)
+{
+    LONG hz = InterlockedCompareExchange(&s_frame_limit, -3, -3);
+    if(hz == -3) {
+        const char *e = getenv("RECOMP_FPS_CAP");
+        hz = !e ? 0 : strcmp(e,"vblank") == 0 ? -2 : atoi(e);
+        if(hz != -2 && (hz < 0 || hz > 1000)) hz = 0;
+        InterlockedCompareExchange(&s_frame_limit, hz, -3);
+        hz = InterlockedCompareExchange(&s_frame_limit, -3, -3);
+    }
+    return (int)hz;
+}
+
 static void flip_fps_cap(int is_video)
 {
-    static int global_hz, inited;
     static Nv2aFramePacer pacer;
     static HANDLE timer;
     uint64_t deadline, now;
     int hz;
 
-    if (!inited) {
-        const char *e = getenv("RECOMP_FPS_CAP");
-        inited = 1;
-        global_hz = !e ? 0 : strcmp(e, "vblank") == 0 ? -2 : atoi(e);
-        if (global_hz < -2 || global_hz > 1000) global_hz = 0;
-        if (global_hz || video_fps_limit())
-            timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                           TIMER_ALL_ACCESS);
-    }
+    int global_hz = xbox_GetFrameLimit();
+    if (!timer && (global_hz || video_fps_limit()))
+        timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                       TIMER_ALL_ACCESS);
     hz = nv2a_frame_limit(global_hz, video_fps_limit(), is_video);
     if (hz == -2) {
         flip_wait_vblank(timer);
@@ -1503,6 +1518,8 @@ static void flip_fps_cap(int is_video)
 }
 #else
 static void flip_fps_cap(int is_video) { (void)is_video; }
+void xbox_SetFrameLimit(int hz) { (void)hz; }
+int xbox_GetFrameLimit(void) { return 0; }
 #endif
 
 /* Remember the surface just drawn into, with its own geometry (see
