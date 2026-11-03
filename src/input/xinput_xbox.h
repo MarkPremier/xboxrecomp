@@ -109,6 +109,13 @@ BOOL xbox_InputIsConnected(DWORD dwPort);
  */
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
 
+#ifdef _WIN32
+/* A PC binding for a title's own action builder: VK code, or 0x101..0x107
+ * (left/right/middle mouse, wheel up/down, mouse 4/5). Uses the overlay's
+ * menu-click suppression and wheel latch; does not change controller input. */
+int xbox_KbmInputDown(int key);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

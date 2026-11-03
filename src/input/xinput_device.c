@@ -550,6 +550,14 @@ static BOOL kbm_input_down(int vk)
     }
 }
 
+/* Title action builders can consume PC bindings without routing them through
+ * a particular console button layout. Keep menu-click suppression and the
+ * wheel's USB-poll latch identical to the ordinary pad overlay. */
+int xbox_KbmInputDown(int vk)
+{
+    return kbm_input_down(vk) != FALSE;
+}
+
 static BOOL kbm_down(int target)
 {
     const int *vk = kbm_menu_active && kbm_menu_listed[target] ? kbm_menu_binds[target].vk : kbm_binds[target].vk;
