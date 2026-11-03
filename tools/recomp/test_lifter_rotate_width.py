@@ -34,6 +34,31 @@ def _emit(mnemonic, reg, count):
 
 
 class RotateWidthTest(unittest.TestCase):
+    def test_carry_out_reaches_following_adc_or_branch(self):
+        for mnemonic in ("rol", "ror"):
+            for width, reg, _rol, _ror in _WIDTHS:
+                with self.subTest(mnemonic=mnemonic, reg=reg):
+                    lifter = Lifter()
+                    lifter.needs_cf = True
+                    insn = Instruction(0, 3, mnemonic, f"{reg}, cl", "",
+                        operands=[Operand(type="reg", reg=reg), Operand(type="reg", reg="cl")])
+                    out = "\n".join(lifter.lift_instruction(insn))
+                    self.assertIn("if (_rot_count) _cf =", out)
+                    self.assertIn("& 31u", out)
+                    self.assertLess(out.index("unsigned _rot_count"), out.index("SET_LO" if width < 4 else "eax ="))
+                    if mnemonic == "ror":
+                        self.assertIn(f">> {width * 8 - 1}", out)
+                    self.assertNotIn("_fa =", out)  # ROL/ROR preserve ZF/SF/PF.
+
+    def test_rotating_cl_captures_count_before_writing_it(self):
+        lifter = Lifter()
+        lifter.needs_cf = True
+        insn = Instruction(0, 2, "rol", "cl, cl", "d2c1",
+            operands=[Operand(type="reg", reg="cl"), Operand(type="reg", reg="cl")])
+        out = "\n".join(lifter.lift_instruction(insn))
+        self.assertLess(out.index("unsigned _rot_count"), out.index("SET_LO8(ecx"))
+        self.assertIn("ROL8(LO8(ecx), _rot_count)", out)
+
     def test_helper_matches_the_operand_width(self):
         for _w, reg, rol, ror in _WIDTHS:
             with self.subTest(reg=reg):

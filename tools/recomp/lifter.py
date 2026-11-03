@@ -2395,7 +2395,18 @@ class Lifter:
         bits = (_operand_width(ops[0]) or 4) * 8
         suffix = {8: "8", 16: "16"}.get(bits, "32")
         func = ("ROL" if m == "rol" else "ROR") + suffix
-        return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
+        if not self.needs_cf:
+            return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
+        # Serious Sam's shadow-mask walker uses rol dl,1 / adc esi,0:
+        # the wrapped bit advances to the next mask byte. Leaving CF stale
+        # repeats the first byte across the lightmap. Capture CL before the
+        # write, since it can also be the rotated destination.
+        carry = f"(({dst}) & 1u)" if m == "rol" else f"(((uint32_t)({dst}) >> {bits - 1}) & 1u)"
+        return [
+            f"{{ unsigned _rot_count = (unsigned)({cnt}) & 31u;",
+            "  " + _fmt_operand_write(ops[0], f"{func}({dst}, _rot_count)"),
+            f"  if (_rot_count) _cf = (int){carry}; }} /* {m} carry-out; zero count preserves flags */",
+        ]
 
     # ── Compare / Test (standalone) ──
 
