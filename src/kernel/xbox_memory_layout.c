@@ -1388,8 +1388,15 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 fflush(stderr);
             }
         }
-fence_mirrors_tick();
-        event_signals_tick();
+        /* GET_REPORT is asynchronous GPU work. Keep walking later commands,
+         * but do not retire a fence past its pending guest-memory write. */
+        {
+            extern int nv2a_pb_exec_poll_reports(void);
+            if (!nv2a_pb_exec_poll_reports()) {
+                fence_mirrors_tick();
+                event_signals_tick();
+            }
+        }
         if (s_nv2a_trace) {
             static uint32_t last_start = 0xFFFFFFFFu;
             uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);

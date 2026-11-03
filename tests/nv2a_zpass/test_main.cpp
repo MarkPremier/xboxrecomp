@@ -54,5 +54,36 @@ int main()
     nv2a_gpu_zpass_reset();nv2a_gpu_zpass_enable(1);CHECK(quad(state,5000));
     CHECK(nv2a_gpu_zpass_result()==1024);
     nv2a_gpu_zpass_enable(0);
+    // Query-only draws reuse scaled scene depth, rather than reclassifying it
+    // as an unscaled shadow map and publishing every dirty render target.
+    uint64_t layout_syncs=gpu_timing.target_layout_syncs;
+    size_t depth_owners=depth_surfaces.size();
+    state.color=nullptr;state.bytes_per_pixel=2;
+    CHECK(quad(state,5000)); // A regular depth prepass has the same owner too.
+    CHECK(depth_scaled(state.depth));
+    CHECK(gpu_timing.target_layout_syncs==layout_syncs);
+    nv2a_gpu_zpass_reset();nv2a_gpu_zpass_enable(1);
+    CHECK(quad(state,5000));
+    uint32_t visible=UINT32_MAX,hidden=UINT32_MAX,empty=UINT32_MAX;
+    auto completed=[](void *opaque,uint32_t count){*static_cast<uint32_t *>(opaque)=count;};
+    nv2a_gpu_zpass_queue_report(&visible,completed);
+    CHECK(visible==UINT32_MAX); // Queueing cannot block on or invent a result.
+    nv2a_gpu_zpass_reset(); // Old report retains its pre-reset counter snapshot.
+    CHECK(quad(state,20000));
+    nv2a_gpu_zpass_queue_report(&hidden,completed);
+    nv2a_gpu_zpass_reset();
+    nv2a_gpu_zpass_queue_report(&empty,completed);
+    CHECK(empty==UINT32_MAX); // Empty reports cannot overtake older writes.
+    nv2a_gpu_zpass_enable(0);
+    nv2a_gpu_zpass_drain();
+    CHECK(visible==1024 && hidden==0 && empty==0);
+    CHECK(!nv2a_gpu_zpass_poll());
+    CHECK(gpu_timing.target_layout_syncs==layout_syncs);
+    CHECK(depth_surfaces.size()==depth_owners);
+    CHECK(depth_scaled(state.depth));
+    // A real depth-only pass without a visibility query remains unscaled.
+    uint16_t shadow[32*32];std::fill(std::begin(shadow),std::end(shadow),uint16_t(0xFFFF));
+    state.depth=(uint8_t *)shadow;CHECK(quad(state,5000));
+    CHECK(!depth_scaled(state.depth));
     std::puts("PASS: occluded/visible, reset/enable, cumulative and scaled ZPASS counts");
 }

@@ -70,10 +70,13 @@ static int pb_sync_light(void)
     return on;
 }
 
-static void pb_flush_ordering(void)
+static void pb_flush_ordering(int memory_release)
 {
 #ifdef _WIN32
+    if (memory_release) nv2a_gpu_zpass_drain();
     if (pb_sync_light()) { nv2a_gpu_wait(); return; }
+#else
+    (void)memory_release;
 #endif
     nv2a_pb_exec_flush();
 }
@@ -660,7 +663,7 @@ static void semaphore_release(uint32_t value)
         goto failure;
     /* Retire the command's value, not a concurrently advanced CPU counter. */
     s_gpu.flush_semaphore++;
-    pb_flush_ordering();
+    pb_flush_ordering(1);
     *(volatile uint32_t *)destination = value;
     return;
 
@@ -678,6 +681,40 @@ failure:
  * (pgraph_write_zpass_pixel_cnt_report: u64 timestamp, u32 result, u32 done).
  * Count real depth/alpha-test survivors: reporting the whole surface visible
  * makes Serious Sam's lens flares shine through occluding walls. */
+typedef struct ZpassCompletion {
+    uint8_t *destination;
+    uint64_t timestamp, cpu_count;
+} ZpassCompletion;
+
+static void complete_zpass(void *opaque, uint32_t gpu_count)
+{
+    ZpassCompletion *report = (ZpassCompletion *)opaque;
+    uint64_t count = report->cpu_count + gpu_count;
+    uint32_t result = count > UINT32_MAX ? UINT32_MAX : (uint32_t)count;
+    uint32_t done = 0;
+    memcpy(report->destination + 8, &result, 4);
+#ifdef _WIN32
+    MemoryBarrier();
+#endif
+    memcpy(report->destination, &report->timestamp, 8);
+#ifdef _WIN32
+    MemoryBarrier();
+#endif
+    memcpy(report->destination + 12, &done, 4);
+    free(report);
+}
+
+/* Called even when PUT stops, so a guest polling its report can make progress.
+ * Pending reports also gate fence mirrors until their memory writes retire. */
+int nv2a_pb_exec_poll_reports(void)
+{
+#ifdef _WIN32
+    return nv2a_gpu_zpass_poll();
+#else
+    return 0;
+#endif
+}
+
 static void report_zpass(uint32_t offset)
 {
     uint32_t ramin_offset;
@@ -702,23 +739,16 @@ static void report_zpass(uint32_t offset)
     uint8_t *destination = xbox_DmaPhysicalPointer(address + offset, 16);
     if (!destination)
         goto failure;
-    uint64_t timestamp = ++s_gpu.report_timestamp;
-    uint64_t count = s_gpu.zpass_cpu_count;
+    ZpassCompletion *completion = (ZpassCompletion *)malloc(sizeof *completion);
+    if (!completion) { fprintf(stderr, "[GPU] occlusion report allocation failed\n"); _Exit(EXIT_FAILURE); }
+    completion->destination = destination;
+    completion->timestamp = ++s_gpu.report_timestamp;
+    completion->cpu_count = s_gpu.zpass_cpu_count;
 #ifdef _WIN32
-    count += nv2a_gpu_zpass_result();
+    nv2a_gpu_zpass_queue_report(completion, complete_zpass);
+#else
+    complete_zpass(completion, 0);
 #endif
-    uint32_t result = count > UINT32_MAX ? UINT32_MAX : (uint32_t)count;
-    uint32_t done = 0;
-    memcpy(destination + 8, &result, 4);
-#ifdef _WIN32
-    MemoryBarrier();
-#endif
-    memcpy(destination, &timestamp, 8);
-    /* The title polls the completion word; publish it after result/stamp. */
-#ifdef _WIN32
-    MemoryBarrier();
-#endif
-    memcpy(destination + 12, &done, 4);
     return;
 
 failure:
@@ -4528,7 +4558,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     if (method == NV097_WAIT_FOR_IDLE) {
         s_gpu.flush_wait_idle++;
-        pb_flush_ordering();
+        pb_flush_ordering(0);
         return;
     }
     if (method == 0x0100) {

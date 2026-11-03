@@ -483,6 +483,7 @@ struct DepthSurface {
     ComPtr<ID3D11DepthStencilView> ms_view;
     ComPtr<ID3D11ShaderResourceView> ms_sample_view;
     bool ms_newer, ms_stale;
+    bool scene_owned; /* actually drawn with colour; depth-only prepasses reuse it */
 };
 
 /* RECOMP_RENDER_SCALE=<n> (1 to 8, may be fractional): colour targets, and
@@ -2302,22 +2303,34 @@ static void readback_failed(const char *kind, HRESULT result, const char *operat
     std::_Exit(EXIT_FAILURE);
 }
 
+static std::vector<ComPtr<ID3D11Query>> zpass_pool;
 struct ZpassSegment {
     ComPtr<ID3D11Query> query;
     double pixels_per_sample = 1.0;
+    double pixels = 0;
+    bool ready = false;
+    ~ZpassSegment() {
+        if (query && zpass_pool.size() < 64) zpass_pool.push_back(std::move(query));
+    }
 };
 static bool zpass_enabled;
-static ZpassSegment zpass_active;
-static std::vector<ZpassSegment> zpass_segments;
-static std::vector<ComPtr<ID3D11Query>> zpass_pool;
+static std::shared_ptr<ZpassSegment> zpass_active;
+static std::vector<std::shared_ptr<ZpassSegment>> zpass_segments;
 static double zpass_total;
+struct ZpassReport {
+    std::vector<std::shared_ptr<ZpassSegment>> segments;
+    double total;
+    void *context;
+    Nv2aGpuZpassCompletion complete;
+};
+static std::deque<ZpassReport> zpass_reports;
+static bool zpass_needs_flush;
 
 static void zpass_end_segment()
 {
-    if (!zpass_active.query) return;
-    context->End(zpass_active.query.Get());
+    if (!zpass_active) return;
+    context->End(zpass_active->query.Get());
     zpass_segments.push_back(std::move(zpass_active));
-    zpass_active = {};
 }
 
 extern "C" void nv2a_gpu_zpass_enable(int enabled)
@@ -2329,7 +2342,6 @@ extern "C" void nv2a_gpu_zpass_enable(int enabled)
 extern "C" void nv2a_gpu_zpass_reset(void)
 {
     zpass_end_segment();
-    for (auto &segment : zpass_segments) zpass_pool.push_back(std::move(segment.query));
     zpass_segments.clear();
     zpass_total = 0;
 }
@@ -2337,41 +2349,83 @@ extern "C" void nv2a_gpu_zpass_reset(void)
 static void zpass_begin_draw(double pixels_per_sample)
 {
     if (!zpass_enabled) return;
-    if (zpass_active.query && zpass_active.pixels_per_sample != pixels_per_sample)
+    if (zpass_active && zpass_active->pixels_per_sample != pixels_per_sample)
         zpass_end_segment();
-    if (zpass_active.query) return;
+    if (zpass_active) return;
+    zpass_active = std::make_shared<ZpassSegment>();
     if (zpass_pool.empty()) {
         D3D11_QUERY_DESC description = {D3D11_QUERY_OCCLUSION, 0};
-        HRESULT result = device->CreateQuery(&description, &zpass_active.query);
+        HRESULT result = device->CreateQuery(&description, &zpass_active->query);
         if (FAILED(result)) readback_failed("occlusion query", result, "create");
     } else {
-        zpass_active.query = std::move(zpass_pool.back());
+        zpass_active->query = std::move(zpass_pool.back());
         zpass_pool.pop_back();
     }
-    zpass_active.pixels_per_sample = pixels_per_sample;
-    context->Begin(zpass_active.query.Get());
+    zpass_active->pixels_per_sample = pixels_per_sample;
+    context->Begin(zpass_active->query.Get());
+}
+
+static uint32_t zpass_count(double total)
+{
+    if (total >= 4294967295.0) return UINT32_MAX;
+    return total > 0 && total < 1 ? 1 : (uint32_t)(total + 0.5);
+}
+
+extern "C" void nv2a_gpu_zpass_queue_report(void *opaque, Nv2aGpuZpassCompletion complete)
+{
+    zpass_end_segment();
+    if (zpass_segments.empty() && zpass_reports.empty()) { complete(opaque, zpass_count(zpass_total)); return; }
+    zpass_reports.push_back({zpass_segments, zpass_total, opaque, complete});
+    zpass_needs_flush = true;
+}
+
+extern "C" int nv2a_gpu_zpass_poll(void)
+{
+    if (zpass_needs_flush) { context->Flush(); zpass_needs_flush = false; }
+    while (!zpass_reports.empty()) {
+        auto &report = zpass_reports.front();
+        double total = report.total;
+        for (auto &segment : report.segments) {
+            if (!segment->ready) {
+                UINT64 samples = 0;
+                HRESULT result = context->GetData(segment->query.Get(), &samples, sizeof samples,
+                                                  D3D11_ASYNC_GETDATA_DONOTFLUSH);
+                if (result == S_FALSE) return 1;
+                if (FAILED(result)) readback_failed("occlusion query", result, "result");
+                segment->pixels = (double)samples * segment->pixels_per_sample;
+                segment->ready = true;
+            }
+            total += segment->pixels;
+        }
+        auto complete = report.complete;
+        void *opaque = report.context;
+        zpass_reports.pop_front();
+        complete(opaque, zpass_count(total));
+    }
+    /* Compact completed counter segments; queued reports own independent refs. */
+    for (auto it = zpass_segments.begin(); it != zpass_segments.end();) {
+        if ((*it)->ready) { zpass_total += (*it)->pixels; it = zpass_segments.erase(it); }
+        else ++it;
+    }
+    return 0;
+}
+
+extern "C" void nv2a_gpu_zpass_drain(void)
+{
+    while (nv2a_gpu_zpass_poll()) {
+        xbox_Nv2aAcknowledgeHandshakes();
+        SwitchToThread();
+    }
 }
 
 extern "C" uint32_t nv2a_gpu_zpass_result(void)
 {
-    zpass_end_segment();
-    if (!zpass_segments.empty()) context->Flush();
-    for (auto &segment : zpass_segments) {
-        UINT64 samples = 0;
-        HRESULT result;
-        while ((result = context->GetData(segment.query.Get(), &samples, sizeof samples,
-                                         D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE) {
-            xbox_Nv2aAcknowledgeHandshakes();
-            SwitchToThread();
-        }
-        if (FAILED(result)) readback_failed("occlusion query", result, "result");
-        zpass_total += (double)samples * segment.pixels_per_sample;
-        zpass_pool.push_back(std::move(segment.query));
-    }
-    zpass_segments.clear();
-    if (zpass_total >= 4294967295.0) return UINT32_MAX;
-    /* A partially covered logical pixel still establishes visibility. */
-    return zpass_total > 0 && zpass_total < 1 ? 1 : (uint32_t)(zpass_total + 0.5);
+    uint32_t result = 0;
+    nv2a_gpu_zpass_queue_report(&result, [](void *opaque, uint32_t pixels) {
+        *static_cast<uint32_t *>(opaque) = pixels;
+    });
+    nv2a_gpu_zpass_drain();
+    return result;
 }
 
 static void mark_target_aliases(const void *owner, const uint8_t *memory, size_t bytes)
@@ -4697,7 +4751,19 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             !nv_cpu_finite(vertices[vertex].position[2]) || !nv_cpu_finite(vertices[vertex].position[3])) return 0;
     /* Kept at every scale, so a change of scale knows which to leave alone. */
     if (state->depth && (state->depth_enable || state->stencil_enable)) {
-        if (depth_only) depth_only_targets.insert(state->depth);
+        /* A colour-masked visibility query tests the existing scene depth;
+         * it is not a new shadow map. Switching that depth to native size
+         * creates a conflicting alias and reads the whole frame back twice. */
+        if (depth_only) {
+            bool scene_owned = std::any_of(depth_surfaces.begin(), depth_surfaces.end(),
+                [&](const DepthSurface &owner) {
+                    return owner.scene_owned && owner.memory == state->depth &&
+                           owner.width == state->width && owner.height == state->height &&
+                           owner.pitch == state->depth_pitch && owner.format == state->depth_format;
+                });
+            if (scene_owned) depth_only_targets.erase(state->depth);
+            else if (!zpass_enabled) depth_only_targets.insert(state->depth);
+        }
         else depth_only_targets.erase(state->depth);
     }
     TargetExtent extent = reusable_target_extent(*state);
@@ -5117,6 +5183,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     ID3D11RenderTargetView *target = nullptr;
     ID3D11DepthStencilView *depth_target = nullptr;
     bind_draw_targets(surface, depth, target, depth_target);
+    if (depth && surface) depth->scene_owned = true;
     ID3D11ShaderResourceView *resources[12] = {}; ID3D11SamplerState *sampler_states[4];
     for (uint32_t stage = 0; stage < 4; stage++) {
         resources[state->textures[stage].depth ? stage + 8 : state->textures[stage].cube ? stage + 4 : stage] = views[stage].Get();

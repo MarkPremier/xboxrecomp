@@ -1,6 +1,9 @@
 /* Real NV097 method dispatch, framebuffer bytes and GPU readback. No disc data. */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#ifdef _WIN32
+#include "nv2a_gpu.h"
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +13,7 @@ guest_fn recomp_lookup(uint32_t va) { (void)va; return NULL; }
 guest_fn recomp_lookup_manual(uint32_t va) { (void)va; return NULL; }
 extern void nv2a_pb_exec_method(uint32_t subch,uint32_t method,uint32_t param);
 extern void nv2a_pb_exec_flush(void);
+extern int nv2a_pb_exec_poll_reports(void);
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); exit(1); } } while(0)
 static void env(const char *key,const char *value) {
 #ifdef _WIN32
@@ -76,6 +80,26 @@ int main(int argc,char **argv) {
     method(0x17D0,0x01008000);
     CHECK(report[2]==0 && report[3]==0 && report[4]==0xFFFFFFFF);
     CHECK(report[0]!=0xFFFFFFFF || report[1]!=0xFFFFFFFF);
+#ifdef _WIN32
+    if(strcmp(argv[1],"cpu")) {
+        Nv2aGpuDraw draw={0};Nv2aGpuVertex vertices[6]={0};
+        const float xy[6][2]={{0,0},{8,0},{0,6},{8,0},{8,6},{0,6}};
+        draw.color=p;draw.width=draw.clip_width=8;draw.height=draw.clip_height=6;
+        draw.pitch=64;draw.bytes_per_pixel=4;draw.polygon_front=draw.polygon_back=0x1B02;
+        for(unsigned i=0;i<6;i++){
+            vertices[i].position[0]=xy[i][0];vertices[i].position[1]=xy[i][1];
+            vertices[i].position[3]=1;
+        }
+        method(0x17C8,1);method(0x17CC,1);
+        CHECK(nv2a_gpu_draw(&draw,vertices,6));
+        method(0x17CC,0);for(unsigned i=0;i<4;i++)report[i]=0xFFFFFFFF;
+        method(0x17D0,0x01008000);
+        CHECK(report[3]==0xFFFFFFFF); /* Completion waits for a nonblocking poll. */
+        uint64_t deadline=GetTickCount64()+5000;
+        while(nv2a_pb_exec_poll_reports()){CHECK(GetTickCount64()<deadline);SwitchToThread();}
+        CHECK(report[2]==48 && report[3]==0 && report[4]==0xFFFFFFFF);
+    }
+#endif
     puts("PASS: bounded RGB565/ARGB and Z16 clears preserve surrounding pixels");
     return 0;
 }
