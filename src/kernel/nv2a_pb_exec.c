@@ -2223,6 +2223,14 @@ static int pvideo_overlay_active(void)
         && ((regs[0x958 / 4 + slot] >> 16) & 3u) == 1u;
 }
 
+/* Whether recent flips show a full-screen video: a movie drawn as a textured
+ * quad (s_gpu.video_active, see the flip) or the PVIDEO overlay. Any thread;
+ * a title can let the keyboard skip its movies with it. */
+int xbox_VideoActive(void)
+{
+    return s_gpu.video_active || pvideo_overlay_active();
+}
+
 static void present_pvideo_overlay(uint32_t destination)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();

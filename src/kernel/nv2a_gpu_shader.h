@@ -283,8 +283,17 @@ void gs_main(triangle Pixel vertices[3],inout TriangleStream<Pixel> stream) {
 void gs_lines_main(line Pixel vertices[2],inout LineStream<Pixel> stream) {
  [unroll]for(uint vertex=0;vertex<2;vertex++)
   if(!all(isfinite(vertices[vertex].position)))return;
+ /* Widescreen, a 2D draw: as gs_main (outlines and frames around 2D panels). */
+ float squeeze=1;
+ if(viewport.w>0 && viewport.w<1) {
+  bool edge=false;
+  [unroll]for(uint vertex=0;vertex<2;vertex++)
+   if(vertices[vertex].position.w!=0 && abs(vertices[vertex].position.x/vertices[vertex].position.w)>=0.98)edge=true;
+  if(!edge)squeeze=viewport.w;
+ }
  [unroll]for(uint vertex=0;vertex<2;vertex++) {
   Pixel result=vertices[vertex];
+  result.position.x*=squeeze;
   if(misc.w!=0) {result.diffuse=vertices[1].diffuse;result.specular=vertices[1].specular;}
   stream.Append(result);
  }
@@ -292,7 +301,10 @@ void gs_lines_main(line Pixel vertices[2],inout LineStream<Pixel> stream) {
 }
 [maxvertexcount(1)]
 void gs_points_main(point Pixel vertices[1],inout PointStream<Pixel> stream) {
- if(all(isfinite(vertices[0].position)))stream.Append(vertices[0]);
+ if(!all(isfinite(vertices[0].position)))return;
+ Pixel result=vertices[0];
+ if(viewport.w>0 && viewport.w<1) result.position.x*=viewport.w;
+ stream.Append(result);
 }
 float4 mapped(float4 registers[16], uint encoded, bool alpha) {
  encoded &=255; float4 value=registers[encoded&15];

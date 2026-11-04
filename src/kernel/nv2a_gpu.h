@@ -12,6 +12,8 @@ int nv2a_gpu_available(void);
 int nv2a_gpu_compile(void);
 /* Current native presentation interval, including live window changes. */
 int xbox_GetPresentInterval(void);
+/* Recent flips show a full-screen video (a textured-quad movie or PVIDEO). */
+int xbox_VideoActive(void);
 /* Live fixed flip limit: 0 unlimited, -2 emulated vblank, 1..1000 Hz.
  * Reads RECOMP_FPS_CAP until explicitly set; movie pacing remains separate. */
 void xbox_SetFrameLimit(int hz);
@@ -39,6 +41,10 @@ void nv2a_gpu_set_render_scale(float scale);
  * registers (most specific first; D3D's c0, c[96], by default) and 2D draws
  * kept at 4:3. From the next flip; any thread. */
 void nv2a_gpu_set_wide_factor(float factor);
+/* The title widens its own field of view (and culling) by the wide factor:
+ * 3D draws then keep their projection and are only stretched; 2D draws are
+ * still squeezed back to 4:3. Off by default. Any thread. */
+void nv2a_gpu_set_wide_title_fov(int on);
 void nv2a_gpu_set_projection_registers(const int *registers, int count);
 /* Draw `bgra` (width x height, B8G8R8A8) wherever the title binds a texture
  * whose bytes in guest memory hash (FNV-1a 64) to `hash`. Before the title
