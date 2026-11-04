@@ -78,6 +78,16 @@ static volatile LONG g_isr_active;       /* host ISRs/DPCs in flight */
 static volatile LONG g_async_running;
 static RECOMP_TLS int t_async_depth;
 
+/* Guest threads crossing DISPATCH_LEVEL, either way. A device holding off its
+ * interrupt for a raised guest tells a stuck raise (this stops) from busy
+ * ones; host ISRs and DPCs are not counted. */
+static volatile LONG g_guest_crossings;
+
+int xbox_IrqlGuestCrossings(void)
+{
+    return (int)InterlockedCompareExchange(&g_guest_crossings, 0, 0);
+}
+
 int xbox_AsyncGateEnter(int force)
 {
     InterlockedIncrement(&g_async_running);
@@ -143,6 +153,11 @@ int xbox_DpcGateEnter(void)
     /* Bounded, like the device models' interrupt hold-off: a guest that
      * raised and never lowered must not stop deferred work for good. */
     now = GetTickCount64();
+    {   /* Guests still raising and lowering are not stuck (xbox_IrqlGuestCrossings). */
+        static int crossings;
+        int seen = xbox_IrqlGuestCrossings();
+        if (seen != crossings) { crossings = seen; blocked_since = 0; }
+    }
     if (!blocked_since)
         blocked_since = now;
     if (now - blocked_since < 250)
@@ -169,6 +184,8 @@ static KIRQL irql_swap(KIRQL v)
     if (old != v) {
         if (v >= DISPATCH_LEVEL)
             InterlockedIncrement(&g_guest_levels[v]);
+        if ((old < DISPATCH_LEVEL) != (v < DISPATCH_LEVEL))
+            InterlockedIncrement(&g_guest_crossings);
         if (old < DISPATCH_LEVEL && v >= DISPATCH_LEVEL) {
             InterlockedIncrement(&g_guest_raised);
             while (!t_async_depth && InterlockedCompareExchange(&g_async_running, 0, 0) > 0)

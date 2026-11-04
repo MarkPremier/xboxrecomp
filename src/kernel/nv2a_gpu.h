@@ -76,6 +76,10 @@ uint32_t nv2a_gpu_zpass_result(void);
  * executor thread even when PUT stops; callbacks run there once data is ready. */
 typedef void (*Nv2aGpuZpassCompletion)(void *context, uint32_t pixels);
 void nv2a_gpu_zpass_queue_report(void *context, Nv2aGpuZpassCompletion complete);
+/* As above for a report the title reissues every frame at the same place
+ * (key, e.g. its destination): once the host GPU runs behind, it is answered
+ * with that place's previous count instead of stalling the title. */
+void nv2a_gpu_zpass_queue_report_keyed(void *context, Nv2aGpuZpassCompletion complete, uintptr_t key);
 int nv2a_gpu_zpass_poll(void); /* nonzero while reports remain pending */
 void nv2a_gpu_zpass_drain(void); /* ordering barrier before GPU memory releases */
 

@@ -2350,15 +2350,41 @@ struct ZpassReport {
     double total;
     void *context;
     Nv2aGpuZpassCompletion complete;
-    ULONGLONG queued_ms;
+    double queued_ms;
+    uintptr_t key;
 };
 /* Fences wait for earlier reports (pb_flush_ordering), so a query that never
  * completes would stall the title's BlockOnTime for good. Past this, an
  * unfinished segment counts as a whole 640x480 screen visible -- the fixed
  * answer the runtime gave before real counts -- and that is logged. */
-static const ULONGLONG zpass_timeout_ms = 250;
+static const double zpass_timeout_ms = 250;
 static const double zpass_timeout_pixels = 640.0 * 480.0;
+/* A title reads last frame's test and spins until it has it: Serious Sam
+ * once per lens flare. The console's GPU always had it by then; a host GPU
+ * rendering at several times the resolution can be frames behind, and each
+ * wait was a stutter in torch-lit rooms. A keyed report still unfinished
+ * after this is answered with its key's last real count (one more frame of
+ * latency) and moves to zpass_late, whose counts keep that answer current.
+ * RECOMP_ZPASS_WAIT_MS sets it; 0 always waits. */
+static double zpass_wait_ms()
+{
+    static const double wait = [] {
+        const char *value = std::getenv("RECOMP_ZPASS_WAIT_MS");
+        return value && *value ? std::atof(value) : 2.0;
+    }();
+    return wait;
+}
+static double zpass_now_ms()
+{
+    static LARGE_INTEGER frequency;
+    LARGE_INTEGER now;
+    if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&now);
+    return (double)now.QuadPart * 1000.0 / (double)frequency.QuadPart;
+}
 static std::deque<ZpassReport> zpass_reports;
+static std::deque<ZpassReport> zpass_late;
+static std::unordered_map<uintptr_t, uint32_t> zpass_last;
 static bool zpass_needs_flush;
 
 static void zpass_end_segment()
@@ -2406,41 +2432,71 @@ static uint32_t zpass_count(double total)
     return total > 0 && total < 1 ? 1 : (uint32_t)(total + 0.5);
 }
 
-extern "C" void nv2a_gpu_zpass_queue_report(void *opaque, Nv2aGpuZpassCompletion complete)
+extern "C" void nv2a_gpu_zpass_queue_report_keyed(void *opaque, Nv2aGpuZpassCompletion complete, uintptr_t key)
 {
     zpass_end_segment();
     if (zpass_segments.empty() && zpass_reports.empty()) { complete(opaque, zpass_count(zpass_total)); return; }
-    zpass_reports.push_back({zpass_segments, zpass_total, opaque, complete, GetTickCount64()});
+    zpass_reports.push_back({zpass_segments, zpass_total, opaque, complete, zpass_now_ms(), key});
     zpass_needs_flush = true;
+}
+
+extern "C" void nv2a_gpu_zpass_queue_report(void *opaque, Nv2aGpuZpassCompletion complete)
+{
+    nv2a_gpu_zpass_queue_report_keyed(opaque, complete, 0);
+}
+
+/* Reads a report's segments that have finished. False while one is still
+ * running; then a nonnegative `timeout_ms` past its queueing gives it up as a
+ * whole screen visible. */
+static bool zpass_collect(ZpassReport &report, double *total, double timeout_ms)
+{
+    *total = report.total;
+    for (auto &segment : report.segments) {
+        if (!segment->ready) {
+            UINT64 samples = 0;
+            HRESULT result = context->GetData(segment->query.Get(), &samples, sizeof samples,
+                                              D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            if (result == S_FALSE) {
+                if (timeout_ms < 0 || zpass_now_ms() - report.queued_ms < timeout_ms) return false;
+                static std::atomic<unsigned> timeouts{0};
+                if (timeouts.fetch_add(1) < 5)
+                    std::fprintf(stderr, "[GPU-D3D11] occlusion query unfinished after %.0f ms; "
+                                 "reporting it visible so fences can retire\n", timeout_ms);
+                segment->pixels = zpass_timeout_pixels;
+            } else {
+                if (FAILED(result)) readback_failed("occlusion query", result, "result");
+                segment->pixels = (double)samples * segment->pixels_per_sample;
+            }
+            segment->ready = true;
+        }
+        *total += segment->pixels;
+    }
+    return true;
 }
 
 extern "C" int nv2a_gpu_zpass_poll(void)
 {
     if (zpass_needs_flush) { context->Flush(); zpass_needs_flush = false; }
+    double total;
+    while (!zpass_late.empty() && zpass_collect(zpass_late.front(), &total, -1)) {
+        zpass_last[zpass_late.front().key] = zpass_count(total);
+        zpass_late.pop_front();
+    }
     while (!zpass_reports.empty()) {
         auto &report = zpass_reports.front();
-        double total = report.total;
-        for (auto &segment : report.segments) {
-            if (!segment->ready) {
-                UINT64 samples = 0;
-                HRESULT result = context->GetData(segment->query.Get(), &samples, sizeof samples,
-                                                  D3D11_ASYNC_GETDATA_DONOTFLUSH);
-                if (result == S_FALSE) {
-                    if (GetTickCount64() - report.queued_ms < zpass_timeout_ms) return 1;
-                    static std::atomic<unsigned> timeouts{0};
-                    if (timeouts.fetch_add(1) < 5)
-                        std::fprintf(stderr, "[GPU-D3D11] occlusion query unfinished after %llu ms; "
-                                     "reporting it visible so fences can retire\n",
-                                     (unsigned long long)zpass_timeout_ms);
-                    segment->pixels = zpass_timeout_pixels;
-                } else {
-                    if (FAILED(result)) readback_failed("occlusion query", result, "result");
-                    segment->pixels = (double)samples * segment->pixels_per_sample;
-                }
-                segment->ready = true;
-            }
-            total += segment->pixels;
+        if (!zpass_collect(report, &total, zpass_timeout_ms)) {
+            auto last = report.key ? zpass_last.find(report.key) : zpass_last.end();
+            double wait = zpass_wait_ms();
+            if (last == zpass_last.end() || wait <= 0 || zpass_now_ms() - report.queued_ms < wait) return 1;
+            uint32_t pixels = last->second;
+            auto complete = report.complete;
+            void *opaque = report.context;
+            zpass_late.push_back(std::move(report));
+            zpass_reports.pop_front();
+            complete(opaque, pixels);
+            continue;
         }
+        if (report.key) zpass_last[report.key] = zpass_count(total);
         auto complete = report.complete;
         void *opaque = report.context;
         zpass_reports.pop_front();
@@ -4960,10 +5016,24 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
      * with an orthographic projection. That has no depth in its w row
      * (c[projection + 3] is 0, 0, 0, 1), where any perspective view has; such
      * a draw is 2D here. */
+    bool ortho_from_view = false;
     if (projection >= 0 && projection + 3 < 192 && wide_title_fov.load(std::memory_order_relaxed)) {
         const float *w_row = constants.vertex_constants[projection + 3];
-        if (std::fabs(w_row[0]) + std::fabs(w_row[1]) + std::fabs(w_row[2]) < 1e-6f) projection = -1;
+        if (std::fabs(w_row[0]) + std::fabs(w_row[1]) + std::fabs(w_row[2]) < 1e-6f) {
+            projection = -1;
+            /* Lens flares (additive: Serious Engine's RenderLensFlares blends
+             * ONE, ONE) are 2D sprites placed where the widened view projected
+             * a light: their place is already right on the wide target, only
+             * their shape needs squeezing. The HUD (ordinary alpha) is laid
+             * out for 4:3 and moves to the middle as a whole. */
+            ortho_from_view = (state->blend_enable && state->blend_destination == 1) ||
+                              !(state->color_mask & 0x10101u);
+        }
     }
+    /* The occlusion test at each light (a small triangle drawn while ZPASS
+     * counts) must sample exactly where the game put it: moved, it tests
+     * the wrong depth and flares shine through walls. */
+    bool visibility_test = projection < 0 && zpass_enabled && wide_title_fov.load(std::memory_order_relaxed);
     if (projection >= 0 && surface && screen_shaped(surface->width, surface->height)) screen_3d_draws++;
     float widened = ((float)target_width / (float)guest_width) / ((float)target_height / (float)guest_height);
     bool squeeze_2d = false;
@@ -4972,8 +5042,10 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             if (!wide_title_fov.load(std::memory_order_relaxed))
                 for (int component = 0; component < 4; component++) constants.vertex_constants[projection][component] /= widened;
         }
-        else if (!nv2a_pb_exec_batch_spans(constants.viewport[0])) {
-            constants.viewport[3] = 1.0f / widened;
+        else if (!visibility_test && !nv2a_pb_exec_batch_spans(constants.viewport[0])) {
+            /* Positive squeezes about the screen centre, negative about each
+             * primitive's own (gs_main). */
+            constants.viewport[3] = (ortho_from_view ? -1.0f : 1.0f) / widened;
             squeeze_2d = true;
         }
     }

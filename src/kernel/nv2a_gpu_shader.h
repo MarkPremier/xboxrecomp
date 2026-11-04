@@ -270,9 +270,34 @@ void gs_main(triangle Pixel vertices[3],inout TriangleStream<Pixel> stream) {
    if(vertices[vertex].position.w!=0 && abs(vertices[vertex].position.x/vertices[vertex].position.w)>=0.98)edge=true;
   if(!edge)squeeze=viewport.w;
  }
+ /* Negative viewport.w: a sprite placed by the view (a lens flare), squeezed
+    about its own centre so it keeps its place and loses only the stretch. */
+ float anchor=0;
+ if(viewport.w<0 && viewport.w>-1) {
+  /* The sprite's centre, the same for both triangles of its quad even when
+     the quad is rotated: where its texture coordinates are mid-range, through
+     this triangle's texture-to-screen mapping. Untextured: the box centre. */
+  float3 x,u,v;
+  float low=1e30,high=-1e30;
+  squeeze=-viewport.w;
+  [unroll]for(uint vertex=0;vertex<3;vertex++) {
+   x[vertex]=vertices[vertex].position.w!=0?vertices[vertex].position.x/vertices[vertex].position.w:0;
+   u[vertex]=vertices[vertex].tex0.x;v[vertex]=vertices[vertex].tex0.y;
+   low=min(low,x[vertex]);high=max(high,x[vertex]);
+  }
+  anchor=(low+high)*0.5;
+  float det=(u[1]-u[0])*(v[2]-v[0])-(u[2]-u[0])*(v[1]-v[0]);
+  if(abs(det)>1e-8) {
+   float a=((x[1]-x[0])*(v[2]-v[0])-(x[2]-x[0])*(v[1]-v[0]))/det;
+   float b=((x[2]-x[0])*(u[1]-u[0])-(x[1]-x[0])*(u[2]-u[0]))/det;
+   float uc=(min(u[0],min(u[1],u[2]))+max(u[0],max(u[1],u[2])))*0.5;
+   float vc=(min(v[0],min(v[1],v[2]))+max(v[0],max(v[1],v[2])))*0.5;
+   anchor=x[0]+a*(uc-u[0])+b*(vc-v[0]);
+  }
+ }
  [unroll]for(uint vertex=0;vertex<3;vertex++) {
   Pixel result=vertices[vertex];
-  result.position.x*=squeeze;
+  result.position.x=(result.position.x-anchor*result.position.w)*squeeze+anchor*result.position.w;
   result.depthSlope=slope;
   if(misc.w!=0) {result.diffuse=vertices[2].diffuse;result.specular=vertices[2].specular;}
   stream.Append(result);
@@ -291,9 +316,20 @@ void gs_lines_main(line Pixel vertices[2],inout LineStream<Pixel> stream) {
    if(vertices[vertex].position.w!=0 && abs(vertices[vertex].position.x/vertices[vertex].position.w)>=0.98)edge=true;
   if(!edge)squeeze=viewport.w;
  }
+ float anchor=0;
+ if(viewport.w<0 && viewport.w>-1) {
+  /* The centre of its bounding box, which both triangles of a quad share. */
+  float low=1e30,high=-1e30;
+  squeeze=-viewport.w;
+  [unroll]for(uint vertex=0;vertex<2;vertex++) {
+   float x=vertices[vertex].position.w!=0?vertices[vertex].position.x/vertices[vertex].position.w:0;
+   low=min(low,x);high=max(high,x);
+  }
+  anchor=(low+high)*0.5;
+ }
  [unroll]for(uint vertex=0;vertex<2;vertex++) {
   Pixel result=vertices[vertex];
-  result.position.x*=squeeze;
+  result.position.x=(result.position.x-anchor*result.position.w)*squeeze+anchor*result.position.w;
   if(misc.w!=0) {result.diffuse=vertices[1].diffuse;result.specular=vertices[1].specular;}
   stream.Append(result);
  }

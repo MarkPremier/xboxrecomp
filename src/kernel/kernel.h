@@ -825,6 +825,7 @@ void    xbox_IrqlThreadExit(void);
 /* Total crossings of the DISPATCH boundary, and who is holding it up.
  * A depth that is non-zero while this stops moving is stuck, not busy. */
 int     xbox_IrqlTransitions(void);
+int     xbox_IrqlGuestCrossings(void);
 void    xbox_IrqlDumpHolders(void);
 void    xbox_IrqlRecord(char op, const char *why, uint32_t caller,
                         unsigned old_level, unsigned new_level);

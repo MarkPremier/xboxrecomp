@@ -745,7 +745,7 @@ static void report_zpass(uint32_t offset)
     completion->timestamp = ++s_gpu.report_timestamp;
     completion->cpu_count = s_gpu.zpass_cpu_count;
 #ifdef _WIN32
-    nv2a_gpu_zpass_queue_report(completion, complete_zpass);
+    nv2a_gpu_zpass_queue_report_keyed(completion, complete_zpass, (uintptr_t)destination);
 #else
     complete_zpass(completion, 0);
 #endif

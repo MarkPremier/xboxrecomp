@@ -198,6 +198,7 @@ extern void xbox_worker_stack_free(int slot);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 extern uint32_t xbox_AllocThreadTib(void);
 extern int xbox_IrqlBlocksInterrupts(void);
+extern int xbox_IrqlGuestCrossings(void);
 extern int xbox_AsyncGateEnter(int force);
 extern void xbox_AsyncGateLeave(void);
 extern int xbox_InterruptLockTry(void);
@@ -221,7 +222,8 @@ extern APU_TLS uint32_t g_fs_base;
 static void apu_deliver_irq(MCPXAPUState *d)
 {
     static int tib_ready;
-    static unsigned held_off;
+    static unsigned held_off, forced;
+    static int held_transitions;
     uint32_t kint, routine, context;
     uint8_t *guest_ram = (uint8_t *)(uintptr_t)xbox_GetMemoryOffset();
     apu_guest_fn fn;
@@ -230,9 +232,21 @@ static void apu_deliver_irq(MCPXAPUState *d)
     if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
         return;
     if (xbox_IrqlBlocksInterrupts()) {
+        /* A raise that never lowers must not silence audio, but threads that
+         * keep raising and lowering are making progress: delivering past
+         * them puts the ISR inside DirectSound's DISPATCH_LEVEL list edits,
+         * which one CPU never allows. Only a hold-off with no IRQL change at
+         * all is a stuck raise. */
+        int transitions = xbox_IrqlGuestCrossings();
+        if (transitions != held_transitions) {
+            held_transitions = transitions;
+            held_off = 0;
+        }
         if (++held_off <= 50)
             return;
-        force = 1;   /* a raise that never lowers must not silence audio */
+        force = 1;
+        if (++forced <= 5 || !(forced & 1023u))
+            fprintf(stderr, "[APU] interrupt forced past a stuck raised IRQL (%u times)\n", forced);
     }
     held_off = 0;
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
