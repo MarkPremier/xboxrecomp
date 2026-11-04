@@ -8069,10 +8069,14 @@ static void bridge_KeGetCurrentIrql(void)
     g_eax = 0;  /* PASSIVE_LEVEL */
 }
 
-/* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes) --- */
+/* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes) ---
+ * The calling thread's KTHREAD, which the console keeps at fs:[0x28]. Each
+ * thread's TIB points at its own record there (xbox_AllocThreadTib), whose
+ * +0x12C is the UniqueThread GetCurrentThreadId reads; returning 0 made every
+ * thread the same null thread to a title comparing the two. */
 static void bridge_KeGetCurrentThread(void)
 {
-    g_eax = 0;
+    g_eax = XBOX_FS_BASE ? BRIDGE_MEM32(XBOX_FS_BASE + 0x28) : 0;
 }
 
 /* --- KeSetDisableBoostThread (ordinal 144, 2 args = 8 bytes) --- */
