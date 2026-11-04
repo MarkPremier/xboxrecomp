@@ -16,3 +16,5 @@ add_test(NAME memory_regressions_default COMMAND memory_regressions_test default
 add_test(NAME memory_regressions_heap_reclaim COMMAND memory_regressions_test heap-reclaim ${XBE})
 add_test(NAME memory_regressions_ext_vma COMMAND memory_regressions_test ext-vma ${XBE})
 add_test(NAME memory_regressions_ext_vma_128 COMMAND memory_regressions_test ext-vma-128 ${XBE})
+add_test(NAME memory_regressions_apu_redir COMMAND memory_regressions_test apu-redir ${XBE})
+add_test(NAME memory_regressions_apu_no_redir COMMAND memory_regressions_test apu-no-redir ${XBE})

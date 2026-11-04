@@ -32,10 +32,15 @@
  *   ext-vma-128   The same switch on a 128 MB map, where the mirrors already
  *                 reach past user space. The tracker must stay out of the way
  *                 rather than reserve a range of negative size.
+ *   apu-redir / apu-no-redir
+ *                 Numeric RECOMP_APU_NO_REDIR=0/1. Sample DMA policy must not
+ *                 redirect ordinary PCM when disabled, and must never move
+ *                 DirectSound structures or DSP scratch out of their block.
  */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "guest_vmem.h"
+#include "apu_state.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -173,6 +178,45 @@ static void set_env(const char *name, const char *value)
 #endif
 }
 
+/* Sam's looping PCM buffer collided with unrelated floating-point graphics
+ * data in the contiguous bank. Sample reads must follow provenance while
+ * DirectSound control structures and DSP scratch retain their pinned bank. */
+static void test_apu_banks(int no_redir)
+{
+    MCPXAPUState *apu = calloc(1, sizeof(*apu));
+    uint32_t va = xbox_ContiguousAlloc(4096, 0x02000000);
+    uint32_t physical = va - 0x80000000u;
+    uint8_t *ordinary, *contiguous;
+    extern uint8_t *xbox_ApuScratchPointer(uint64_t, uint32_t);
+    if (!apu || !va) {
+        check(0, "allocate APU bank fixture", NULL);
+        free(apu);
+        return;
+    }
+    ordinary = (uint8_t *)G(physical);
+    contiguous = (uint8_t *)G(va);
+    *(uint32_t *)ordinary = 0x01FCFEF6;
+    *(uint32_t *)contiguous = 0x3F1F4E44;
+    xbox_RecordDmaTranslation(va, physical);
+    xbox_RecordDmaTranslation(physical, physical);
+    check(xbox_DmaPhysicalPointer(physical, 4) == ordinary,
+          "shared sample DMA retains ordinary provenance", NULL);
+    check(xbox_ApuPhysicalPointer(physical, 4) == (no_redir ? ordinary : contiguous),
+          "APU sample bank follows numeric redirect setting", NULL);
+    check(xbox_ApuPhysicalPointer(va, 4) == contiguous,
+          "explicit contiguous sample addresses remain contiguous", NULL);
+    check(xbox_ApuScratchPointer(physical, 4) == contiguous,
+          "DSP scratch stays in its live contiguous block", NULL);
+    apu->physical_mapper = xbox_ApuPhysicalPointer;
+    g_state = apu;
+    check(mcpx_apu_ds_address(physical, 4) == contiguous,
+          "DS voice/SGE/notifier storage stays contiguous", NULL);
+    check(mcpx_apu_ram_address(physical, 4) == (no_redir ? ordinary : contiguous),
+          "actual APU sample reader uses the selected bank", NULL);
+    g_state = NULL;
+    free(apu);
+}
+
 int main(int argc, char **argv)
 {
     const char *mode = argc > 1 ? argv[1] : "default";
@@ -180,13 +224,15 @@ int main(int argc, char **argv)
     int reclaim = !strcmp(mode, "heap-reclaim");
     int ext128 = !strcmp(mode, "ext-vma-128");
     int ext = ext128 || !strcmp(mode, "ext-vma");
+    int apu_no_redir = !strcmp(mode, "apu-no-redir");
+    int apu_mode = apu_no_redir || !strcmp(mode, "apu-redir");
     size_t xbe_len = 0;
     unsigned char *xbe;
     char d[160];
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && strcmp(mode, "default")) {
+    if (!reclaim && !ext && !apu_mode && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
@@ -196,6 +242,8 @@ int main(int argc, char **argv)
         set_env("RECOMP_EXT_VMA", "1");
     if (ext128)
         xbox_SetTotalRam(XBOX_DEVKIT_RAM);
+    if (apu_mode)
+        set_env("RECOMP_APU_NO_REDIR", apu_no_redir ? "1" : "0");
 
     xbe = load_file(path, &xbe_len);
     if (!xbe) {
@@ -205,6 +253,12 @@ int main(int argc, char **argv)
     if (!xbox_MemoryLayoutInit(xbe, xbe_len)) {
         puts("xbox_MemoryLayoutInit failed");
         return 2;
+    }
+    if (apu_mode) {
+        test_apu_banks(apu_no_redir);
+        xbox_MemoryLayoutShutdown();
+        free(xbe);
+        return failures ? 1 : 0;
     }
 
     scratch = xbox_HeapAlloc(0x10000, 4096);

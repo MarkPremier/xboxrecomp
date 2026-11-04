@@ -4229,8 +4229,10 @@ uint8_t *xbox_ApuPhysicalPointer(uint64_t physical, uint32_t bytes)
         physical < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
     static int no_redir = -1;
 
-    if (no_redir < 0)
-        no_redir = getenv("RECOMP_APU_NO_REDIR") != NULL;
+    if (no_redir < 0) {
+        const char *setting = getenv("RECOMP_APU_NO_REDIR");
+        no_redir = setting && *setting && strcmp(setting, "0");
+    }
     if (!no_redir && !explicit_contiguous && g_contig_memory &&
         physical < CONTIG_ARENA_BYTES &&
         contig_block_at((uint32_t)physical, NULL, NULL)) {
