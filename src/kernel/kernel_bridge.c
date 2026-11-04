@@ -513,6 +513,10 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
+    ULONG guarantee = 64 * 1024;
+
+    /* Room for a crash handler to report a native stack overflow. */
+    SetThreadStackGuarantee(&guarantee);
 
     /* Own register set (RECOMP_TLS), own simulated stack -- and own TIB.
      *
