@@ -2316,6 +2316,13 @@ extern "C" void nv2a_gpu_set_wide_title_fov(int on)
     wide_title_fov.store(on != 0);
 }
 
+/* Consecutive flips without a 3D draw on the screen: loading screens, menus,
+ * briefings and movies, as opposed to play. Any thread (a racy read is fine). */
+extern "C" int nv2a_gpu_frames_without_3d(void)
+{
+    return (int)frames_without_3d;
+}
+
 static void readback_failed(const char *kind, HRESULT result, const char *operation = "map")
 {
     std::fprintf(stderr, "[GPU-D3D11] readback failed: %s %s 0x%08X; device 0x%08X\n",

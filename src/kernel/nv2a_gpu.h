@@ -45,6 +45,8 @@ void nv2a_gpu_set_wide_factor(float factor);
  * 3D draws then keep their projection and are only stretched; 2D draws are
  * still squeezed back to 4:3. Off by default. Any thread. */
 void nv2a_gpu_set_wide_title_fov(int on);
+/* Consecutive flips with no 3D draw on the screen (2D-only screens). */
+int nv2a_gpu_frames_without_3d(void);
 void nv2a_gpu_set_projection_registers(const int *registers, int count);
 /* Draw `bgra` (width x height, B8G8R8A8) wherever the title binds a texture
  * whose bytes in guest memory hash (FNV-1a 64) to `hash`. Before the title
