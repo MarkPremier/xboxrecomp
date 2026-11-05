@@ -489,6 +489,16 @@ int xbox_KbmMenuWheel(void)
     return (int)InterlockedExchange(&kbm_menu_wheel, 0);
 }
 
+/* Every notch, menu pointer or not, for a title that turns each one into a
+ * press of its own (the WheelUp/WheelDown latch merges a quick spin into one
+ * hold): notches since the last call, up positive. */
+static volatile LONG kbm_wheel_notches;
+
+int xbox_KbmWheelNotches(void)
+{
+    return (int)InterlockedExchange(&kbm_wheel_notches, 0);
+}
+
 static void kbm_parse_map(const char *variable, struct kbm_bind *binds, int *listed)
 {
     char *spec = getenv(variable);
@@ -833,6 +843,7 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     /* Wheel notches latch WheelUp/WheelDown; with WHEEL_MOVE they also push
      * the left stick forward/back for the same beat. */
     wheel = xbox_FramebufferMouseWheel();
+    if (wheel) InterlockedExchangeAdd(&kbm_wheel_notches, wheel);
     if (xbox_FramebufferMenuPointer()) {
         InterlockedExchangeAdd(&kbm_menu_wheel, wheel);
         wheel_dir = 0;
