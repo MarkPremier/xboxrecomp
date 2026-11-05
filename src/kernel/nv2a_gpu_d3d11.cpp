@@ -2337,6 +2337,7 @@ struct ZpassSegment {
     double pixels_per_sample = 1.0;
     double pixels = 0;
     bool ready = false;
+    bool view_space = false;   /* counted a 3D draw: a model's bounding-box test */
     ~ZpassSegment() {
         if (query && zpass_pool.size() < 64) zpass_pool.push_back(std::move(query));
     }
@@ -2407,12 +2408,12 @@ extern "C" void nv2a_gpu_zpass_reset(void)
     zpass_total = 0;
 }
 
-static void zpass_begin_draw(double pixels_per_sample)
+static void zpass_begin_draw(double pixels_per_sample, bool view_space)
 {
     if (!zpass_enabled) return;
     if (zpass_active && zpass_active->pixels_per_sample != pixels_per_sample)
         zpass_end_segment();
-    if (zpass_active) return;
+    if (zpass_active) { zpass_active->view_space |= view_space; return; }
     zpass_active = std::make_shared<ZpassSegment>();
     if (zpass_pool.empty()) {
         D3D11_QUERY_DESC description = {D3D11_QUERY_OCCLUSION, 0};
@@ -2423,6 +2424,7 @@ static void zpass_begin_draw(double pixels_per_sample)
         zpass_pool.pop_back();
     }
     zpass_active->pixels_per_sample = pixels_per_sample;
+    zpass_active->view_space = view_space;
     context->Begin(zpass_active->query.Get());
 }
 
@@ -2489,6 +2491,15 @@ extern "C" int nv2a_gpu_zpass_poll(void)
             double wait = zpass_wait_ms();
             if (last == zpass_last.end() || wait <= 0 || zpass_now_ms() - report.queued_ms < wait) return 1;
             uint32_t pixels = last->second;
+            /* A model's test answered from its slot's last count can inherit
+             * "hidden" from whatever used the slot before, and the title then
+             * skips drawing it (a werebull and a biomech stayed invisible).
+             * Drawing an occluded model costs a little GPU time; hiding one
+             * the console would show is wrong, so a late 3D test is never 0.
+             * Lens flares (2D tests) keep the last count: they must not shine
+             * through walls. */
+            for (auto &segment : report.segments)
+                if (segment->view_space && !pixels) pixels = 1;
             auto complete = report.complete;
             void *opaque = report.context;
             zpass_late.push_back(std::move(report));
@@ -5355,7 +5366,8 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     zpass_begin_draw(((double)guest_width * guest_height) /
                      ((double)target_width * target_height *
                       ((surface && target == surface->ms_target.Get()) ||
-                       (depth && depth_target == depth->ms_view.Get()) ? msaa_samples : 1)));
+                       (depth && depth_target == depth->ms_view.Get()) ? msaa_samples : 1)),
+                     projection >= 0);
     if (state->indices) context->DrawIndexed(state->index_count, 0, 0);
     else context->Draw(count, 0);
     end_gpu_sample(sample);
