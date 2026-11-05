@@ -101,3 +101,53 @@ def test_jump_to_continuation_becomes_native_continue():
 def test_jump_to_continuation_pattern_is_the_vc7_epilogue():
     # mov esp,[ebx-4]; mov ebp,[ebp-4]; jmp eax -- 0x002B4648 in Serious Sam.
     assert cxx_eh.JUMP_TO_CONTINUATION == bytes.fromhex("8b63fc8b6dfcffe0")
+
+
+# Serious Sam sub_00358B27: `mov eax, 0x2E831A; call __EH_prolog (0x2C2D18)`.
+# The helper links the record, so the function has no `mov fs:[0], esp` of
+# its own; its catch resumes at 0x00358CB0.
+PROLOG, PROLOG_THUNK, PROLOG_CONT = 0x002C2D18, 0x002E831A, 0x00358CB0
+
+
+def _mov_eax(addr, value):
+    insn = Instruction(addr, 5, "mov", f"eax, 0x{value:x}", "b8" + "00" * 4)
+    insn.operands = [Operand(type="reg", reg="eax"), Operand(type="imm", imm=value)]
+    return insn
+
+
+def _call(addr, target):
+    insn = Instruction(addr, 5, "call", f"0x{target:x}", "e8" + "00" * 4)
+    insn.operands = [Operand(type="imm", imm=target)]
+    return insn
+
+
+def test_eh_prolog_call_is_an_anchor_site():
+    insns = [_mov_eax(0x00358B27, PROLOG_THUNK), _call(0x00358B2C, PROLOG)]
+    frames = {PROLOG_THUNK: frozenset({PROLOG_CONT})}
+    assert cxx_eh.function_sites(insns, frames, 0x00358B27, 0x00358CD5,
+                                 prologs={PROLOG}) == {0x00358B2C: {PROLOG_CONT}}
+    # Without knowing the helper, or with a thunk that has no try blocks, no site.
+    assert cxx_eh.function_sites(insns, frames, 0x00358B27, 0x00358CD5) == {}
+    assert cxx_eh.function_sites(insns, {}, 0x00358B27, 0x00358CD5, prologs={PROLOG}) == {}
+    # Something between the mov and the call breaks the pattern.
+    gap = [_mov_eax(0x00358B27, PROLOG_THUNK), _push_imm(0x00358B2C, 1), _call(0x00358B31, PROLOG)]
+    assert cxx_eh.function_sites(gap, frames, 0x00358B27, 0x00358CD5, prologs={PROLOG}) == {}
+
+
+def test_eh_prolog_pattern_finds_the_helper():
+    image = b"\xcc" * 16 + cxx_eh.EH_PROLOG + b"\xcc" * 16
+    assert image.find(cxx_eh.EH_PROLOG) == 16
+    assert len(cxx_eh.EH_PROLOG) == 31     # 0x2C2D18..0x2C2D36 inclusive
+
+
+def test_eh_prolog_anchor_is_armed_after_the_call_at_the_record():
+    lifter = Lifter()
+    lifter.func_start, lifter.func_end = 0x00358B27, 0x00358CD5
+    lifter.eh_anchor_sites = {0x00358B2C: {PROLOG_CONT}}
+    lines = lifter.lift_instruction(_call(0x00358B2C, PROLOG))
+    text = "\n".join(lines)
+    # The call (and, in a full translation, its ebp read-back) comes first.
+    call = text.index("2C2D18")
+    anchor = text.index("setjmp(*recomp_eh_anchor(ebp - 0xCu))")
+    assert call < anchor
+    assert f"if (g_eh_target == 0x{PROLOG_CONT:08X}u) goto loc_{PROLOG_CONT:08X};" in text

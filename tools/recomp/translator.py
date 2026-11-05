@@ -512,6 +512,7 @@ class FunctionTranslator:
         once per run (see cxx_eh.py)."""
         if self._cxx_eh is None:
             self._cxx_eh = cxx_eh.scan(self.xbe_data)
+            self._eh_prologs = cxx_eh.eh_prologs(self.xbe_data)
         return self._cxx_eh
 
     def _eh_leaders(self, instructions, start, end):
@@ -520,7 +521,7 @@ class FunctionTranslator:
         them -- the catch funclet's return value does."""
         frames, continue_sites = self._cxx_eh_tables()
         sites = cxx_eh.function_sites(instructions, frames, start, end,
-                                      entries=self.func_db)
+                                      entries=self.func_db, prologs=self._eh_prologs)
         self.lifter.eh_anchor_sites = sites
         self.lifter.eh_continue_sites = continue_sites
         return {c for conts in sites.values() for c in conts

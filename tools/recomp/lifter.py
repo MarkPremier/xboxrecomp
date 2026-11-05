@@ -20,6 +20,7 @@ import struct
 
 from .disasm import Instruction, Operand, LOOP_JUMPS
 from .config import is_code_address, is_data_address, va_to_file_offset
+from .cxx_eh import EH_PROLOG_RECORD
 
 # Function export names of the Windows libraries the host exe links
 # (kernel32/user32/gdi32/advapi32/winmm/ws2_32/ole32/dbghelp/...). A guest
@@ -1468,9 +1469,13 @@ class Lifter:
         # ── C++ exception handling (see cxx_eh.py) ──
         # A try-block registration is live from here: arm the native anchor a
         # catch continuation longjmps back to, and branch to the continuation.
-        if insn.address in self.eh_anchor_sites and m == "mov":
-            lines = self._lift_mov(insn, ops)
-            lines.append("if (setjmp(*recomp_eh_anchor(esp))) {"
+        if insn.address in self.eh_anchor_sites and m in ("mov", "call"):
+            if m == "mov":
+                lines, record = self._lift_mov(insn, ops), "esp"
+            else:   # __EH_prolog linked the record and set ebp above it
+                lines = self._lift_call(insn, ops)
+                record = f"ebp - 0x{-EH_PROLOG_RECORD:X}u"
+            lines.append(f"if (setjmp(*recomp_eh_anchor({record}))) {{"
                          " ebp = g_ebp; /* C++ catch continuation */")
             for cont in sorted(self.eh_anchor_sites[insn.address]):
                 if self.func_start <= cont < self.func_end:

@@ -20,6 +20,15 @@ jumps there:
     mov ebp, [ebp-4]                8B 6D FC
     jmp eax                         FF E0
 
+Some functions link their registration through MSVC's __EH_prolog helper
+instead, entered with the thunk in eax:
+
+    mov eax, offset handler_thunk    B8 <thunk>
+    call __EH_prolog
+
+The helper pushes the record, links it with `mov fs:[0], esp` and returns
+with ebp three words above it, so the record is at ebp-0Ch in the caller.
+
 A recompiled function cannot be entered in the middle, and the frames between
 the throw and the catch are native C frames that must unwind. The lifter
 therefore arms a native anchor where such a function links its registration
@@ -41,6 +50,12 @@ from . import config
 
 _THUNK = re.compile(rb"\xB8(....)\xE9(....)", re.S)
 JUMP_TO_CONTINUATION = bytes.fromhex("8b63fc8b6dfcffe0")
+# push -1 / push eax / mov eax, fs:[0] / push eax / mov eax, [esp+0Ch] /
+# mov fs:[0], esp / mov [esp+0Ch], ebp / lea ebp, [esp+0Ch] / push eax / ret
+EH_PROLOG = bytes.fromhex("6aff5064a100000000508b44240c64892500000000"
+                          "896c240c8d6c240c50c3")
+# Where __EH_prolog leaves the registration record, relative to ebp.
+EH_PROLOG_RECORD = -0x0C
 _FUNCLET_SCAN_BYTES = 0x400
 
 
@@ -112,15 +127,45 @@ def scan(xbe_data):
     return frames, continue_sites
 
 
-def function_sites(instructions, frames, start, end, entries=()):
+def eh_prologs(xbe_data):
+    """VAs of every copy of MSVC's __EH_prolog in code sections."""
+    found = set()
+    for name, va, size, raw in config.SECTIONS:
+        if not config.is_code_address(va):
+            continue
+        seg = xbe_data[raw:raw + size]
+        p = seg.find(EH_PROLOG)
+        while p >= 0:
+            found.add(va + p)
+            p = seg.find(EH_PROLOG, p + 1)
+    return frozenset(found)
+
+
+def function_sites(instructions, frames, start, end, entries=(), prologs=()):
     """Map each `mov fs:[0], esp` that links a try-block registration to the
     continuations its function can resume at: those inside [start, end), and
     those that are themselves function entries in `entries`. The analysis
     splits a function at a continuation often enough -- the funclet's
     `mov eax, offset $continuation` reads as a code pointer -- and resuming
-    there is then a tail call, as falling into the next piece is."""
-    sites, pending = {}, None
+    there is then a tail call, as falling into the next piece is.
+
+    A `call` to one of `prologs` (__EH_prolog) with a try-block thunk in eax
+    is a site too: the anchor is armed after the call, at the record the
+    helper linked (EH_PROLOG_RECORD)."""
+    sites, pending, prolog_thunk = {}, None, None
     for insn in instructions:
+        if insn.mnemonic == "mov" and insn.op_str.replace(" ", "").startswith("eax,0x"):
+            value = int(insn.op_str.replace(" ", "")[4:], 16)
+            prolog_thunk = value if value in frames else None
+            continue
+        if insn.mnemonic == "call" and prolog_thunk is not None \
+                and insn.op_str.startswith("0x") and int(insn.op_str, 16) in prologs:
+            conts = {c for c in frames[prolog_thunk] if start <= c < end or c in entries}
+            if conts:
+                sites[insn.address] = conts
+            prolog_thunk = None
+            continue
+        prolog_thunk = None
         if insn.mnemonic == "push" and len(insn.operands) == 1 \
                 and insn.operands[0].type == "imm":
             if insn.operands[0].imm in frames:
