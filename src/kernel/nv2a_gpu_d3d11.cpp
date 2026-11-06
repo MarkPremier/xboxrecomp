@@ -2366,12 +2366,15 @@ static const double zpass_timeout_pixels = 640.0 * 480.0;
  * wait was a stutter in torch-lit rooms. A keyed report still unfinished
  * after this is answered with its key's last real count (one more frame of
  * latency) and moves to zpass_late, whose counts keep that answer current.
- * RECOMP_ZPASS_WAIT_MS sets it; 0 always waits. */
+ * Every fence release drains the reports, several times a frame, so the
+ * wait is kept short: at 2 ms a frame-limited host GPU (idle, clocked
+ * down) used the whole wait at each drain and Tomb of Ramses fell from
+ * 120 to 64 fps. RECOMP_ZPASS_WAIT_MS sets it; 0 always waits. */
 static double zpass_wait_ms()
 {
     static const double wait = [] {
         const char *value = std::getenv("RECOMP_ZPASS_WAIT_MS");
-        return value && *value ? std::atof(value) : 2.0;
+        return value && *value ? std::atof(value) : 0.25;
     }();
     return wait;
 }
@@ -2383,6 +2386,7 @@ static double zpass_now_ms()
     QueryPerformanceCounter(&now);
     return (double)now.QuadPart * 1000.0 / (double)frequency.QuadPart;
 }
+extern "C" FILE *g_nv2a_capture_out;
 static std::deque<ZpassReport> zpass_reports;
 static std::deque<ZpassReport> zpass_late;
 static std::unordered_map<uintptr_t, uint32_t> zpass_last;
@@ -2500,6 +2504,9 @@ extern "C" int nv2a_gpu_zpass_poll(void)
              * through walls. */
             for (auto &segment : report.segments)
                 if (segment->view_space && !pixels) pixels = 1;
+            if (g_nv2a_capture_out)
+                std::fprintf(g_nv2a_capture_out, "[ZPASS] late: slot's last count %u, answering %u\n",
+                             last->second, pixels);
             auto complete = report.complete;
             void *opaque = report.context;
             zpass_late.push_back(std::move(report));

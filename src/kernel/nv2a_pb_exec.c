@@ -686,11 +686,18 @@ typedef struct ZpassCompletion {
     uint64_t timestamp, cpu_count;
 } ZpassCompletion;
 
+/* The F11 capture's file while it is being written (see raster_batch):
+ * ZPASS clears, reports and their answers go to it in stream order. */
+FILE *g_nv2a_capture_out;
+
 static void complete_zpass(void *opaque, uint32_t gpu_count)
 {
     ZpassCompletion *report = (ZpassCompletion *)opaque;
     uint64_t count = report->cpu_count + gpu_count;
     uint32_t result = count > UINT32_MAX ? UINT32_MAX : (uint32_t)count;
+    if (g_nv2a_capture_out)
+        fprintf(g_nv2a_capture_out, "[ZPASS] report %llu answered %u (cpu %llu)\n",
+                (unsigned long long)report->timestamp, result, (unsigned long long)report->cpu_count);
     uint32_t done = 0;
     memcpy(report->destination + 8, &result, 4);
 #ifdef _WIN32
@@ -744,6 +751,9 @@ static void report_zpass(uint32_t offset)
     completion->destination = destination;
     completion->timestamp = ++s_gpu.report_timestamp;
     completion->cpu_count = s_gpu.zpass_cpu_count;
+    if (g_nv2a_capture_out)
+        fprintf(g_nv2a_capture_out, "[ZPASS] report %llu queued, slot %08X\n",
+                (unsigned long long)completion->timestamp, (uint32_t)(address + offset));
 #ifdef _WIN32
     nv2a_gpu_zpass_queue_report_keyed(completion, complete_zpass, (uintptr_t)destination);
 #else
@@ -3705,6 +3715,7 @@ static void raster_batch(void)
                 if (info_out != stderr) {
                     fclose(info_out);
                     info_out = stderr;
+                    g_nv2a_capture_out = NULL;
                     fprintf(stderr, "[BINFO] capture %u written\n", capture_seq);
                 }
             }
@@ -3719,6 +3730,7 @@ static void raster_batch(void)
                 FILE *f = fopen(path, "w");
                 if (f) {
                     info_out = f;
+                    g_nv2a_capture_out = f;
                     info_lo = 1; info_hi = 0x7FFFFFFF; info_state = 1;
                     fprintf(stderr, "[BINFO] capture %u -> %s\n", capture_seq, path);
                 }
@@ -5000,6 +5012,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     switch (method) {
     case NV097_CLEAR_REPORT_VALUE:
         s_gpu.zpass_cpu_count = 0;
+        if (g_nv2a_capture_out) fprintf(g_nv2a_capture_out, "[ZPASS] clear\n");
 #ifdef _WIN32
         nv2a_gpu_zpass_reset();
 #endif
