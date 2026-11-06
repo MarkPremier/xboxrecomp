@@ -1509,14 +1509,17 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                           0, 0, (int)s_fb_width, (int)s_fb_height,
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
         }
-        /* Pump often enough to sample WM_INPUT/WM_KEYDOWN smoothly, but not
-         * so tightly that the window thread monopolises a core. Rendering is
+        /* Wait for the next message rather than a fixed sleep: Sleep(4) lasts
+         * the system tick (15.6 ms unless the process raises the timer
+         * resolution), so mouse input arrived in bursts and each game frame
+         * took a varying number of them -- uneven mouse look. Woken by the
+         * input itself, the deltas grow as the mouse moves. Rendering is
          * gated on a new frame, above. */
         fb_inject_poll();
         if (s_rec_state < 0)
             rec_init();
         fb_replay_poll();
-        Sleep(4);
+        MsgWaitForMultipleObjectsEx(0, NULL, 4, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
     }
 
     ReleaseDC(hwnd, hdc);
