@@ -1,7 +1,7 @@
 #include "nv2a_gpu.h"
 #include <d3d11.h>
 #include <d3d11_1.h>
-#include <dxgi1_5.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <cstdio>
 #include <cstdlib>
@@ -5077,19 +5077,59 @@ extern "C" int nv2a_gpu_compile(void)
     return 1;
 }
 
+/* Laptops with two GPUs list the integrated one first, and that is the one a
+ * device made with no adapter gets. NVIDIA's and AMD's switchable-graphics
+ * drivers read these exports from the executable (a static library's
+ * dllexport still reaches the program's export table) and start it on the
+ * discrete GPU; DXGI is asked for the high-performance adapter as well. */
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+
+static ComPtr<IDXGIAdapter1> high_performance_adapter()
+{
+    ComPtr<IDXGIFactory1> factory;
+    ComPtr<IDXGIFactory6> factory6;
+    ComPtr<IDXGIAdapter1> adapter;
+    DXGI_ADAPTER_DESC1 description = {};
+    /* IDXGIFactory6 needs Windows 10 1803; before it, the default adapter. */
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || FAILED(factory.As(&factory6)) ||
+            FAILED(factory6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                        IID_PPV_ARGS(&adapter))) ||
+            FAILED(adapter->GetDesc1(&description)) || (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
+        return nullptr;
+    return adapter;
+}
+
 extern "C" int nv2a_gpu_available(void)
 {
     static bool attempted;
     if (!attempted) {
         attempted = true;
-        D3D_FEATURE_LEVEL level;
-        HRESULT result = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
-                                         D3D11_SDK_VERSION, &device, &level, &context);
+        D3D_FEATURE_LEVEL level = {};
+        ComPtr<IDXGIAdapter1> adapter = high_performance_adapter();
+        HRESULT result = E_FAIL;
+        if (adapter)
+            result = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
+                                       D3D11_SDK_VERSION, &device, &level, &context);
+        if (FAILED(result))
+            result = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                                       D3D11_SDK_VERSION, &device, &level, &context);
         if (FAILED(result)) {
             std::fprintf(stderr, "[GPU-D3D11] device unavailable: 0x%08X\n", (unsigned)result);
             return 0;
         }
         std::fprintf(stderr, "[GPU-D3D11] device ready: feature level 0x%X, hardware\n", (unsigned)level);
+        {
+            ComPtr<IDXGIDevice> dxgi_device;
+            ComPtr<IDXGIAdapter> used;
+            DXGI_ADAPTER_DESC description = {};
+            if (SUCCEEDED(device.As(&dxgi_device)) && SUCCEEDED(dxgi_device->GetAdapter(&used)) &&
+                    SUCCEEDED(used->GetDesc(&description)))
+                std::fprintf(stderr, "[GPU-D3D11] adapter: %ls, %u MB video memory\n", description.Description,
+                             (unsigned)(description.DedicatedVideoMemory >> 20));
+        }
         if (SUCCEEDED(context.As(&context1))) {
             D3D11_FEATURE_DATA_D3D11_OPTIONS options = {};
             if (FAILED(device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof options)) ||

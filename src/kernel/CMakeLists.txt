@@ -43,7 +43,7 @@ target_include_directories(xbox_kernel PUBLIC
 if(WIN32)
     target_sources(xbox_kernel PRIVATE nv2a_gpu_d3d11.cpp)
     target_compile_features(xbox_kernel PRIVATE cxx_std_17)
-    target_link_libraries(xbox_kernel PRIVATE d3d11 d3dcompiler)
+    target_link_libraries(xbox_kernel PRIVATE d3d11 dxgi d3dcompiler)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
