@@ -3697,9 +3697,13 @@ static void write_depth_pgm(DepthSurface &surface, const char *path, bool wide)
 extern "C" volatile LONG g_nv2a_capture_active;
 volatile LONG g_nv2a_capture_active;
 
+/* Whether the shadow map get_texture last returned is exact (float depth). */
+static bool shadow_view_exact;
+
 static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, const Surface &destination)
 {
     GpuTimer texture_timer(gpu_timing.texture);
+    shadow_view_exact = false;
     gpu_timing.texture_calls++;
     gpu_timing.surface_count = surfaces.size();
     gpu_timing.depth_surface_count = depth_surfaces.size();
@@ -3739,6 +3743,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                 write_depth_pgm(*shadow, path, true);
             }
         }
+        shadow_view_exact = shadow->exact;
         return shadow->sample_view.Get();
     }
     static const bool mirror_aliases = []() {
@@ -4959,8 +4964,9 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             (binding.control0_valid && (binding.control0 & 4u) ? 16u : 0u) |
             (binding.address_w == 5 ? 32u : 0u) |
             /* shadow compare: 64, 128 for a 24-bit depth, function in 8..10,
-             * 2048 for a linear magnification filter (four-tap PCF) */
-            (binding.shadow ? 64u | ((shadow_func & 7u) << 8) |
+             * 2048 for a linear magnification filter (four-tap PCF), 4096
+             * for an exact (float) map */
+            (binding.shadow ? 64u | ((shadow_func & 7u) << 8) | (shadow_view_exact ? 4096u : 0u) |
                 (binding.format == 0x2A || binding.format == 0x2B || binding.format == 0x2E ||
                  binding.format == 0x2F ? 128u : 0u) |
                 (((binding.filter >> 24) & 15u) == 2u ? 2048u : 0u) : 0u));

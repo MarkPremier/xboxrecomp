@@ -504,6 +504,12 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
    float maxDepth=(textureFlags&128)?16777215.0:65535.0;
    float reference=clamp(uvw.z,0,maxDepth);   /* stored OP reference, as xemu does */
    uint func=(textureFlags>>8)&7;
+   /* An exact (float) map resolves depth to float noise: where a body lies
+    * on the ground the two meet within it, and the shadow broke up in
+    * blotches. A twentieth of a 16-bit step counts as touching -- in shadow
+    * -- for GREATER/GEQUAL (lit while the stored depth is beyond the
+    * reference; Turok's). */
+   if((textureFlags&4096) && (func==4 || func==6))reference+=0.05;
    /* A linear filter compares the four texels of the bilinear footprint and
     * blends the results (percentage-closer filtering), as the NV2A does;
     * point sampling compares one texel. */
