@@ -384,7 +384,8 @@ PixelOutput finish_pixel(float4 color,Pixel input,bool frontFacing) {
 #if defined(NV_DEPTH_ENABLED) && !NV_DEPTH_ENABLED
  output.depth=0;
 #else
- output.depth=floor(clamp(depth,0,viewport.z))/viewport.z;
+ /* fogControl.w: an exact (float) shadow map keeps the depth unrounded */
+ output.depth=(fogControl.w!=0?clamp(depth,0,viewport.z):floor(clamp(depth,0,viewport.z)))/viewport.z;
 #endif
  return output;
 }

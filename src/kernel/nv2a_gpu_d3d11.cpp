@@ -483,6 +483,7 @@ struct DepthSurface {
     ComPtr<ID3D11DepthStencilView> ms_view;
     ComPtr<ID3D11ShaderResourceView> ms_sample_view;
     bool ms_newer, ms_stale;
+    bool exact;   /* a shadow map kept as float depth (see exact_shadow_depth) */
 };
 
 /* RECOMP_RENDER_SCALE=<n> (1 to 8, may be fractional): colour targets, and
@@ -621,12 +622,53 @@ static bool is_scaled(const Target &target)
     return target.texture_width != target.width || target.texture_height != target.height;
 }
 
+/* An exact shadow map's texture is float depth, so like a scaled one it
+ * reaches guest RAM (16-bit) through its resolve and upload. */
+static bool is_scaled(const DepthSurface &target)
+{
+    return target.exact || target.texture_width != target.width || target.texture_height != target.height;
+}
+
 /* Depth targets seen in a depth-only draw: those stay at the title's size. */
 static std::set<const uint8_t *> depth_only_targets;
 
 static bool depth_scaled(const uint8_t *memory)
 {
     return !depth_only_targets.count(memory);
+}
+
+/* Exact shadow maps. A 16-bit shadow map stores whole depth steps, and with
+ * Turok Evolution's light camera (near plane 0.1, about 200 units out) one
+ * step is several units deep -- deeper than a creature. A wall up to a step
+ * in front of a body (between it and the light) then compares as behind it
+ * and takes its shadow: the streaks up walls and buildings near bodies. So a
+ * depth target once read as a shadow map (and only ever drawn without
+ * colour) is drawn as float depth, unrounded and without the title's polygon
+ * offset (a tenth of a step, there for the rounding; exact, it would lift a
+ * body lying flat off its own shadow). Guest RAM still gets 16-bit depth.
+ * nv2a_gpu_set_exact_shadows switches it (a map changes kind at its next
+ * draw, get_depth); RECOMP_SHADOW_EXACT=0/1 overrides that. Off is the 16-bit
+ * map, as the Xbox draws it. */
+static std::set<const uint8_t *> shadow_map_targets;
+static std::atomic<int> exact_shadows_setting{1};
+
+extern "C" void nv2a_gpu_set_exact_shadows(int on)
+{
+    exact_shadows_setting = on ? 1 : 0;
+}
+
+static bool exact_shadow_depth()
+{
+    static const int forced = []() {
+        const char *value = std::getenv("RECOMP_SHADOW_EXACT");
+        return value ? (std::strcmp(value, "0") != 0 ? 1 : 0) : -1;
+    }();
+    return forced >= 0 ? forced != 0 : exact_shadows_setting.load() != 0;
+}
+
+static bool wants_exact_depth(const uint8_t *memory, uint32_t format)
+{
+    return format == 1 && exact_shadow_depth() && !depth_scaled(memory) && shadow_map_targets.count(memory);
 }
 
 /* Shadow maps (depth-only targets) drawn 1, 2 or 4 times the title's size on
@@ -1894,17 +1936,22 @@ static bool create_depth_textures(DepthSurface &surface)
     D3D11_TEXTURE2D_DESC description = {};
     description.Width = surface.texture_width; description.Height = surface.texture_height;
     description.MipLevels = description.ArraySize = 1; description.SampleDesc.Count = 1;
-    description.Format = wide ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_R16_TYPELESS;
+    description.Format = wide ? DXGI_FORMAT_R24G8_TYPELESS : surface.exact ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_R16_TYPELESS;
     description.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
     D3D11_DEPTH_STENCIL_VIEW_DESC view = {};
-    view.Format = wide ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D16_UNORM; view.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    view.Format = wide ? DXGI_FORMAT_D24_UNORM_S8_UINT : surface.exact ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_D16_UNORM;
+    view.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
     D3D11_SHADER_RESOURCE_VIEW_DESC sample = {};
-    sample.Format = wide ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : DXGI_FORMAT_R16_UNORM;
+    sample.Format = wide ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : surface.exact ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R16_UNORM;
     sample.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sample.Texture2D.MipLevels = 1;
     if (!target_operation_succeeded("depth", "create texture", device->CreateTexture2D(&description, nullptr, &surface.texture)) ||
         !target_operation_succeeded("depth", "create view", device->CreateDepthStencilView(surface.texture.Get(), &view, &surface.view)) ||
         !target_operation_succeeded("depth", "create sample view", device->CreateShaderResourceView(surface.texture.Get(), &sample, &surface.sample_view))) return false;
     if (!is_scaled(surface)) return true;
+    /* The guest-size resolve and upload hold what guest RAM does. */
+    description.Format = wide ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_R16_TYPELESS;
+    view.Format = wide ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_D16_UNORM;
+    sample.Format = wide ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : DXGI_FORMAT_R16_UNORM;
     description.Width = surface.width; description.Height = surface.height;
     description.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     if (!target_operation_succeeded("depth", "create resolve", device->CreateTexture2D(&description, nullptr, &surface.resolve)) ||
@@ -2076,12 +2123,27 @@ static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, T
     }
     UINT texture_width, texture_height;
     depth_texture_size(state.depth, extent.width, extent.height, texture_width, texture_height);
+    bool exact = wants_exact_depth(state.depth, state.depth_format);
     for (auto &surface : depth_surfaces)
         if (surface.memory == state.depth && surface.width == extent.width && surface.height == extent.height &&
             surface.pitch == state.depth_pitch && surface.format == state.depth_format &&
             surface.texture_width == texture_width && surface.texture_height == texture_height) {
             surface.last_used = ++surface_use_serial;
             surface.used_frame = surface_frame_serial;
+            if (surface.exact != exact) {
+                /* Now known as a shadow map (or no longer): its texture
+                 * changes kind, what it holds carries over. */
+                resolve_depth(surface);
+                ComPtr<ID3D11ShaderResourceView> old = surface.sample_view;
+                ComPtr<ID3D11Texture2D> old_texture = surface.texture;
+                surface.exact = exact;
+                if (!create_depth_textures(surface)) return nullptr;
+                context->ClearDepthStencilView(surface.view.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+                if (preserve) scale_blit(old.Get(), nullptr, surface.view.Get(), surface.texture_width, surface.texture_height);
+                surface.clear_value_valid = false;
+                std::fprintf(stderr, "[GPU-D3D11] shadow map %p: %s depth\n", (void *)surface.memory,
+                             exact ? "exact (float)" : "16-bit");
+            }
             if (!preserve) { surface.needs_refresh = false; return &surface; }
             return refresh_depth(surface) ? &surface : nullptr;
         }
@@ -2090,6 +2152,7 @@ static DepthSurface *get_depth(const Nv2aGpuDraw &state, bool preserve = true, T
     surface.texture_width = texture_width; surface.texture_height = texture_height;
     surface.last_used = ++surface_use_serial;
     surface.used_frame = surface_frame_serial;
+    surface.exact = exact;
     if (!create_depth_textures(surface) || !create_ms_depth(surface)) return nullptr;
     D3D11_TEXTURE2D_DESC description = {};
     description.Width = extent.width; description.Height = extent.height;
@@ -2884,6 +2947,8 @@ static void flip_bookkeeping()
 /* Returns the guest VA the caller should display this flip. In the default
  * (synchronous) path that is the buffer just published; with RECOMP_ASYNC_FLIP
  * it is the previous frame's buffer, resolved without a GPU wait. */
+static void write_depth_pgm(DepthSurface &surface, const char *path, bool wide);
+
 extern "C" uint32_t nv2a_gpu_flip(const void *presented, size_t bytes, uint32_t va, uint32_t pitch)
 {
     { /* DIAG RECOMP_DEPTH_DUMP=<seconds>: save each 16-bit depth surface once, as a PGM */
@@ -2894,25 +2959,8 @@ extern "C" uint32_t nv2a_gpu_flip(const void *presented, size_t bytes, uint32_t 
             int n = 0;
             for (auto &surface : depth_surfaces) {
                 if (surface.format != 1) continue;
-                context->CopyResource(surface.staging.Get(), publish_source(surface));
-                D3D11_MAPPED_SUBRESOURCE mapped = {};
-                if (FAILED(context->Map(surface.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) continue;
                 char path[64]; std::snprintf(path, sizeof path, "depth_%d_%ux%u.pgm", n++, surface.width, surface.height);
-                FILE *f = std::fopen(path, "wb");
-                unsigned lo = 65535, hi = 0;
-                if (f) {
-                    std::fprintf(f, "P5\n%u %u\n255\n", surface.width, surface.height);
-                    for (uint32_t y = 0; y < surface.height; y++)
-                        for (uint32_t x = 0; x < surface.width; x++) {
-                            uint16_t v = ((const uint16_t *)((const uint8_t *)mapped.pData + (size_t)y * mapped.RowPitch))[x];
-                            if (v < lo) lo = v; if (v > hi) hi = v;
-                            std::fputc(v >> 8, f);
-                        }
-                    std::fclose(f);
-                }
-                context->Unmap(surface.staging.Get(), 0);
-                std::fprintf(stderr, "[DEPTHDUMP] %s memory %p dirty %u range %u..%u\n", path,
-                             (void *)surface.memory, (unsigned)surface.dirty, lo, hi);
+                write_depth_pgm(surface, path, false);
             }
         }
     }
@@ -3619,6 +3667,36 @@ static void dump_texture(const Nv2aGpuTexture &binding, uint64_t hash)
     }
 }
 
+/* DIAG: a 16-bit depth surface as a PGM (8-bit, or the full 16 bits when
+ * `wide`), with its range logged. */
+static void write_depth_pgm(DepthSurface &surface, const char *path, bool wide)
+{
+    context->CopyResource(surface.staging.Get(), publish_source(surface));
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(context->Map(surface.staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return;
+    FILE *f = std::fopen(path, "wb");
+    unsigned lo = 65535, hi = 0;
+    if (f) {
+        std::fprintf(f, "P5\n%u %u\n%u\n", surface.width, surface.height, wide ? 65535u : 255u);
+        for (uint32_t y = 0; y < surface.height; y++)
+            for (uint32_t x = 0; x < surface.width; x++) {
+                uint16_t v = ((const uint16_t *)((const uint8_t *)mapped.pData + (size_t)y * mapped.RowPitch))[x];
+                if (v < lo) lo = v; if (v > hi) hi = v;
+                std::fputc(v >> 8, f);
+                if (wide) std::fputc(v & 255, f);
+            }
+        std::fclose(f);
+    }
+    context->Unmap(surface.staging.Get(), 0);
+    std::fprintf(stderr, "[DEPTHDUMP] %s memory %p dirty %u range %u..%u\n", path,
+                 (void *)surface.memory, (unsigned)surface.dirty, lo, hi);
+}
+
+/* Set by the F11 capture to its number while it records a frame: each shadow
+ * map that frame reads is saved once, as capture_<n>_shadow_<i>_<w>x<h>.pgm. */
+extern "C" volatile LONG g_nv2a_capture_active;
+volatile LONG g_nv2a_capture_active;
+
 static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, const Surface &destination)
 {
     GpuTimer texture_timer(gpu_timing.texture);
@@ -3640,6 +3718,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                 if (!shadow || surface.last_used > shadow->last_used) shadow = &surface;
             }
         if (!shadow) return nullptr;
+        shadow_map_targets.insert(shadow->memory);   /* drawn exact from the next pass (wants_exact_depth) */
         static std::set<const uint8_t *> reported;
         if (candidates > 1 && reported.insert(shadow->memory).second)
             std::fprintf(stderr, "[GPU-D3D11] shadow map %p: %u textures, reading the %ux%u one drawn last\n",
@@ -3648,6 +3727,18 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         shadow->last_used = ++surface_use_serial;
         shadow->used_frame = surface_frame_serial;
         resolve_depth(*shadow);
+        if (LONG capture = g_nv2a_capture_active) {
+            static LONG dumped_capture; static std::set<const uint8_t *> dumped;
+            if (dumped_capture != capture) { dumped_capture = capture; dumped.clear(); }
+            if (dumped.insert(shadow->memory).second) {
+                char path[MAX_PATH + 64];
+                DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+                while (length && path[length - 1] != '\\' && path[length - 1] != '/') length--;
+                std::snprintf(path + length, sizeof path - length, "capture_%ld_shadow_%u_%ux%u.pgm", capture,
+                              (unsigned)dumped.size(), shadow->width, shadow->height);
+                write_depth_pgm(*shadow, path, true);
+            }
+        }
         return shadow->sample_view.Get();
     }
     static const bool mirror_aliases = []() {
@@ -4708,10 +4799,12 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         }
         constants.depth_range[3] = scale;
     }
-    if (front_offset || back_offset) {
+    bool exact_depth = depth && depth->exact;   /* an exact shadow map: unrounded, no offset */
+    if ((front_offset || back_offset) && !exact_depth) {
         constants.depth_offset[0] = state->polygon_offset_scale; constants.depth_offset[1] = state->polygon_offset_bias;
         constants.depth_offset[2] = front_offset ? 1.0f : 0.0f; constants.depth_offset[3] = back_offset ? 1.0f : 0.0f;
     }
+    constants.fog_control[3] = exact_depth ? 1u : 0u;
     for (uint32_t stage = 0; stage < 8; stage++) {
         constants.stages[stage][0] = state->combiners.rgb_input[stage]; constants.stages[stage][1] = state->combiners.alpha_input[stage];
         constants.stages[stage][2] = state->combiners.rgb_output[stage]; constants.stages[stage][3] = state->combiners.alpha_output[stage];
@@ -4826,6 +4919,20 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         if (!binding.source_bytes) return reject("missing texture data");
         views[stage] = get_texture(binding, surface ? *surface : no_color_target);
         uint32_t shadow_func = binding.shadow_func;
+        static const bool shadow_diag = std::getenv("RECOMP_SHADOW_DIAG") != nullptr;
+        if (binding.shadow && shadow_diag) {
+            /* A shadow-compare stage's sampling state, once per kind. */
+            static std::set<uint64_t> seen;
+            uint64_t key = ((uint64_t)binding.address_u << 60) | ((uint64_t)binding.address_v << 56) |
+                           ((uint64_t)binding.address_w << 52) | ((uint64_t)(binding.format & 0xFFu) << 44) |
+                           ((uint64_t)(binding.shadow_func & 7u) << 40) | ((uint64_t)binding.border_color << 8) |
+                           ((binding.filter >> 24) & 0xFFu);
+            if (seen.size() < 16 && seen.insert(key).second)
+                std::fprintf(stderr, "[SHADOW] compare stage %u: format %02X %ux%u linear %u address %u/%u/%u border %08X "
+                             "filter %08X func %u%s\n", stage, binding.format, binding.width, binding.height,
+                             (unsigned)binding.linear, binding.address_u, binding.address_v, binding.address_w,
+                             binding.border_color, binding.filter, binding.shadow_func, views[stage] ? "" : " (no map yet)");
+        }
         if (!views[stage] && binding.shadow) {
             views[stage] = default_white_view();   /* nothing drawn there yet: lit */
             shadow_func = 7;                       /* ALWAYS */

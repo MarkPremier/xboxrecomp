@@ -163,6 +163,9 @@ int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, uint32_t co
 int nv2a_pb_exec_batch_spans(float width);
 /* 1 = queued, 0 = use CPU clear, -1 = native resource failure. */
 int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t color, uint32_t depth);
+/* Shadow maps as exact (float) depth, or the Xbox's 16-bit (see
+ * exact_shadow_depth in nv2a_gpu_d3d11.cpp); from any thread. */
+void nv2a_gpu_set_exact_shadows(int on);
 int nv2a_gpu_execute_state(const uint32_t program[136][4], const uint32_t valid[136], uint32_t start,
 						  const float attributes[16][4], float constants[192][4]);
 

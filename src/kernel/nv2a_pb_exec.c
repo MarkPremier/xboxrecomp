@@ -664,59 +664,15 @@ failure:
     _Exit(EXIT_FAILURE);
 }
 
-/* ZPASS occlusion report. The title writes a 64-bit stamp into the report
- * buffer, rings GET_REPORT, then spins until the stamp changes; the GPU is
- * meant to overwrite it with a fresh timestamp plus the number of pixels that
- * passed the depth test. xemu answers exactly that way
- * (pgraph_write_zpass_pixel_cnt_report: u64 timestamp, u32 result, u32 done).
- * There is no real occlusion counter behind the D3D11 path, so report the
- * whole surface as visible -- never cull geometry a real query would have
- * kept. ponytail: fixed count, feed the rasteriser's passing-pixel count here
- * if a title ever needs true occlusion culling. */
-static void report_zpass(uint32_t offset)
-{
-    uint32_t ramin_offset = s_gpu.report_context;
-    if (!ramin_offset)
-        goto failure;
-    if (ramin_offset >= 0x100000u) {
-        uint32_t instance;
-        if (!ramht_instance(ramin_offset, &instance))
-            goto failure;
-        ramin_offset = instance;
-    }
-    volatile uint32_t *descriptor = xbox_Nv2aRegisterPointer(0x700000 + ramin_offset, 12);
-    if (!descriptor)
-        goto failure;
-    uint32_t flags = descriptor[0];
-    uint32_t limit = descriptor[1];
-    uint32_t frame = descriptor[2];
-    uint32_t dma_class = flags & 0xFFFu;
-    uint32_t target = flags & 0x30000u;
-    uint64_t address = (frame & 0xFFFFF000u) + (flags >> 20);
-    if ((dma_class != 0x03u && dma_class != 0x3Du) ||
-            (target != 0 && target != 0x20000u) || (offset & 3u) ||
-            (uint64_t)offset + 16 > (uint64_t)limit + 1)
-        goto failure;
-    uint8_t *destination = xbox_DmaPhysicalPointer(address + offset, 16);
-    if (!destination)
-        goto failure;
-    uint64_t timestamp = ++s_gpu.report_timestamp;
-    uint32_t result = s_gpu.clip_w && s_gpu.clip_h
-                    ? s_gpu.clip_w * s_gpu.clip_h : 1;
-    uint32_t done = 0;
-    memcpy(destination, &timestamp, 8);
-    memcpy(destination + 8, &result, 4);
-    memcpy(destination + 12, &done, 4);
-    return;
-
-failure:
-    {
-        static unsigned warned;
-        if (warned++ < 4)
-            fprintf(stderr, "[GPU] zpass report unresolved: handle 0x%08X offset 0x%08X\n",
-                    s_gpu.report_context, offset);
-    }
-}
+/* ZPASS occlusion reports. The NV2A counts the pixels that pass the depth
+ * test while SET_ZPASS_PIXEL_COUNT_ENABLE is on and GET_REPORT writes {u64
+ * timestamp, u32 count, u32 done} at its 24-bit offset in the report DMA
+ * object (xemu: pgraph_write_zpass_pixel_cnt_report). Nothing is counted or
+ * written here. In this memory layout a title's report page can sit above
+ * the 16 MB that offset reaches -- Turok Evolution's is at 0x01A89000 and its
+ * reports say 0xA89000 -- so a write at the offset lands 16 MB too low, on
+ * other data (DirectSound crashed in it). A title that spins on its reports
+ * answers them itself (Turok: its sub_00194B40 override). */
 
 /* Every texture-stage register, as the title last set it.
  * Texturing is not implemented yet; knowing which formats and sizes a title
@@ -3509,6 +3465,7 @@ static int gpu_submit_chunk(Nv2aGpuDraw *state, uint32_t *count)
 /* Set by the window (F11) to write the next whole frame's batch state to
  * capture_<n>.txt beside the exe. */
 volatile LONG g_nv2a_capture_request;
+extern volatile LONG g_nv2a_capture_active;   /* nv2a_gpu_d3d11.cpp: the capture recording now, or 0 */
 
 static void raster_batch(void)
 {
@@ -3578,6 +3535,7 @@ static void raster_batch(void)
                     fclose(info_out);
                     info_out = stderr;
                     fprintf(stderr, "[BINFO] capture %u written\n", capture_seq);
+                    InterlockedExchange(&g_nv2a_capture_active, 0);
                 }
             }
             if (info_sec >= 0 && info_state == 0 &&
@@ -3592,6 +3550,7 @@ static void raster_batch(void)
                 if (f) {
                     info_out = f;
                     info_lo = 1; info_hi = 0x7FFFFFFF; info_state = 1;
+                    InterlockedExchange(&g_nv2a_capture_active, (LONG)capture_seq);   /* shadow maps it reads are saved */
                     fprintf(stderr, "[BINFO] capture %u -> %s\n", capture_seq, path);
                 }
             }
@@ -3642,11 +3601,35 @@ static void raster_batch(void)
                 /* Where the batch lands (logical pixels) and the oFog its
                  * vertex program wrote, from the CPU interpreter. */
                 float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f, f0 = 1e30f, f1 = -1e30f;
-                uint32_t v, seen = 0;
+                float z0 = 1e30f, z1 = -1e30f;   /* screen depth (shadow casters) */
+                float shadow[4][2];              /* s/q t/q r/q q of a shadow stage */
+                uint32_t v, seen = 0, shadow_stage = 4, shadow_seen = 0, shadow_behind = 0, k;
+                for (st = 1; st < 4; st++) {
+                    const Texture *t = &s_gpu.extra_tex[st - 1];
+                    uint32_t format = (t->raw_format >> 8) & 0xFFu;
+                    if (((s_gpu.shader_stage_program >> (st * 5)) & 31u) == 2u &&
+                        (format == 0x2C || format == 0x2D || format == 0x30 || format == 0x31 ||
+                         format == 0x2A || format == 0x2B || format == 0x2E || format == 0x2F)) { shadow_stage = st; break; }
+                }
+                for (k = 0; k < 4; k++) { shadow[k][0] = 1e30f; shadow[k][1] = -1e30f; }
                 for (v = 0; v < s_gpu.idx_count && v < 65536u; v++) {
                     Nv2aCpuVertex cv;
-                    if (!fetch_shader_vertex(s_gpu.idx[v], &cv) || !(cv.output[0][3] > 0)) continue;
+                    if (!fetch_shader_vertex(s_gpu.idx[v], &cv)) continue;
+                    if (shadow_stage < 4) {
+                        const float *c = cv.output[9 + shadow_stage];
+                        if (c[3] > 0) {
+                            float p[4] = {c[0] / c[3], c[1] / c[3], c[2] / c[3], c[3]};
+                            shadow_seen++;
+                            for (k = 0; k < 4; k++) {
+                                if (p[k] < shadow[k][0]) shadow[k][0] = p[k];
+                                if (p[k] > shadow[k][1]) shadow[k][1] = p[k];
+                            }
+                        } else shadow_behind++;
+                    }
+                    if (!(cv.output[0][3] > 0)) continue;
                     seen++;
+                    if (cv.output[0][2] < z0) z0 = cv.output[0][2];
+                    if (cv.output[0][2] > z1) z1 = cv.output[0][2];
                     if (cv.output[0][0] < x0) x0 = cv.output[0][0];
                     if (cv.output[0][0] > x1) x1 = cv.output[0][0];
                     if (cv.output[0][1] < y0) y0 = cv.output[0][1];
@@ -3654,8 +3637,12 @@ static void raster_batch(void)
                     if (cv.output[5][0] < f0) f0 = cv.output[5][0];
                     if (cv.output[5][0] > f1) f1 = cv.output[5][0];
                 }
-                fprintf(info_out, "[BINFO]   screen %.0f,%.0f-%.0f,%.0f ofog %.3f..%.3f (%u of %u in front)\n",
-                        x0, y0, x1, y1, f0, f1, seen, s_gpu.idx_count);
+                fprintf(info_out, "[BINFO]   screen %.0f,%.0f-%.0f,%.0f z %.1f..%.1f ofog %.3f..%.3f (%u of %u in front)\n",
+                        x0, y0, x1, y1, z0, z1, f0, f1, seen, s_gpu.idx_count);
+                if (shadow_stage < 4)
+                    fprintf(info_out, "[BINFO]   shadow t%u func %u: s %.1f..%.1f t %.1f..%.1f r/q %.1f..%.1f q %.2f..%.2f (%u, %u with q<=0)\n",
+                            shadow_stage, s_gpu.shadow_func, shadow[0][0], shadow[0][1], shadow[1][0], shadow[1][1],
+                            shadow[2][0], shadow[2][1], shadow[3][0], shadow[3][1], shadow_seen, shadow_behind);
                 {
                     /* The program (once per capture) and the constants it
                      * reads, so a vertex program can be disassembled offline. */
@@ -4864,13 +4851,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     switch (method) {
     case NV097_CLEAR_REPORT_VALUE:
     case NV097_SET_ZPASS_PIXEL_COUNT_ENABLE:
-        /* Recorded only to keep the occlusion query trio out of the unhandled
-         * report; the count itself is answered in report_zpass. */
-        return;
     case NV097_GET_REPORT:
-        if ((param & NV097_GET_REPORT_TYPE) == NV097_GET_REPORT_TYPE_ZPASS_PIXEL_CNT)
-            report_zpass(param & NV097_GET_REPORT_OFFSET);
-        return;
+        return;   /* the occlusion query trio: taken, not acted on (above) */
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_x = param & 0xFFFF;
         s_gpu.clip_w = (param >> 16) & 0xFFFF;
@@ -5555,11 +5537,8 @@ void nv2a_pb_exec_report(void)
                 nv_class_name(s_engine_class[i].class_id),
                 s_engine_class[i].count);
 
-    /* The ZPASS query trio (0x17C8/0x17CC/0x17D0) is handled above: GET_REPORT
-     * resolves the report DMA object (SET_CONTEXT_DMA_REPORT) and writes a
-     * fresh stamp plus a whole-surface count. ponytail: the count is fixed, not
-     * a real occlusion result; feed the rasteriser's passing-pixel count here
-     * if a title ever needs true occlusion culling. */
+    /* The ZPASS query trio (0x17C8/0x17CC/0x17D0) is taken and dropped above:
+     * no count, no report written (see "ZPASS occlusion reports"). */
 
     /* Top ten by frequency: selection sort over a small table, once every few
      * seconds, is not worth a better algorithm.
