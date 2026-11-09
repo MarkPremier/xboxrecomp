@@ -28,7 +28,8 @@
 #pragma comment(lib, "xinput.lib")
 #include "hid_pads.h"
 
-/* The host slot a HID pad (hid_pads.c) stands in, beside XInput's 0-3. */
+/* The host slots HID pads (hid_pads.c) stand in, beside XInput's 0-3: this
+ * plus the pad's place (0-3). */
 #define HIDPAD_SLOT 0x100u
 
 static LONG g_reported_slot[XBOX_MAX_CONTROLLERS] = { -1, -1, -1, -1 };
@@ -858,18 +859,29 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     pState->dwPacketNumber = ++packet;
 }
 
+/* The `nth` HID pad as Xbox port `port`, if there is one. */
+static int hid_pad_port(DWORD port, int nth, XINPUT_STATE *state, DWORD *host_slot)
+{
+    int place = xbox_HidPadState(nth, state);
+    LONG slot;
+    if (place < 0) return 0;
+    slot = (LONG)(HIDPAD_SLOT + (DWORD)place);
+    if (InterlockedExchange(&g_reported_slot[port], slot) != slot)
+        fprintf(stderr, "[XINPUT] HID pad %d -> Xbox port %lu\n", place + 1, port);
+    xbox_HidPadSetPlayer(place, (int)port);
+    *host_slot = (DWORD)slot;
+    return 1;
+}
+
 static DWORD poll_host(DWORD port, XINPUT_STATE *state, DWORD *host_slot)
 {
     DWORD connected = 0;
+    int hid_offset = 0;
     if (g_host_slot >= 0 && port == 0) {
         DWORD result = XInputGetState((DWORD)g_host_slot, state);
         LONG selected = result == ERROR_SUCCESS ? g_host_slot : -1;
-        if (result == ERROR_DEVICE_NOT_CONNECTED && xbox_HidPadState(state)) {
-            if (InterlockedExchange(&g_reported_slot[port], (LONG)HIDPAD_SLOT) != (LONG)HIDPAD_SLOT)
-                fprintf(stderr, "[XINPUT] HID pad -> Xbox port 0\n");
-            *host_slot = HIDPAD_SLOT;
+        if (result == ERROR_DEVICE_NOT_CONNECTED && hid_pad_port(port, 0, state, host_slot))
             return ERROR_SUCCESS;
-        }
         LONG previous = InterlockedExchange(&g_reported_slot[port], selected);
         if (selected >= 0 && previous != selected)
             fprintf(stderr, "[XINPUT] selected host slot %d -> Xbox port 0\n", g_host_slot);
@@ -879,6 +891,10 @@ static DWORD poll_host(DWORD port, XINPUT_STATE *state, DWORD *host_slot)
         return result;
     }
     DWORD wanted = g_host_slot >= 0 ? port - 1 : port;
+    if (g_host_slot >= 0) {     /* port 0 took the first HID pad if its slot is empty */
+        XINPUT_STATE probe;
+        hid_offset = XInputGetState((DWORD)g_host_slot, &probe) != ERROR_SUCCESS;
+    }
     for (DWORD slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++) {
         if ((int)slot == g_host_slot) continue;
         DWORD result = XInputGetState(slot, state);
@@ -897,13 +913,9 @@ static DWORD poll_host(DWORD port, XINPUT_STATE *state, DWORD *host_slot)
             return ERROR_SUCCESS;
         }
     }
-    /* A HID pad takes the first port no XInput pad has. */
-    if (connected == wanted && xbox_HidPadState(state)) {
-        if (InterlockedExchange(&g_reported_slot[port], (LONG)HIDPAD_SLOT) != (LONG)HIDPAD_SLOT)
-            fprintf(stderr, "[XINPUT] HID pad -> Xbox port %lu\n", port);
-        *host_slot = HIDPAD_SLOT;
+    /* HID pads take the ports after the XInput pads', in their order. */
+    if (wanted >= connected && hid_pad_port(port, (int)(wanted - connected) + hid_offset, state, host_slot))
         return ERROR_SUCCESS;
-    }
     if (InterlockedExchange(&g_reported_slot[port], -1) != -1)
         fprintf(stderr, "[XINPUT] Xbox port %lu disconnected\n", port);
     return ERROR_DEVICE_NOT_CONNECTED;
@@ -1019,8 +1031,8 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 
     result = poll_host(dwPort, &state, &slot);
     if (result != ERROR_SUCCESS) return result;
-    if (slot == HIDPAD_SLOT) {
-        xbox_HidPadRumble(pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed);
+    if (slot >= HIDPAD_SLOT) {
+        xbox_HidPadRumble((int)(slot - HIDPAD_SLOT), pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed);
         return ERROR_SUCCESS;
     }
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
