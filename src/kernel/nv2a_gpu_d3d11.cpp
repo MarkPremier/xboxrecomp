@@ -1206,7 +1206,13 @@ static std::condition_variable pixel_jobs_signal;
 static std::deque<std::shared_ptr<PixelCompileJob>> pixel_jobs_queued;
 static std::vector<std::shared_ptr<PixelCompileJob>> pixel_jobs_done;
 static std::vector<std::array<uint32_t,43>> pixel_jobs_pending;
-static std::vector<std::vector<uint32_t>> vertex_jobs_pending;
+/* The same program can read differently packed attributes on another draw. */
+using VertexCompileKey = std::pair<std::vector<uint32_t>, uint32_t>;
+static std::vector<VertexCompileKey> vertex_jobs_pending;
+/* A deterministic compiler/device failure is remembered for this run. Without
+ * this, every draw of an unsupported shader can start the same failed job. */
+static std::set<VertexCompileKey> vertex_jobs_failed;
+static std::set<std::array<uint32_t,43>> pixel_jobs_failed;
 static std::atomic<int> pixel_jobs_finished{0};
 static ComPtr<ID3D11PixelShader> generic_pixel_shader;
 static bool generic_pixel_requested;
@@ -1304,7 +1310,7 @@ static void queue_pixel_compile(std::shared_ptr<PixelCompileJob> job)
         for (unsigned index = 0; index < threads; index++) std::thread(pixel_compile_worker).detach();
     }
     std::lock_guard<std::mutex> hold(pixel_jobs_lock);
-    if (job->vertex) vertex_jobs_pending.push_back(job->vertex_key);
+    if (job->vertex) vertex_jobs_pending.emplace_back(job->vertex_key, job->vertex_mask);
     else if (!job->generic) pixel_jobs_pending.push_back(job->key);
     if (job->generic) pixel_jobs_queued.push_front(job); else pixel_jobs_queued.push_back(job);
     pixel_jobs_signal.notify_one();
@@ -1321,7 +1327,8 @@ static void install_compiled_pixel_shaders()
         pixel_jobs_finished = 0;
         for (const auto &job : done) {
             if (job->vertex)
-                vertex_jobs_pending.erase(std::remove(vertex_jobs_pending.begin(), vertex_jobs_pending.end(), job->vertex_key),
+                vertex_jobs_pending.erase(std::remove(vertex_jobs_pending.begin(), vertex_jobs_pending.end(),
+                                                     VertexCompileKey{job->vertex_key, job->vertex_mask}),
                                           vertex_jobs_pending.end());
             else
                 pixel_jobs_pending.erase(std::remove(pixel_jobs_pending.begin(), pixel_jobs_pending.end(), job->key),
@@ -1331,6 +1338,7 @@ static void install_compiled_pixel_shaders()
     for (const auto &job : done) {
         if (job->vertex) {
             if (!job->vertex_shader) {
+                vertex_jobs_failed.emplace(job->vertex_key, job->vertex_mask);
                 gpu_timing.vertex_shader_failures++;
                 std::fprintf(stderr, "[GPU-D3D11] vertex compile: %s\n",
                              job->errors ? (const char *)job->errors->GetBufferPointer() : "failed");
@@ -1343,10 +1351,12 @@ static void install_compiled_pixel_shaders()
             variant.input_mask = job->vertex_mask;
             variant.bytecode_bytes = job->code->GetBufferSize();
             gpu_timing.vertex_async_compiles++;
-            cache_shader_variant(vertex_variants, std::move(variant));
+            if (!cache_shader_variant(vertex_variants, std::move(variant)))
+                vertex_jobs_failed.emplace(job->vertex_key, job->vertex_mask);
             continue;
         }
         if (!job->shader) {
+            if (!job->generic) pixel_jobs_failed.insert(job->key);
             gpu_timing.pixel_shader_failures++;
             std::fprintf(stderr, "[GPU-D3D11] %s shader compile: %s\n", job->generic ? "generic" : "guest",
                          job->errors ? (const char *)job->errors->GetBufferPointer() : "failed");
@@ -1361,7 +1371,7 @@ static void install_compiled_pixel_shaders()
         variant.shader = job->shader;
         variant.bytecode_bytes = job->code->GetBufferSize();
         gpu_timing.pixel_async_compiles++;
-        cache_shader_variant(shader_variants, std::move(variant));
+        if (!cache_shader_variant(shader_variants, std::move(variant))) pixel_jobs_failed.insert(job->key);
     }
 }
 
@@ -1377,17 +1387,21 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
     if (!words) return nullptr;
     /* Finished compiles are installed by get_pixel_shader, which runs first:
      * installing here could evict the pixel shader this draw just took. */
-    for (auto &cached : vertex_variants) if (cached.key.size() == words &&
+    for (auto &cached : vertex_variants) if (cached.input_mask == state.attribute_mask && cached.key.size() == words &&
         !std::memcmp(cached.key.data(), state.vertex_program + state.vertex_start, words * sizeof(uint32_t))) {
         cached.last_used = ++shader_use_serial;
         gpu_timing.vertex_shader_hits++;
         return &cached;
     }
     std::vector<uint32_t> key(state.vertex_program[state.vertex_start], state.vertex_program[state.vertex_start] + words);
+    VertexCompileKey compile_key{key, state.attribute_mask};
+    if (vertex_jobs_failed.count(compile_key)) return nullptr;
     bool async = pixel_compiles_async();
     if (async) {
         std::lock_guard<std::mutex> hold(pixel_jobs_lock);
-        if (std::find(vertex_jobs_pending.begin(), vertex_jobs_pending.end(), key) != vertex_jobs_pending.end()) {
+        if (std::any_of(vertex_jobs_pending.begin(), vertex_jobs_pending.end(), [&](const VertexCompileKey &pending_key) {
+                return pending_key.second == state.attribute_mask && pending_key.first == key;
+            })) {
             gpu_timing.vertex_skipped_draws++;
             *pending = true;
             return nullptr;
@@ -1398,7 +1412,10 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
     auto job = std::make_shared<PixelCompileJob>();
     job->vertex = true;
     job->vertex_source = vertex_program_source(key, false);
-    if (job->vertex_source.empty()) return nullptr;
+    if (job->vertex_source.empty()) {
+        vertex_jobs_failed.insert(std::move(compile_key));
+        return nullptr;
+    }
     job->vertex_key = std::move(key);
     job->vertex_mask = state.attribute_mask;
     ComPtr<ID3DBlob> code, errors;
@@ -1410,15 +1427,21 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
             return nullptr;
         }
         gpu_timing.vertex_shader_failures++;
+        vertex_jobs_failed.insert(std::move(compile_key));
         std::fprintf(stderr, "[GPU-D3D11] vertex compile: %s\n", errors ? (const char *)errors->GetBufferPointer() : "failed");
         return nullptr;
     }
     VertexVariant variant;
     variant.key = std::move(job->vertex_key);
-    if (!create_vertex_objects(code.Get(), variant.shader, variant.layout, state.attribute_mask)) return nullptr;
+    if (!create_vertex_objects(code.Get(), variant.shader, variant.layout, state.attribute_mask)) {
+        vertex_jobs_failed.insert(std::move(compile_key));
+        return nullptr;
+    }
     variant.input_mask = state.attribute_mask;
     variant.bytecode_bytes = code->GetBufferSize();
-    return cache_shader_variant(vertex_variants, std::move(variant));
+    auto *cached = cache_shader_variant(vertex_variants, std::move(variant));
+    if (!cached) vertex_jobs_failed.insert(std::move(compile_key));
+    return cached;
 }
 
 static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t window_clip_mode)
@@ -1446,6 +1469,7 @@ static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t wi
         gpu_timing.pixel_shader_hits++;
         return cached.shader.Get();
     }
+    if (pixel_jobs_failed.count(variant.key)) return generic_pixel_shader.Get();
     bool async = pixel_compiles_async();
     if (async && generic_pixel_shader) {
         std::lock_guard<std::mutex> hold(pixel_jobs_lock);
@@ -1500,13 +1524,18 @@ static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t wi
     ComPtr<ID3DBlob> code = job->code, errors;
     if (!code && FAILED(compile_pixel_variant(*job, code, errors))) {
         gpu_timing.pixel_shader_failures++;
+        pixel_jobs_failed.insert(variant.key);
         std::fprintf(stderr, "[GPU-D3D11] guest shader compile: %s\n", errors ? (const char *)errors->GetBufferPointer() : "failed");
-        return nullptr;
+        return generic_pixel_shader.Get();
     }
-    if (FAILED(device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &variant.shader))) return nullptr;
+    if (FAILED(device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &variant.shader))) {
+        pixel_jobs_failed.insert(variant.key);
+        return generic_pixel_shader.Get();
+    }
     variant.bytecode_bytes = code->GetBufferSize();
     auto *cached = cache_shader_variant(shader_variants, std::move(variant));
-    return cached ? cached->shader.Get() : nullptr;
+    if (!cached) pixel_jobs_failed.insert(job->key);
+    return cached ? cached->shader.Get() : generic_pixel_shader.Get();
 }
 
 template<typename SurfaceType>

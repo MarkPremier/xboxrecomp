@@ -326,6 +326,9 @@ typedef struct MCPXAPUVPState {
     uint8_t submix_headroom[NUM_MIXBINS];
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
     uint64_t voice_locked[4];
+    /* Synchronize a voice update with its current VP slice, without making
+     * the title wait for all other voices or the DSP/output work. */
+    QemuMutex voice_guard[MCPX_HW_MAX_VOICES];
 
     struct {
         int current_entry;

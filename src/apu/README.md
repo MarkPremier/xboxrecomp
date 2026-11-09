@@ -31,6 +31,23 @@ and mixes software voices into it; it must not clear hardware output or
 generate 1024/2048 replacement frames each tick. Muting clears the packet,
 and the inactive-hardware path clears stale VP data before software mixing.
 
+Voice locks synchronize with only that voice's current VP slice. A locked
+voice waits while the title updates its buffer, position or resampler;
+other voices continue. Natural completion of a non-looping buffer waits
+for the resampler's buffered output to reach the mix before notifying the
+title, so short effects and the ends of longer sounds are preserved.
+
+The title's idle-voice handler uses `mcpx_apu_voice_idle_begin`/`end` to
+recheck whether that voice was restarted while its notification waited.
+This covers both interrupt and synchronous DirectSound service. Stale
+notifications are ignored; valid idle reports hold the voice guard through
+retirement, so a late completion cannot unlink a new playback of the voice.
+
+`RECOMP_APU_EVENT_TRACE=1` logs voice starts, pause/resume, first nonzero
+mixed contribution, stops, idle traps and rejected stale idle reports. This
+helps distinguish missing starts, silent or unlinked voices, and downstream
+output problems. It is off by default.
+
 XAudio2 queue saturation applies backpressure while releasing the APU lock.
 The waveOut fallback also waits before reusing an in-flight buffer. Submission
 failures and two-second queue stalls are reported and stop host output,

@@ -48,6 +48,12 @@ void mcpx_apu_play_test_tone(MCPXAPUState *d);
 
 #define APU_MIXER_MAX_VOICES 64
 
+/* Validate an idle notification at the point the guest consumes it, whether
+ * from its ISR or its synchronous audio service. A true result holds that
+ * voice stable until idle_end; false means it was restarted or is locked. */
+int mcpx_apu_voice_idle_begin(MCPXAPUState *d, uint32_t voice);
+void mcpx_apu_voice_idle_end(MCPXAPUState *d, uint32_t voice);
+
 typedef struct APUMixerVoice {
     volatile int     active;       /* 1 = playing, 0 = stopped */
     volatile int     looping;      /* 1 = loop, 0 = one-shot */

@@ -92,6 +92,7 @@ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
     if (d->vp.filters[v].resampler) {
         src_reset(d->vp.filters[v].resampler);
     }
+    d->vp.filters[v].resample_source_ended = false;
 }
 
 static bool voice_should_mute(uint16_t v)
@@ -155,9 +156,35 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * Voice off / lock
  * ============================================================ */
 
+/* Event-level tracing for intermittent effects: a start without a matching
+ * first-mix line identifies a silent voice, rather than host output loss. */
+static bool voice_trace_pending[MCPX_HW_MAX_VOICES];
+static bool voice_event_trace(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("RECOMP_APU_EVENT_TRACE");
+        enabled = value && *value && *value != '0';
+    }
+    return enabled != 0;
+}
+
+static void trace_voice_event(MCPXAPUState *d, uint16_t v, const char *event)
+{
+    if (!voice_event_trace()) return;
+    fprintf(stderr, "[APU-EVENT] %s v%u tick=%u ba=%06X cbo=%u ebo=%u state=%08X fmt=%08X pending=%d\n",
+            event, v, (unsigned)d->ep_frame_div,
+            voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START, NV_PAVS_VOICE_CUR_PSL_START_BA),
+            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET, NV_PAVS_VOICE_PAR_OFFSET_CBO),
+            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFFu),
+            voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu), voice_trace_pending[v]);
+}
+
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
     if (out_of_range("voice", v, MCPX_HW_MAX_VOICES)) return;
+    trace_voice_event(d, v, "off");
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -170,22 +197,22 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
-/* The lock bits are only read back by the front end (is_voice_locked), so a
- * PIO VOICE_LOCK is an atomic bit flip. It used to take d->lock, which the
- * frame thread holds for a whole frame and lets go of once per frame: with
- * many 3D voices playing (HRTF, resampling) DirectSound's game thread waited
- * a frame or more on every lock and unlock -- a fifth of Turok Evolution's
- * frame time in its busier levels. */
+/* Wait only for this voice's current slice before granting the guest's lock.
+ * An atomic bit alone let the VP keep advancing a locked active voice, or
+ * finish an old slice after VOICE_ON reset its position and resampler.
+ * Taking d->lock here instead would wait for every voice and DSP/output work. */
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     if (out_of_range("voice", v, MCPX_HW_MAX_VOICES)) return;
     uint64_t mask = 1ULL << (v % 64);
     volatile LONG64 *word = (volatile LONG64 *)&d->vp.voice_locked[v / 64];
+    qemu_mutex_lock(&d->vp.voice_guard[v]);
     if (lock) {
         InterlockedOr64(word, (LONG64)mask);
     } else {
         InterlockedAnd64(word, (LONG64)~mask);
     }
+    qemu_mutex_unlock(&d->vp.voice_guard[v]);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
@@ -193,6 +220,30 @@ static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
     if (out_of_range("voice", v, MCPX_HW_MAX_VOICES)) return false;
     uint64_t mask = 1ULL << (v % 64);
     return (qatomic_read(&d->vp.voice_locked[v / 64]) & mask) != 0;
+}
+
+/* PIO writes run on the title thread while an idle trap waits for its ISR.
+ * A stop followed immediately by a restart can therefore make that trap
+ * stale. Retiring it afterwards unlinks the newly playing voice, leaving
+ * it ACTIVE but unreachable by the VP until another start relinks it.
+ * Validate at the guest handler itself: DirectSound also services traps
+ * synchronously through KeSynchronizeExecution, outside our IRQ delivery. */
+int mcpx_apu_voice_idle_begin(MCPXAPUState *d, uint32_t v)
+{
+    if (!d || v >= MCPX_HW_MAX_VOICES) return 0;
+    qemu_mutex_lock(&d->vp.voice_guard[v]);
+    if (is_voice_locked(d, (uint16_t)v) ||
+        voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+        trace_voice_event(d, (uint16_t)v, "stale-idle");
+        qemu_mutex_unlock(&d->vp.voice_guard[v]);
+        return 0;
+    }
+    return 1;
+}
+
+void mcpx_apu_voice_idle_end(MCPXAPUState *d, uint32_t voice)
+{
+    if (d && voice < MCPX_HW_MAX_VOICES) qemu_mutex_unlock(&d->vp.voice_guard[voice]);
 }
 
 /* ============================================================
@@ -258,6 +309,10 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
 
+        if (voice_event_trace()) {
+            voice_trace_pending[selected_handle] = true;
+            trace_voice_event(d, (uint16_t)selected_handle, "on");
+        }
         list = GET_MASK(d->regs[NV_PAPU_FEAV], NV_PAPU_FEAV_LST);
         if (list != NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_INHERIT) {
             unsigned int top_reg = voice_list_regs[list - 1].top;
@@ -366,13 +421,22 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
-        voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
+        selected_handle = argument & NV1BA0_PIO_VOICE_OFF_HANDLE;
+        if (out_of_range("voice", selected_handle, MCPX_HW_MAX_VOICES)) break;
+        qemu_mutex_lock(&d->vp.voice_guard[selected_handle]);
+        voice_off(d, (uint16_t)selected_handle);
+        qemu_mutex_unlock(&d->vp.voice_guard[selected_handle]);
         break;
 
     case NV1BA0_PIO_VOICE_PAUSE:
-        voice_set_mask(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE),
+        selected_handle = argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE;
+        if (out_of_range("voice", selected_handle, MCPX_HW_MAX_VOICES)) break;
+        qemu_mutex_lock(&d->vp.voice_guard[selected_handle]);
+        voice_set_mask(d, (uint16_t)selected_handle,
                        NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_PAUSED,
                        (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) != 0);
+        trace_voice_event(d, (uint16_t)selected_handle, argument & NV1BA0_PIO_VOICE_PAUSE_ACTION ? "pause" : "resume");
+        qemu_mutex_unlock(&d->vp.voice_guard[selected_handle]);
         break;
 
     case NV1BA0_PIO_SET_CURRENT_HRTF_ENTRY:
@@ -566,6 +630,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case SE2FE_IDLE_VOICE:
         if (d->regs[NV_PAPU_FETFORCE1] & NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE) {
+            trace_voice_event(d, (uint16_t)argument, "idle-trap");
             /* The pair first, then the trap that makes the ISR read it, in
              * one store that is also a barrier (see the top of fe_method). */
             uint32_t fectl = d->regs[NV_PAPU_FECTL];
@@ -995,7 +1060,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
     }
 
-    if (cbo >= ebo) {
+    if (cbo > ebo) {
         if (stream) {
             d->vp.ssl[v].ssl_seg += 1;
             cbo = 0;
@@ -1013,7 +1078,9 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 cbo = lbo;
             } else {
                 cbo = ebo;
-                voice_off(d, (uint16_t)v);
+                /* SRC can read ahead of its output. Keep the voice active
+                 * until its buffered samples have actually reached the mix. */
+                d->vp.filters[v].resample_source_ended = true;
             }
         }
     }
@@ -1038,7 +1105,7 @@ static long voice_resample_callback(void *cb_data, float **data)
     MCPXAPUState *d = container_of(filter, MCPXAPUState, vp.filters[v]);
 
     int sample_count = 0;
-    while (sample_count < NUM_SAMPLES_PER_FRAME) {
+    while (sample_count < NUM_SAMPLES_PER_FRAME && !filter->resample_source_ended) {
         int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                     NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
         if (!active) {
@@ -1047,13 +1114,13 @@ static long voice_resample_callback(void *cb_data, float **data)
         int count = voice_get_samples(
             d, v, &filter->resample_buf[sample_count],
             NUM_SAMPLES_PER_FRAME - sample_count);
-        if (count < 0) {
+        if (count <= 0) {
             break;
         }
         sample_count += count;
     }
 
-    if (sample_count < NUM_SAMPLES_PER_FRAME) {
+    if (sample_count < NUM_SAMPLES_PER_FRAME && !filter->resample_source_ended) {
         /* Starvation causes SRC to hang on repeated calls. Provide silence. */
         memset(&filter->resample_buf[sample_count], 0,
                2 * (NUM_SAMPLES_PER_FRAME - sample_count) * sizeof(float));
@@ -1088,7 +1155,7 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
     }
     if (count != requested_num) {
         DPRINTF("resample returned fewer than expected: %d\n", count);
-        if (count == 0) {
+        if (count == 0 && !filter->resample_source_ended) {
             return -1;
         }
     }
@@ -1150,6 +1217,7 @@ static void voice_process(MCPXAPUState *d,
     bool multipass = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                     NV_PAVS_VOICE_CFG_FMT_MULTIPASS) != 0;
     dbg->multipass = multipass;
+    bool finished = false;
 
     if (multipass) {
         /* Read from multipass bin */
@@ -1180,6 +1248,10 @@ static void voice_process(MCPXAPUState *d,
              * sat here indefinitely while the title waited in voice_lock. */
             if (count == 0 && ++empty > 4) break;
             sample_count += count;
+            if (d->vp.filters[v].resample_source_ended && sample_count < NUM_SAMPLES_PER_FRAME) {
+                finished = true;
+                break;
+            }
         }
     }
 
@@ -1224,7 +1296,10 @@ static void voice_process(MCPXAPUState *d,
         dbg->vol[i] = vol[i];
     }
 
-    if (voice_should_mute(v)) return;
+    if (voice_should_mute(v)) {
+        if (finished) voice_off(d, v);
+        return;
+    }
 
     /* Low-pass filter */
     int fmode = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_MISC,
@@ -1265,6 +1340,8 @@ static void voice_process(MCPXAPUState *d,
     }
 
     /* Mix into bins */
+    float trace_peak = 0.0f;
+    bool tracing = voice_trace_pending[v];
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
         float hr;
@@ -1277,6 +1354,13 @@ static void voice_process(MCPXAPUState *d,
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             mixbins[bin[b]][i] += g * samples[i][b % channels];
         }
+        if (tracing)
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                trace_peak = fmaxf(trace_peak, fabsf(g * samples[i][b % channels]));
+    }
+    if (voice_trace_pending[v] && trace_peak > 0.0f) {
+        trace_voice_event(d, v, "mixed");
+        voice_trace_pending[v] = false;
     }
 
     /* VP monitor mix */
@@ -1294,6 +1378,7 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
+    if (finished) voice_off(d, v);
     (void)voice_list;
 }
 
@@ -1428,12 +1513,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
              * title's thread while this walk runs. Seen in between, a voice
              * being started read as idle, and the ISR retired it -- a playing
              * voice on DirectSound's finished list, freed later while still
-             * there. In xemu the method and the walk share a lock; here the
-             * lock bit is read first (both lock operations are interlocked),
-             * so an unlocked voice's ACTIVE_VOICE is the method's final word.
-             * A locked idle voice is reported on a later frame. */
+             * there. The per-voice guard makes this check and processing
+             * indivisible with granting the title's lock; locked active
+             * voices wait too, until their data and filters are consistent. */
+            qemu_mutex_lock(&d->vp.voice_guard[v]);
             bool locked_now = is_voice_locked(d, v);
-            MemoryBarrier();
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
                 /* Frames each voice has sat idle but locked: a title that
@@ -1449,10 +1533,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                         fprintf(stderr, "[APU] voice %u has been idle and locked for a second;"
                                         " its idle report waits for the unlock\n", v);
                 }
-            } else {
+            } else if (!locked_now) {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
             }
+            qemu_mutex_unlock(&d->vp.voice_guard[v]);
             d->regs[current] = d->regs[next];
         }
     }
@@ -1478,13 +1563,12 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
 void mcpx_apu_vp_init(MCPXAPUState *d)
 {
-    /* Single-threaded - no worker dispatch needed */
-    (void)d;
+    for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) qemu_mutex_init(&d->vp.voice_guard[v]);
 }
 
 void mcpx_apu_vp_finalize(MCPXAPUState *d)
 {
-    (void)d;
+    for (unsigned v = 0; v < MCPX_HW_MAX_VOICES; v++) qemu_mutex_destroy(&d->vp.voice_guard[v]);
 }
 
 void mcpx_apu_vp_reset(MCPXAPUState *d)
