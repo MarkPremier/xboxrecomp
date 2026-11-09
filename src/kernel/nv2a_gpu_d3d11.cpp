@@ -579,9 +579,8 @@ static bool screen_shaped(uint32_t width, uint32_t height)
 
 /* Heat haze (nv2a_gpu_set_heat_haze): 0 as the console draws it; 1 smooth,
  * the offsets of a bump stage read filtered (bump_source_smoothing); 2 sharp,
- * smooth and the small targets the title copies the screen into for such an
- * effect (Turok: 256x256) drawn at the screen's own pixel density instead of
- * a fraction of it. RECOMP_SMOOTH_BUMP=1 starts at 1. */
+ * full-resolution scene refraction with feathered particle edges; 3 off.
+ * RECOMP_SMOOTH_BUMP=1 starts at 1. */
 static int heat_haze = -1;
 static std::atomic<int> pending_heat_haze{-1};
 
@@ -596,15 +595,6 @@ static int heat_haze_mode()
 
 /* How much finer than the render scale a target is drawn: with a sharp heat
  * haze, one well under the screen's size gets the screen's density, up to 4x. */
-static float effect_target_factor(uint32_t width, uint32_t height)
-{
-    if (heat_haze_mode() != 2 || width > 512 || height > 512 || !width || !height) return 1.0f;
-    uint32_t screen_width = 640, screen_height = 480;
-    xbox_FramebufferSize(&screen_width, &screen_height);
-    float factor = std::max((float)screen_width / (float)width, (float)screen_height / (float)height);
-    return std::min(std::max(factor, 1.0f), 4.0f);
-}
-
 static UINT extent_at(uint32_t size, float factor)
 {
     if (factor == 1.0f) return size;
@@ -617,7 +607,6 @@ static void texture_size(uint32_t width, uint32_t height, bool scaled, UINT &tex
     float scale = scaled ? render_scale() : 1.0f;
     bool screen = screen_shaped(width, height);
     float wide = scaled && wide_frames && screen ? wide_factor : 1.0f;
-    if (scaled && !screen) scale *= effect_target_factor(width, height);
     texture_width = extent_at(width, scale * wide);
     texture_height = extent_at(height, scale);
 }
@@ -742,6 +731,7 @@ struct Constants {
     float light_spot_direction[8][4];    /* xyz=direction, w=spot parameter */
     uint32_t texgen[4][4], texture_matrix_enable[4];
     uint32_t window_clip_control[4], window_clip_rects[8][4];
+    float heat_transform[4][4];
 };
 
 static_assert(sizeof(Constants) % 16 == 0 && sizeof(Constants) <= 65536, "D3D11 constant-buffer extent");
@@ -751,6 +741,7 @@ static std::vector<DepthSurface> depth_surfaces;
 static uint64_t surface_use_serial;
 static uint64_t surface_frame_serial = 1;   /* advances on every flip */
 static uint64_t target_content_serial;
+static uint64_t dark_matter_frame;
 static std::vector<CachedTexture> textures;
 /* Bind-time lookup is limited to entries with the same guest source address.
  * Rebuild after insertion, even when eviction keeps the cache size unchanged. */
@@ -1809,6 +1800,7 @@ static D3D11_BOX texture_box(const Target &target, const D3D11_BOX &box)
 static void upload_surface(Surface &surface, const D3D11_BOX *box, const void *data, UINT row_pitch)
 {
     resolve_color(surface);      /* a partial upload keeps the rest */
+    surface.content_serial = ++target_content_serial;  /* CPU writes also invalidate scene snapshots */
     if (surface.ms_texture) surface.ms_stale = true;
     if (!is_scaled(surface)) {
         context->UpdateSubresource(surface.texture.Get(), 0, box, data, row_pitch, 0);
@@ -2300,11 +2292,9 @@ static void apply_target_sizes()
     }
     int haze = pending_heat_haze.exchange(-1);
     if (haze >= 0 && haze != heat_haze_mode()) {
-        bool resize = (haze == 2) != (heat_haze == 2);
         heat_haze = haze;
-        if (resize)
-            std::snprintf(why + std::strlen(why), sizeof why - std::strlen(why), "%sheat haze %s",
-                          *why ? ", " : "", haze == 2 ? "sharp" : "at the render scale");
+        std::fprintf(stderr, "[GPU-D3D11] heat haze %s\n",
+                     haze == 3 ? "off" : haze == 2 ? "enhanced" : haze == 1 ? "smooth" : "xbox");
     }
     int shadow = pending_shadow_scale.exchange(-1);
     if (shadow > 0 && (float)shadow != shadow_scale()) {
@@ -2346,7 +2336,7 @@ extern "C" void nv2a_gpu_set_msaa(int samples)
 
 extern "C" void nv2a_gpu_set_heat_haze(int mode)
 {
-    pending_heat_haze.store(mode >= 2 ? 2 : mode == 1 ? 1 : 0);
+    pending_heat_haze.store(mode >= 3 ? 3 : mode == 2 ? 2 : mode == 1 ? 1 : 0);
 }
 
 /* Shadow maps drawn 1, 2 or 4 times the title's size, from the next flip. */
@@ -3675,27 +3665,109 @@ static bool initialize_pipeline()
 static ComPtr<ID3D11Texture2D> feedback_texture;
 static ComPtr<ID3D11ShaderResourceView> feedback_view;
 
-static ID3D11ShaderResourceView *get_feedback_texture(const Surface &destination)
+static ID3D11ShaderResourceView *snapshot_color(const Surface &destination,
+    ComPtr<ID3D11Texture2D> &snapshot, ComPtr<ID3D11ShaderResourceView> &view)
 {
     if (!context || !destination.texture) return nullptr;
     D3D11_TEXTURE2D_DESC desc = {};
     destination.texture->GetDesc(&desc);
     D3D11_TEXTURE2D_DESC have = {};
-    if (feedback_texture) feedback_texture->GetDesc(&have);
-    if (!feedback_texture || !feedback_view ||
+    if (snapshot) snapshot->GetDesc(&have);
+    if (!snapshot || !view ||
             have.Width != desc.Width || have.Height != desc.Height || have.Format != desc.Format) {
-        feedback_texture.Reset();
-        feedback_view.Reset();
+        snapshot.Reset();
+        view.Reset();
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.CPUAccessFlags = 0;
         desc.MiscFlags = 0;
-        if (FAILED(device->CreateTexture2D(&desc, nullptr, &feedback_texture))) return nullptr;
-        if (FAILED(device->CreateShaderResourceView(feedback_texture.Get(), nullptr, &feedback_view))) return nullptr;
+        if (FAILED(device->CreateTexture2D(&desc, nullptr, &snapshot))) return nullptr;
+        if (FAILED(device->CreateShaderResourceView(snapshot.Get(), nullptr, &view))) return nullptr;
     }
     resolve_color(const_cast<Surface &>(destination));
-    context->CopyResource(feedback_texture.Get(), destination.texture.Get());
-    return feedback_view.Get();
+    context->CopyResource(snapshot.Get(), destination.texture.Get());
+    return view.Get();
+}
+
+static ID3D11ShaderResourceView *get_feedback_texture(const Surface &destination)
+{
+    return snapshot_color(destination, feedback_texture, feedback_view);
+}
+
+/* Consecutive heat batches share the undistorted scene. Copying the whole
+ * 4K target for every particle batch costs bandwidth and feeds earlier haze
+ * back into later haze. Any other scene write or flip starts a fresh copy. */
+static struct {
+    ComPtr<ID3D11Texture2D> texture, destination;
+    ComPtr<ID3D11ShaderResourceView> view;
+    uint64_t serial = 0, frame = 0;
+} heat_scene;
+
+static ID3D11ShaderResourceView *get_heat_scene(const Surface &destination)
+{
+    if (heat_scene.view && heat_scene.destination == destination.texture &&
+        heat_scene.serial == destination.content_serial && heat_scene.frame == surface_frame_serial)
+        return heat_scene.view.Get();
+    if (!snapshot_color(destination, heat_scene.texture, heat_scene.view)) return nullptr;
+    heat_scene.destination = destination.texture;
+    heat_scene.serial = destination.content_serial;
+    heat_scene.frame = surface_frame_serial;
+    return heat_scene.view.Get();
+}
+
+struct HeatCopy {
+    const uint8_t *scene = nullptr;
+    float transform[4] = {};
+    uint64_t frame = 0;
+};
+static std::unordered_map<const uint8_t *, HeatCopy> heat_copies;
+
+/* The title captures a crop of the screen, not necessarily the whole frame.
+ * Recover that crop's UV mapping so full-resolution refraction retains the
+ * animated mesh's warp (notably the rocket launcher's barrel heat). */
+static void remember_heat_copy(const Nv2aGpuDraw &state, const Nv2aGpuVertex *vertices, uint32_t count, bool trace)
+{
+    const auto &source = state.textures[0];
+    if (heat_haze_mode() != 2 || !state.color || !source.source || !source.linear ||
+        !screen_shaped(source.width, source.height) || state.width > 512 || state.height > 512 ||
+        !state.width || !state.height || count < 3 || count > 6 || !state.vertex_program || !state.vertex_constants ||
+        (state.stage_program & 31u) != 1 || (source.format != 0x12 && source.format != 0x1E)) return;
+    heat_copies.erase(state.color);
+    float work[192][4]; std::memcpy(work, state.vertex_constants, sizeof work);
+    float point[6][4];
+    for (uint32_t v = 0; v < count; v++) {
+        Nv2aCpuVertex out;
+        if (!nv_cpu_vertex_execute(state.vertex_program, state.vertex_valid, state.vertex_start,
+                                   vertices[v].attributes, work, &out) || out.output[9][3] == 0) return;
+        point[v][0] = out.output[0][0] / (float)state.width;
+        point[v][1] = out.output[0][1] / (float)state.height;
+        point[v][2] = out.output[9][0] / out.output[9][3] / (float)source.width;
+        point[v][3] = out.output[9][1] / out.output[9][3] / (float)source.height;
+        for (float value : point[v]) if (!nv_cpu_finite(value)) return;
+    }
+    for (uint32_t b = 1; b < count; b++) for (uint32_t c = b + 1; c < count; c++) {
+        float dx1 = point[b][0] - point[0][0], dy1 = point[b][1] - point[0][1];
+        float dx2 = point[c][0] - point[0][0], dy2 = point[c][1] - point[0][1];
+        float determinant = dx1 * dy2 - dx2 * dy1;
+        if (std::fabs(determinant) < 1e-6f) continue;
+        float du1 = point[b][2] - point[0][2], dv1 = point[b][3] - point[0][3];
+        float du2 = point[c][2] - point[0][2], dv2 = point[c][3] - point[0][3];
+        float sx = (du1 * dy2 - du2 * dy1) / determinant;
+        float sy = (dx1 * dv2 - dx2 * dv1) / determinant;
+        float cross_u = (dx1 * du2 - dx2 * du1) / determinant;
+        float cross_v = (dv1 * dy2 - dv2 * dy1) / determinant;
+        if (std::fabs(cross_u) > 1e-4f || std::fabs(cross_v) > 1e-4f || sx <= 0 || sy <= 0) return;
+        HeatCopy copy;
+        copy.scene = source.source; copy.frame = surface_frame_serial;
+        copy.transform[0] = sx; copy.transform[1] = sy;
+        copy.transform[2] = point[0][2] - sx * point[0][0];
+        copy.transform[3] = point[0][3] - sy * point[0][1];
+        if (heat_copies.size() >= 64) heat_copies.clear();
+        heat_copies[state.color] = copy;
+        if (trace)
+            std::fprintf(stderr,"[HEAT-CROP] %p scale %g,%g bias %g,%g\n",(const void *)state.color,sx,sy,copy.transform[2],copy.transform[3]);
+        return;
+    }
 }
 
 static ID3D11ShaderResourceView *default_white_view()
@@ -4363,6 +4435,75 @@ extern "C" void nv2a_gpu_set_anisotropy(int level)
 
 static bool make_sampler(const Nv2aGpuTexture &binding, ComPtr<ID3D11SamplerState> &result);
 
+/* Screen refraction particles, rather than bump-mapped water or materials:
+ * alpha-blended, no depth writes, reading a small rendered colour copy.
+ * Match the copy's live surface as well as its dimensions; a static texture
+ * of the same size must never be hidden by the heat-haze setting. */
+static uint32_t heat_haze_stages(const Nv2aGpuDraw &state)
+{
+    if (!state.color || !state.blend_enable || state.depth_mask ||
+        state.blend_source != 0x302 || state.blend_destination != 0x303 ||
+        state.topology != NV2A_GPU_TOPOLOGY_TRIANGLES) return 0;
+    uint32_t result = 0;
+    for (uint32_t stage = 1; stage < 4; stage++) {
+        uint32_t mode = (state.stage_program >> (stage * 5)) & 31u;
+        const auto &binding = state.textures[stage];
+        if ((mode != 6 && mode != 7) || binding.disabled || binding.shadow || binding.cube || binding.depth ||
+            !binding.source || !binding.width || !binding.height || binding.width > 512 || binding.height > 512 ||
+            (binding.format != 0x06 && binding.format != 0x07 && binding.format != 0x12 && binding.format != 0x1E)) continue;
+        for (const auto &surface : surfaces)
+            if (surface.memory == binding.source && surface.width == binding.width && surface.height == binding.height &&
+                surface.pitch == (binding.linear ? binding.pitch : binding.width * 4u)) {
+                result |= 1u << stage;
+                break;
+            }
+    }
+    return result;
+}
+
+/* This legacy black-ring layer exposes an opaque rectangular backdrop at
+ * the end of Turok's cube burst. Enhanced omits that layer, including its
+ * dark halo; the other burst particles and Xbox mode are retained. */
+static bool dark_matter_overlay(const Nv2aGpuDraw &state)
+{
+    const auto &binding = state.textures[0];
+    return heat_haze_mode() == 2 && state.depth_enable && !state.depth_mask &&
+        state.blend_enable && state.blend_source == 0x302 && state.blend_destination == 0x303 &&
+        binding.format == 0x0E && binding.width == 128 && binding.height == 128 &&
+        binding.source && binding.source_bytes >= 16384 &&
+        texture_hash(binding.source, 16384) == 0xAEC26B706124FAE3ull;
+}
+
+/* Preserve small cube ripples, but fade the screen-copy grid before it
+ * expands across the view and exposes its rectangular capture boundary. */
+static float heat_grid_strength(const Nv2aGpuDraw &state, const Nv2aGpuVertex *vertices, uint32_t count)
+{
+    if (count != 240 || state.stage_program != 0x1801 || state.combiners.control != 0x11102 ||
+        state.combiners.final_input[0] != 0x0E || state.combiners.final_input[1] != 0x1C80 ||
+        !state.vertex_program || !state.vertex_constants) return 1;
+    float work[192][4]; std::memcpy(work, state.vertex_constants, sizeof work);
+    Nv2aCpuVertex out;
+    if (!nv_cpu_vertex_execute(state.vertex_program, state.vertex_valid, state.vertex_start,
+                               vertices[0].attributes, work, &out)) return 1;
+    if (std::fabs(out.output[3][0] - 128.0f / 255.0f) >= 0.001f) return 1;
+    if (out.output[3][3] < 0.999f) return 0;
+    float low[2] = {out.output[0][0], out.output[0][1]}, high[2] = {low[0], low[1]};
+    for (uint32_t v = 0; v < count; v++) {
+        if (v && !nv_cpu_vertex_execute(state.vertex_program, state.vertex_valid, state.vertex_start,
+                                        vertices[v].attributes, work, &out)) return 0;
+        if (!(out.output[0][3] > 0)) return 0;
+        for (unsigned c = 0; c < 2; c++) {
+            if (!nv_cpu_finite(out.output[0][c])) return 0;
+            low[c] = std::min(low[c], out.output[0][c]); high[c] = std::max(high[c], out.output[0][c]);
+        }
+    }
+    float width = (float)state.width / (state.aa_scale_x ? state.aa_scale_x : 1u);
+    float height = (float)state.height / (state.aa_scale_y ? state.aa_scale_y : 1u);
+    if (!(width > 0 && height > 0)) return 1;
+    float extent = std::max((high[0] - low[0]) / width, (high[1] - low[1]) / height);
+    return std::max(0.0f, std::min(1.0f, (1.0f - extent) * 2.0f));
+}
+
 /* A texture whose texels offset a later stage's lookup (BUMPENVMAP, modes 6
  * and 7) read point-sampled: each texel moves a square of the screen by one
  * amount, so a heat haze (Turok Evolution's flamethrower: a 128x128 noise
@@ -4373,7 +4514,7 @@ static bool make_sampler(const Nv2aGpuTexture &binding, ComPtr<ID3D11SamplerStat
 static bool bump_source_smoothing(const Nv2aGpuDraw *state, uint32_t stage, const Nv2aGpuTexture &binding,
                                   Nv2aGpuTexture &smoothed)
 {
-    if (!heat_haze_mode()) return false;
+    if (heat_haze_mode() != 1 && heat_haze_mode() != 2) return false;
     bool source = false;
     for (uint32_t later = stage + 1; later < 4 && !source; later++) {
         uint32_t mode = (state->stage_program >> (later * 5)) & 31u;
@@ -4666,6 +4807,26 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         !state->width || !state->height || state->width > 4096 || state->height > 4096 ||
         (!depth_only && (state->pitch < state->width * 4 || state->bytes_per_pixel != 4)) ||
         (state->combiners.control & 255u) > 8 || !initialize_pipeline()) return 0;
+    uint32_t haze_stages = heat_haze_stages(*state);
+    static const bool heat_trace = std::getenv("RECOMP_HEAT_TRACE") != nullptr;
+    if (heat_trace && haze_stages) {
+        static unsigned shown;
+        if (shown++ < 16)
+            std::fprintf(stderr, "[HEAT] stages %X mode %d source %ux%u target %ux%u\n", haze_stages, heat_haze_mode(),
+                         state->textures[2].width, state->textures[2].height, state->width, state->height);
+
+    }
+    if (haze_stages && heat_haze_mode() == 3) return 1;  /* handled: suppress refraction, not fire/smoke */
+    if (dark_matter_overlay(*state)) {
+        dark_matter_frame = surface_frame_serial;
+        return 1;
+    }
+    /* Other explosions can use the same grid shape. Only apply the cube's
+     * size fade after identifying its unique dark overlay in this frame. */
+    bool cube_haze = haze_stages && count == 240 && dark_matter_frame == surface_frame_serial;
+    float grid_strength = cube_haze && heat_haze_mode() == 2 ? heat_grid_strength(*state, vertices, count) : 1;
+    if (grid_strength == 0) return 1;
+
     if (depth_only && !state->depth_enable && !state->stencil_enable) return 1;   /* nothing it can change */
     if (state->topology > NV2A_GPU_TOPOLOGY_POINTS) return reject("primitive topology");
     uint32_t primitive_width = state->topology == NV2A_GPU_TOPOLOGY_TRIANGLES ? 3u :
@@ -5047,7 +5208,21 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             if ((mode == 1 || mode == 2) && vertices[vertex].texture[stage][3] == 0) return reject("zero projective texture coordinate");
         }
         if (!binding.source_bytes) return reject("missing texture data");
-        views[stage] = get_texture(binding, surface ? *surface : no_color_target);
+        bool sharp_haze = (haze_stages & (1u << stage)) && heat_haze_mode() == 2 && surface;
+        auto heat_copy = heat_copies.find(binding.source);
+        bool mapped_haze = sharp_haze && heat_copy != heat_copies.end() &&
+            heat_copy->second.scene == surface->memory && heat_copy->second.frame == surface_frame_serial;
+        views[stage] = sharp_haze ? get_heat_scene(*surface) : get_texture(binding, surface ? *surface : no_color_target);
+        if (sharp_haze) {
+            /* Pixel centres sample the current full-resolution scene exactly
+             * when displacement reaches zero, instead of pasting the title's
+             * low-resolution, slightly shifted screen copy over each quad. */
+            constants.bump_luminance[stage][2] = 1.0f / surface->texture_width;
+            constants.bump_luminance[stage][3] = 1.0f / surface->texture_height;
+            if (mode == 6) constants.bump_luminance[stage][0] = grid_strength;
+            if (mapped_haze) std::memcpy(constants.heat_transform[stage], heat_copy->second.transform, sizeof heat_copy->second.transform);
+
+        }
         uint32_t shadow_func = binding.shadow_func;
         static const bool shadow_diag = std::getenv("RECOMP_SHADOW_DIAG") != nullptr;
         if (binding.shadow && shadow_diag) {
@@ -5094,7 +5269,9 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             (binding.shadow ? 64u | ((shadow_func & 7u) << 8) | (shadow_view_exact ? 4096u : 0u) |
                 (binding.format == 0x2A || binding.format == 0x2B || binding.format == 0x2E ||
                  binding.format == 0x2F ? 128u : 0u) |
-                (((binding.filter >> 24) & 15u) == 2u ? 2048u : 0u) : 0u));
+                 (((binding.filter >> 24) & 15u) == 2u ? 2048u : 0u) : 0u) |
+            (mapped_haze ? 8192u : 0u) | (sharp_haze && mode == 6 ? 16384u : 0u) |
+            (sharp_haze && cube_haze ? 32768u : 0u));
         if (sign_mask) signed_texture_stages++;
         switch (binding.format) {
         case 0x01: case 0x16: case 0x17: case 0x1A: case 0x1B: case 0x20: case 0x28: case 0x29:
@@ -5266,6 +5443,8 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     pending_draws = true;
     if (surface && (state->color_mask & 0x01010101u)) { if (writes) mark_written_region(*surface, region); }
     else gpu_timing.color_masked_draws++;
+    if (surface && haze_stages && heat_haze_mode() == 2 && heat_scene.destination == surface->texture)
+        heat_scene.serial = surface->content_serial;  /* these writes are the haze itself */
     bool stencil_writes = state->stencil_enable && (state->stencil_write_mask & 255u) &&
         (state->stencil_fail != 0x1E00 || state->stencil_depth_fail != 0x1E00 || state->stencil_pass != 0x1E00);
     if (depth && ((state->depth_enable && state->depth_mask) || stencil_writes) && writes) mark_written_region(*depth, region);

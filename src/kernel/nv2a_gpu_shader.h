@@ -30,6 +30,7 @@ cbuffer State : register(b0) {
  float4 lightSpotDirection[8];    /* xyz=direction, w=spot parameter */
  uint4 texgen[4]; uint4 textureMatrixEnable;
  uint4 windowClipControl; uint4 windowClipRects[8];
+ float4 heatTransform[4];
 };
 #ifndef NV_WINDOW_CLIP_MODE
 #define NV_WINDOW_CLIP_MODE windowClipControl.x
@@ -426,11 +427,34 @@ float4 texture_color_sign(float4 color,uint mask) {
  if(mask&1)color.a=2*color.a-1;
  return color;
 }
+/* Interpolate signed offsets after decoding each texel. Filtering their
+ * unsigned bytes first interpolates through 128 at the 255/0 wrap, turning
+ * a small left/right ripple into a full-strength jump. Gather uses the
+ * source sampler's addressing but leaves these four texels unfiltered. */
+float2 filtered_heat_offset(uint stage,float2 uv) {
+ float4 green,blue;uint width,height;
+ switch(stage) {
+ case 0:green=image0.GatherGreen(sampler0,uv);blue=image0.GatherBlue(sampler0,uv);image0.GetDimensions(width,height);break;
+ case 1:green=image1.GatherGreen(sampler1,uv);blue=image1.GatherBlue(sampler1,uv);image1.GetDimensions(width,height);break;
+ case 2:green=image2.GatherGreen(sampler2,uv);blue=image2.GatherBlue(sampler2,uv);image2.GetDimensions(width,height);break;
+ default:green=image3.GatherGreen(sampler3,uv);blue=image3.GatherBlue(sampler3,uv);image3.GetDimensions(width,height);break;
+ }
+ uint sign=TEXTURE_SIGN(stage);
+ if(sign&4)green=2*green-1;
+ else {green*=255;green=(green-256*step(128,green))/127;}
+ if(sign&8)blue=2*blue-1;
+ else {blue*=255;blue=(blue-256*step(128,blue))/127;}
+ float2 blend=frac(uv*float2(width,height)-0.5);
+ float2 bottom=lerp(float2(blue.w,green.w),float2(blue.z,green.z),blend.x);
+ float2 top=lerp(float2(blue.x,green.x),float2(blue.y,green.y),blend.x);
+ return lerp(bottom,top,blend.y);
+}
 PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
  float4 registers[16]; [unroll]for(uint index=0;index<16;index++)registers[index]=0;
  registers[4]=input.diffuse; registers[5]=input.specular; registers[3]=float4(fogColor.rgb,saturate(input.fog));
  float4 coordinates[4]={input.tex0,input.tex1,input.tex2,input.tex3};
  float dotValues[4]={0,0,0,0};
+ float hazeCoverage=1;
  [unroll]for(uint stage=0;stage<4;stage++) {
   uint mode=(NV_STAGE_PROGRAM>>(stage*5))&31;
   /* A stage with no texture reads (0,0,0,1). Not xemu's 0: Turok Evolution's
@@ -473,14 +497,41 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
         uint sourceSign=TEXTURE_SIGN(sourceStage);
         if(sourceSign&8)perturbation.x=registers[8+sourceStage].b;
         if(sourceSign&4)perturbation.y=registers[8+sourceStage].g;
-        uv=coordinate.xy+float2(dot(bumpMatrix[stage].xz,perturbation),dot(bumpMatrix[stage].yw,perturbation));
+        float2 displacement=float2(dot(bumpMatrix[stage].xz,perturbation),dot(bumpMatrix[stage].yw,perturbation));
+        uv=coordinate.xy+displacement;
+        if(bumpLuminance[stage].z>0 && bumpLuminance[stage].w>0) {
+         /* Explicit selection keeps FXC's generic shader from dynamically
+          * indexing an input-signature register. */
+         float4 sourceCoordinate=sourceStage==0?input.tex0:sourceStage==1?input.tex1:sourceStage==2?input.tex2:input.tex3;
+         float2 particleUV=sourceCoordinate.xy;
+         if(sourceCoordinate.w!=0)particleUV/=sourceCoordinate.w;
+         if(textureInfo[sourceStage].z!=0)particleUV/=textureInfo[sourceStage].xy;
+         perturbation=filtered_heat_offset(sourceStage,particleUV);
+         displacement=2*float2(dot(bumpMatrix[stage].xz,perturbation),dot(bumpMatrix[stage].yw,perturbation));
+         /* A rounded, feathered footprint avoids trading a hard square for
+          * a soft square. Both displacement and blend vanish at its border. */
+         float2 centred=particleUV*2-1;
+         float coverage=1-smoothstep(0.81,1,dot(centred,centred));
+         if(textureFlags&16384)coverage*=bumpLuminance[stage].x;
+         /* The combiner already applies particle alpha. Applying it again
+          * hides the rocket launcher's deliberately faint barrel haze. */
+         hazeCoverage*=coverage;
+         if(textureInfo[stage].z!=0)displacement/=textureInfo[stage].xy;
+         float2 screenUV=input.position.xy*bumpLuminance[stage].zw;
+         if(textureFlags&8192) {
+          float2 capturedUV=coordinate.xy;
+          if(textureInfo[stage].z!=0)capturedUV/=textureInfo[stage].xy;
+          float2 warpedUV=(capturedUV+displacement)*heatTransform[stage].xy+heatTransform[stage].zw;
+          uv=lerp(screenUV,warpedUV,coverage);
+         } else uv=screenUV+displacement*coverage;
+        }
      }
    if(mode==9)uv=float2(dotValues[stage-1],dotValues[stage]);
    if(mode==15 || mode==16) {
     uint sourceStage=stage==1?0:(textureControl.x>>(stage*4+8))&15;
     uv=mode==15?registers[8+sourceStage].ar:registers[8+sourceStage].gb;
    }
-   if(textureInfo[stage].z!=0)uv/=textureInfo[stage].xy;
+   if(textureInfo[stage].z!=0 && !(bumpLuminance[stage].z>0 && bumpLuminance[stage].w>0))uv/=textureInfo[stage].xy;
   float2 gradientX=ddx(uv),gradientY=ddy(uv);
   if(textureFlags&4)uv.x=saturate(uv.x);
   if(textureFlags&8)uv.y=saturate(uv.y);
@@ -587,10 +638,14 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
  registers[14]=specular+temporary; if(NV_FINAL1&0x80)registers[14]=saturate(registers[14]);
  registers[15]=mapped(registers,NV_FINAL1>>24,false)*mapped(registers,NV_FINAL1>>16,false);
  registers[14].a=0;registers[15].a=0;
- if(NV_FINAL0==0 && NV_FINAL1==0)return finish_pixel(registers[NV_STAGE_COUNT?12:4],input,frontFacing);
+ if(NV_FINAL0==0 && NV_FINAL1==0) {
+  float4 result=registers[NV_STAGE_COUNT?12:4];result.a*=hazeCoverage;
+  return finish_pixel(result,input,frontFacing);
+ }
  float4 aa=mapped(registers,NV_FINAL0>>24,false);
  float4 result=aa*mapped(registers,NV_FINAL0>>16,false)+(1-aa)*mapped(registers,NV_FINAL0>>8,false)+mapped(registers,NV_FINAL0,false);
  result.a=mapped(registers,NV_FINAL1>>8,true).x; result=saturate(result);
+ result.a*=hazeCoverage;
  return finish_pixel(result,input,frontFacing);
 }
 )HLSL";

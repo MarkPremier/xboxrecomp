@@ -45,7 +45,7 @@ void nv2a_gpu_set_texture_replacements(int on);
 void nv2a_gpu_set_anisotropy(int level);
 void nv2a_gpu_set_msaa(int samples);
 /* Heat haze: 0 as the console draws it, 1 smooth (bump offsets filtered), 2
- * sharp (smooth, and small screen-copy targets at the screen's density).
+ * enhanced (full-resolution refraction, feathered edges and fade), 3 off.
  * From the next flip; any thread. */
 void nv2a_gpu_set_heat_haze(int mode);
 void nv2a_gpu_set_shadow_scale(int factor);
