@@ -741,7 +741,6 @@ static std::vector<DepthSurface> depth_surfaces;
 static uint64_t surface_use_serial;
 static uint64_t surface_frame_serial = 1;   /* advances on every flip */
 static uint64_t target_content_serial;
-static uint64_t dark_matter_frame;
 static std::vector<CachedTexture> textures;
 /* Bind-time lookup is limited to entries with the same guest source address.
  * Rebuild after insertion, even when eviction keeps the cache size unchanged. */
@@ -4474,36 +4473,6 @@ static bool dark_matter_overlay(const Nv2aGpuDraw &state)
         texture_hash(binding.source, 16384) == 0xAEC26B706124FAE3ull;
 }
 
-/* Preserve small cube ripples, but fade the screen-copy grid before it
- * expands across the view and exposes its rectangular capture boundary. */
-static float heat_grid_strength(const Nv2aGpuDraw &state, const Nv2aGpuVertex *vertices, uint32_t count)
-{
-    if (count != 240 || state.stage_program != 0x1801 || state.combiners.control != 0x11102 ||
-        state.combiners.final_input[0] != 0x0E || state.combiners.final_input[1] != 0x1C80 ||
-        !state.vertex_program || !state.vertex_constants) return 1;
-    float work[192][4]; std::memcpy(work, state.vertex_constants, sizeof work);
-    Nv2aCpuVertex out;
-    if (!nv_cpu_vertex_execute(state.vertex_program, state.vertex_valid, state.vertex_start,
-                               vertices[0].attributes, work, &out)) return 1;
-    if (std::fabs(out.output[3][0] - 128.0f / 255.0f) >= 0.001f) return 1;
-    if (out.output[3][3] < 0.999f) return 0;
-    float low[2] = {out.output[0][0], out.output[0][1]}, high[2] = {low[0], low[1]};
-    for (uint32_t v = 0; v < count; v++) {
-        if (v && !nv_cpu_vertex_execute(state.vertex_program, state.vertex_valid, state.vertex_start,
-                                        vertices[v].attributes, work, &out)) return 0;
-        if (!(out.output[0][3] > 0)) return 0;
-        for (unsigned c = 0; c < 2; c++) {
-            if (!nv_cpu_finite(out.output[0][c])) return 0;
-            low[c] = std::min(low[c], out.output[0][c]); high[c] = std::max(high[c], out.output[0][c]);
-        }
-    }
-    float width = (float)state.width / (state.aa_scale_x ? state.aa_scale_x : 1u);
-    float height = (float)state.height / (state.aa_scale_y ? state.aa_scale_y : 1u);
-    if (!(width > 0 && height > 0)) return 1;
-    float extent = std::max((high[0] - low[0]) / width, (high[1] - low[1]) / height);
-    return std::max(0.0f, std::min(1.0f, (1.0f - extent) * 2.0f));
-}
-
 /* A texture whose texels offset a later stage's lookup (BUMPENVMAP, modes 6
  * and 7) read point-sampled: each texel moves a square of the screen by one
  * amount, so a heat haze (Turok Evolution's flamethrower: a 128x128 noise
@@ -4817,15 +4786,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
 
     }
     if (haze_stages && heat_haze_mode() == 3) return 1;  /* handled: suppress refraction, not fire/smoke */
-    if (dark_matter_overlay(*state)) {
-        dark_matter_frame = surface_frame_serial;
-        return 1;
-    }
-    /* Other explosions can use the same grid shape. Only apply the cube's
-     * size fade after identifying its unique dark overlay in this frame. */
-    bool cube_haze = haze_stages && count == 240 && dark_matter_frame == surface_frame_serial;
-    float grid_strength = cube_haze && heat_haze_mode() == 2 ? heat_grid_strength(*state, vertices, count) : 1;
-    if (grid_strength == 0) return 1;
+    if (dark_matter_overlay(*state)) return 1;
 
     if (depth_only && !state->depth_enable && !state->stencil_enable) return 1;   /* nothing it can change */
     if (state->topology > NV2A_GPU_TOPOLOGY_POINTS) return reject("primitive topology");
@@ -5219,7 +5180,6 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
              * low-resolution, slightly shifted screen copy over each quad. */
             constants.bump_luminance[stage][2] = 1.0f / surface->texture_width;
             constants.bump_luminance[stage][3] = 1.0f / surface->texture_height;
-            if (mode == 6) constants.bump_luminance[stage][0] = grid_strength;
             if (mapped_haze) std::memcpy(constants.heat_transform[stage], heat_copy->second.transform, sizeof heat_copy->second.transform);
 
         }
@@ -5270,8 +5230,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
                 (binding.format == 0x2A || binding.format == 0x2B || binding.format == 0x2E ||
                  binding.format == 0x2F ? 128u : 0u) |
                  (((binding.filter >> 24) & 15u) == 2u ? 2048u : 0u) : 0u) |
-            (mapped_haze ? 8192u : 0u) | (sharp_haze && mode == 6 ? 16384u : 0u) |
-            (sharp_haze && cube_haze ? 32768u : 0u));
+            (mapped_haze ? 8192u : 0u));
         if (sign_mask) signed_texture_stages++;
         switch (binding.format) {
         case 0x01: case 0x16: case 0x17: case 0x1A: case 0x1B: case 0x20: case 0x28: case 0x29:

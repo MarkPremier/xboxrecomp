@@ -512,7 +512,6 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
           * a soft square. Both displacement and blend vanish at its border. */
          float2 centred=particleUV*2-1;
          float coverage=1-smoothstep(0.81,1,dot(centred,centred));
-         if(textureFlags&16384)coverage*=bumpLuminance[stage].x;
          /* The combiner already applies particle alpha. Applying it again
           * hides the rocket launcher's deliberately faint barrel haze. */
          hazeCoverage*=coverage;
