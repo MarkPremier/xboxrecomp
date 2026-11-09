@@ -436,6 +436,10 @@ struct Surface {
     uint32_t clear_value;
     uint64_t last_used, content_serial, alias_copy_serial;
     uint64_t used_frame;   /* surface_frame_serial when last bound or sampled */
+    /* Without a snapshot: a hash of guest RAM when the GPU took the target
+     * over (it turned dirty), for abandoned_surface. */
+    uint64_t ram_print;
+    bool ram_print_valid;
     D3D11_BOX written_region;
     std::vector<uint64_t> written_mask;
     std::vector<uint8_t> source_snapshot;
@@ -473,6 +477,8 @@ struct DepthSurface {
     uint32_t clear_value;
     uint64_t last_used, content_serial;
     uint64_t used_frame;   /* as Surface */
+    uint64_t ram_print;    /* as Surface */
+    bool ram_print_valid;
     D3D11_BOX written_region;
     std::vector<uint64_t> written_mask;
     std::vector<uint8_t> source_snapshot;
@@ -1522,6 +1528,29 @@ static void mark_written_mask(SurfaceType &surface, const D3D11_BOX &region)
     }
 }
 
+static uint32_t target_bytes(const Surface &) { return 4; }
+static uint32_t target_bytes(const DepthSurface &surface) { return surface.format == 1 ? 2 : 4; }
+
+/* A hash of the guest RAM a target covers (FNV-1a over 8-byte words, the
+ * row's tail bytewise). */
+template<typename SurfaceType>
+static uint64_t ram_fingerprint(const SurfaceType &surface)
+{
+    uint64_t hash = 0xCBF29CE484222325ull;
+    size_t row_bytes = (size_t)surface.width * target_bytes(surface);
+    for (uint32_t row = 0; row < surface.height; row++) {
+        const uint8_t *bytes = surface.memory + (size_t)row * surface.pitch;
+        size_t at = 0;
+        for (; at + 8 <= row_bytes; at += 8) {
+            uint64_t word;
+            std::memcpy(&word, bytes + at, 8);
+            hash = (hash ^ word) * 0x100000001B3ull;
+        }
+        for (; at < row_bytes; at++) hash = (hash ^ bytes[at]) * 0x100000001B3ull;
+    }
+    return hash;
+}
+
 template<typename SurfaceType>
 static void mark_written_region(SurfaceType &surface, const D3D11_BOX &region)
 {
@@ -1529,6 +1558,10 @@ static void mark_written_region(SurfaceType &surface, const D3D11_BOX &region)
     if (!surface.dirty) {
         surface.written_region = region;
         surface.written_mask.clear();
+        /* What guest RAM holds as the GPU takes the target over, when there
+         * is no snapshot to say so: see abandoned_surface. */
+        surface.ram_print_valid = !surface.snapshot_valid;
+        if (surface.ram_print_valid) surface.ram_print = ram_fingerprint(surface);
     }
     else {
         auto &written = surface.written_region;
@@ -2179,6 +2212,10 @@ static void resize_targets(const char *why)
         UINT width, height;
         texture_size(surface.width, surface.height, true, width, height);
         if (width == surface.texture_width && height == surface.texture_height) { index++; continue; }
+        std::fprintf(stderr, "[GPU-D3D11]   colour %p %ux%u: %ux%u -> %ux%u, dirty %u snapshot %u, last drawn %llu frames ago\n",
+                     (const void *)surface.memory, surface.width, surface.height, surface.texture_width,
+                     surface.texture_height, width, height, (unsigned)surface.dirty, (unsigned)surface.snapshot_valid,
+                     (unsigned long long)(surface_frame_serial - surface.used_frame));
         resolve_color(surface);
         ComPtr<ID3D11ShaderResourceView> old = surface.view;
         surface.texture_width = width; surface.texture_height = height;
@@ -2194,6 +2231,10 @@ static void resize_targets(const char *why)
         UINT width, height;
         depth_texture_size(surface.memory, surface.width, surface.height, width, height);
         if (width == surface.texture_width && height == surface.texture_height) { index++; continue; }
+        std::fprintf(stderr, "[GPU-D3D11]   depth %p %ux%u format %u: %ux%u -> %ux%u, dirty %u snapshot %u, last drawn %llu frames ago\n",
+                     (const void *)surface.memory, surface.width, surface.height, surface.format, surface.texture_width,
+                     surface.texture_height, width, height, (unsigned)surface.dirty, (unsigned)surface.snapshot_valid,
+                     (unsigned long long)(surface_frame_serial - surface.used_frame));
         resolve_depth(surface);
         ComPtr<ID3D11ShaderResourceView> old = surface.sample_view;
         surface.texture_width = width; surface.texture_height = height;
@@ -2440,26 +2481,39 @@ static void wait_ordering_completion(void)
  * So a dirty surface not used for two frames whose guest RAM no longer holds
  * what was last published there belongs to someone else now: forget its GPU
  * content (the next use uploads RAM) rather than publish it. A live target is
- * used every frame and never reaches the comparison. */
+ * used every frame and never reaches the comparison.
+ *
+ * A target never published has no snapshot, and used to be published blind.
+ * Turok Evolution's 256x256 heat-haze copy is one: drawn and sampled on the
+ * GPU only, it was still dirty when the title quit to the front end, and the
+ * first full sync there wrote it over the menu's textures and heap (a white
+ * panel, black palm crowns, then a heap walk spinning forever). Such a target
+ * keeps a hash of guest RAM from when it turned dirty (mark_written_region),
+ * compared here instead. */
 template<typename SurfaceType>
 static bool abandoned_surface(SurfaceType &surface, uint32_t bytes)
 {
-    if (!surface.dirty || !surface.snapshot_valid || surface_frame_serial - surface.used_frame < 2) return false;
-    size_t row_bytes = (size_t)surface.width * bytes;
-    for (uint32_t row = 0; row < surface.height; row++)
-        if (std::memcmp(surface.memory + (size_t)row * surface.pitch,
-                        surface.source_snapshot.data() + (size_t)row * row_bytes, row_bytes)) {
-            static unsigned reported;
-            if (reported++ < 16)
-                std::fprintf(stderr, "[GPU-D3D11] %ux%u target %p reused by the title; not published\n",
-                             surface.width, surface.height, (const void *)surface.memory);
-            surface.dirty = false;
-            surface.clear_value_valid = false;
-            surface.snapshot_valid = false;
-            surface.needs_refresh = true;
-            return true;
-        }
-    return false;
+    if (!surface.dirty || surface_frame_serial - surface.used_frame < 2) return false;
+    bool reused = false;
+    if (surface.snapshot_valid) {
+        size_t row_bytes = (size_t)surface.width * bytes;
+        for (uint32_t row = 0; row < surface.height && !reused; row++)
+            reused = std::memcmp(surface.memory + (size_t)row * surface.pitch,
+                                 surface.source_snapshot.data() + (size_t)row * row_bytes, row_bytes) != 0;
+    } else if (surface.ram_print_valid) {
+        reused = ram_fingerprint(surface) != surface.ram_print;
+    }
+    if (!reused) return false;
+    static unsigned reported;
+    if (reported++ < 16)
+        std::fprintf(stderr, "[GPU-D3D11] %ux%u target %p reused by the title; not published\n",
+                     surface.width, surface.height, (const void *)surface.memory);
+    surface.dirty = false;
+    surface.clear_value_valid = false;
+    surface.snapshot_valid = false;
+    surface.ram_print_valid = false;
+    surface.needs_refresh = true;
+    return true;
 }
 
 static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_bytes = 0)
@@ -2493,6 +2547,34 @@ static void gpu_sync_impl(bool publish, const void *only = nullptr, size_t only_
     }
     for (auto &surface : surfaces) abandoned_surface(surface, 4);
     for (auto &surface : depth_surfaces) abandoned_surface(surface, surface.format == 1 ? 2 : 4);
+    {
+        /* Diagnostic (the menu that came back white after a heat haze change):
+         * a dirty target the title has not drawn for two frames, with no
+         * snapshot or RAM hash for abandoned_surface to compare, is published without
+         * knowing whether its memory still belongs to it. */
+        static unsigned blind;
+        for (auto &surface : surfaces)
+            if (blind < 48 && surface.dirty && !surface.snapshot_valid && !surface.ram_print_valid && wanted(surface) &&
+                    surface_frame_serial - surface.used_frame >= 2) {
+                blind++;
+                std::fprintf(stderr, "[GPU-D3D11] publishing colour %p %ux%u unchecked: last drawn %llu frames ago%s %08X\n",
+                             (const void *)surface.memory, surface.width, surface.height,
+                             (unsigned long long)(surface_frame_serial - surface.used_frame),
+                             surface.clear_value_valid ? ", a clear of" : ", content; first word",
+                             surface.clear_value_valid ? surface.clear_value : *(const uint32_t *)surface.memory);
+            }
+        if (!only && publish_depth())
+            for (auto &surface : depth_surfaces)
+                if (blind < 48 && surface.dirty && !surface.snapshot_valid && !surface.ram_print_valid &&
+                        surface_frame_serial - surface.used_frame >= 2) {
+                    blind++;
+                    std::fprintf(stderr, "[GPU-D3D11] publishing depth %p %ux%u format %u unchecked: last drawn %llu frames ago%s %08X\n",
+                                 (const void *)surface.memory, surface.width, surface.height, surface.format,
+                                 (unsigned long long)(surface_frame_serial - surface.used_frame),
+                                 surface.clear_value_valid ? ", a clear of" : "; RAM's first word",
+                                 surface.clear_value_valid ? surface.clear_value : *(const uint32_t *)surface.memory);
+                }
+    }
     ID3D11RenderTargetView *empty = nullptr;
     context->OMSetRenderTargets(1, &empty, nullptr);
     bool has_readback = false;
@@ -3905,6 +3987,20 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
         nv2a_gpu_surface_publish(binding.source, binding.source_bytes);
     }
     if (direct) {
+        if (LONG capture = g_nv2a_capture_active) {
+            /* Diagnostic: during an F11 capture, each texture sampled from a
+             * target's GPU copy rather than from guest RAM, once. */
+            static LONG listed_capture;
+            static std::set<const uint8_t *> listed;
+            if (listed_capture != capture) { listed_capture = capture; listed.clear(); }
+            if (listed.insert(direct->memory).second)
+                std::fprintf(stderr, "[GPU-D3D11] capture %ld: texture %p %ux%u format %X read from its target "
+                             "(texture %ux%u, dirty %u snapshot %u, last drawn %llu frames ago)\n",
+                             capture, (const void *)direct->memory, direct->width, direct->height, binding.format,
+                             direct->texture_width, direct->texture_height, (unsigned)direct->dirty,
+                             (unsigned)direct->snapshot_valid,
+                             (unsigned long long)(surface_frame_serial - direct->used_frame));
+        }
         direct->last_used = ++surface_use_serial;
         if (cloak_debug())
             std::fprintf(stderr, "[CLOAKDBG] direct src=%p %ux%u fmt=%X linear=%u pitch=%u; surf %ux%u pitch=%u dirty=%u needs_refresh=%u snapshot_valid=%u\n",

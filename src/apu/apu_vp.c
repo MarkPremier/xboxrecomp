@@ -226,13 +226,20 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
      * thread was issuing -- retiring a voice the game was tearing down
      * (Turok Evolution: crash in sub_001B34BF under ISR 0x1B29D8). A second
      * idle voice waits for the next frame's list walk instead; it is still
-     * in the list, so nothing is lost. */
+     * in the list, so nothing is lost.
+     *
+     * The pair is written only by the trap itself (SE2FE_IDLE_VOICE below),
+     * which is the only time the ISR reads it (sub_001B28BB checks FECTL's
+     * trap reason first). Every method used to record itself there unless it
+     * saw the front end trapped, but the title's methods arrive on its own
+     * thread, without the APU lock, while the frame thread's list walk traps:
+     * one that checked just before the trap and wrote just after it left
+     * IDLE_VOICE paired with the title's argument. The ISR then retired
+     * whichever voice that argument named -- one still playing -- onto
+     * DirectSound's finished list; the title freed it later, and the DPC's
+     * drain (sub_001B22DA) called through the reused memory. */
     if (trapped && method == SE2FE_IDLE_VOICE)
         return;
-    if (!trapped) {
-        d->regs[NV_PAPU_FEDECMETH] = method;
-        d->regs[NV_PAPU_FEDECPARAM] = argument;
-    }
     unsigned int selected_handle, list;
 
     switch (method) {
@@ -559,10 +566,14 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case SE2FE_IDLE_VOICE:
         if (d->regs[NV_PAPU_FETFORCE1] & NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE) {
-            d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FEMETHMODE;
-            d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
-            d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
-            d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
+            /* The pair first, then the trap that makes the ISR read it, in
+             * one store that is also a barrier (see the top of fe_method). */
+            uint32_t fectl = d->regs[NV_PAPU_FECTL];
+            fectl &= ~(NV_PAPU_FECTL_FEMETHMODE | NV_PAPU_FECTL_FETRAPREASON);
+            fectl |= NV_PAPU_FECTL_FEMETHMODE_TRAPPED | NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
+            d->regs[NV_PAPU_FEDECMETH] = method;
+            d->regs[NV_PAPU_FEDECPARAM] = argument;
+            InterlockedExchange((volatile LONG *)&d->regs[NV_PAPU_FECTL], (LONG)fectl);
             d->set_irq = true;
         }
         break;
@@ -1411,9 +1422,33 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 }
             }
 
+            /* A voice the title has locked is one it is in the middle of
+             * changing, and VOICE_ON is one: it locks the voice, links it in
+             * as the list's top and only then sets ACTIVE_VOICE, on the
+             * title's thread while this walk runs. Seen in between, a voice
+             * being started read as idle, and the ISR retired it -- a playing
+             * voice on DirectSound's finished list, freed later while still
+             * there. In xemu the method and the walk share a lock; here the
+             * lock bit is read first (both lock operations are interlocked),
+             * so an unlocked voice's ACTIVE_VOICE is the method's final word.
+             * A locked idle voice is reported on a later frame. */
+            bool locked_now = is_voice_locked(d, v);
+            MemoryBarrier();
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                fe_method(d, SE2FE_IDLE_VOICE, v);
+                /* Frames each voice has sat idle but locked: a title that
+                 * held the lock while waiting for this report would wait for
+                 * good, and that should show (once a second is 188 frames). */
+                static uint16_t locked_idle_frames[MCPX_HW_MAX_VOICES];
+                if (!locked_now) {
+                    locked_idle_frames[v] = 0;
+                    fe_method(d, SE2FE_IDLE_VOICE, v);
+                } else if (++locked_idle_frames[v] == 188) {
+                    static unsigned reported;
+                    if (reported++ < 16)
+                        fprintf(stderr, "[APU] voice %u has been idle and locked for a second;"
+                                        " its idle report waits for the unlock\n", v);
+                }
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);

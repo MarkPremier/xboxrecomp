@@ -433,6 +433,9 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
  float dotValues[4]={0,0,0,0};
  [unroll]for(uint stage=0;stage<4;stage++) {
   uint mode=(NV_STAGE_PROGRAM>>(stage*5))&31;
+  /* A stage with no texture reads (0,0,0,1). Not xemu's 0: Turok Evolution's
+   * heat ripples (the dark matter explosion's quads take diffuse alpha times
+   * an unused t1's) vanish with alpha 0, and they show on the console. */
   float4 coordinate=coordinates[stage]; float4 value=float4(0,0,0,1);
   if(mode==4)value=coordinate;
   if(mode==9 || mode==11 || mode==12 || mode==14 || mode==17 || mode==18) {
