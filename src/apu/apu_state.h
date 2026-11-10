@@ -416,6 +416,18 @@ struct MCPXAPUState {
         void *stream; /* SDL_AudioStream* - stubbed */
         int queued_bytes_low, queued_bytes_high;
     } monitor;
+
+    /* GP/EP scratch and FIFO page bindings. A physical page number can name
+     * different ordinary/contiguous backing in the host; retain the bank the
+     * SGE described, rather than retarget DMA when graphics later allocates
+     * the same numeric offset. Only the APU frame thread mutates these. */
+    struct {
+        hwaddr table;
+        uint32_t epoch, count;
+        uint32_t *physical;
+        uint8_t **host;
+    } dsp_dma_pages[4];
+    uint32_t dsp_dma_epoch[4]; /* register writers invalidate without freeing */
 };
 
 /* ============================================================
@@ -430,6 +442,7 @@ void mcpx_apu_vp_reset(MCPXAPUState *d);
 
 /* DSP functions */
 void mcpx_apu_dsp_init(MCPXAPUState *d);
+void mcpx_apu_dsp_dma_finalize(MCPXAPUState *d);
 void mcpx_apu_dsp_ack_frame(MCPXAPUState *d);
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);

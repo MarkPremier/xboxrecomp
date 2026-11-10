@@ -397,6 +397,16 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         ds_stl(d->regs[NV_PAPU_FEMEMADDR], (uint32_t)val);
         qatomic_set(&d->regs[addr], (uint32_t)val);
         break;
+    case NV_PAPU_GPSADDR:
+    case NV_PAPU_EPSADDR:
+    case NV_PAPU_GPFADDR:
+    case NV_PAPU_EPFADDR: {
+        unsigned slot = addr == NV_PAPU_GPSADDR ? 0 : addr == NV_PAPU_EPSADDR ? 1 :
+                        addr == NV_PAPU_GPFADDR ? 2 : 3;
+        qatomic_set(&d->regs[addr], (uint32_t)val);
+        qatomic_fetch_add(&d->dsp_dma_epoch[slot], 1);
+        break;
+    }
     default:
         if (addr < 0x20000) {
             qatomic_set(&d->regs[addr], (uint32_t)val);
@@ -1029,6 +1039,7 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
     qemu_mutex_unlock(&d->lock);
 
     qemu_thread_join(&d->apu_thread);
+    mcpx_apu_dsp_dma_finalize(d);
     mcpx_apu_vp_finalize(d);
     mcpx_apu_monitor_finalize(d);
 

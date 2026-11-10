@@ -239,6 +239,22 @@ Offset      Name                   Description
 
 Full register definitions in `apu_regs.h`.
 
+## DSP page ownership (Serious Sam)
+
+GP/EP scratch and FIFO tables may contain both contiguous program pages and
+ordinary-RAM effects buffers. The host's two banks can share a physical page
+number. Resolving every transfer through the currently live contiguous block
+redirected Sam's audio effects into later model textures, producing corrupted
+pants. Native write watchpoints identified `scatter_gather_rw` as the writer.
+
+Each of the four DSP tables now retains the backing selected by the physical
+mapper when its pages are registered. Growing a table preserves existing
+bindings; changing a descriptor rebinds that page. Rewriting a table-base
+register invalidates its bindings on the APU thread, and shutdown frees them
+after that thread joins. Voice/control-structure and sample routing policies
+are unchanged. `serious_sam/tests/apu_dma_test.c` exercises mixed banks,
+collisions, partial pages, growth, descriptor replacement and re-registration.
+
 ## Dependencies
 
 - `qemu_shim.h` (from `../nv2a/`) — QEMU type abstraction layer

@@ -327,7 +327,61 @@ static void apu_dma_tripwire(uint32_t guest, size_t len)
     n++;
 }
 
-static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
+void mcpx_apu_dsp_dma_finalize(MCPXAPUState *d)
+{
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        free(d->dsp_dma_pages[slot].physical);
+        free(d->dsp_dma_pages[slot].host);
+        memset(&d->dsp_dma_pages[slot], 0, sizeof(d->dsp_dma_pages[slot]));
+    }
+}
+
+static uint8_t *dsp_page_backing(MCPXAPUState *d, uint32_t physical)
+{
+    if (!physical || (physical & (TARGET_PAGE_SIZE - 1))) return NULL;
+    /* Sam's effects buffers can be ordinary RAM. The generic scratch resolver
+     * pins any live contiguous allocation at this offset, even an unrelated
+     * model texture allocated much later. Resolve provenance when the SGE is
+     * installed, and keep that binding through subsequent bank retags. */
+    return d->physical_mapper ? d->physical_mapper(physical, TARGET_PAGE_SIZE)
+                              : dsp_dma_address(physical, TARGET_PAGE_SIZE);
+}
+
+static bool dsp_bind_pages(MCPXAPUState *d, unsigned slot, hwaddr table, uint32_t last)
+{
+    if (slot >= 4 || last >= 32768) return false;
+    uint32_t count = last + 1, epoch = qatomic_read(&d->dsp_dma_epoch[slot]);
+    if (d->dsp_dma_pages[slot].table != table || d->dsp_dma_pages[slot].epoch != epoch) {
+        free(d->dsp_dma_pages[slot].physical); free(d->dsp_dma_pages[slot].host);
+        memset(&d->dsp_dma_pages[slot], 0, sizeof(d->dsp_dma_pages[slot]));
+        d->dsp_dma_pages[slot].table = table;
+        d->dsp_dma_pages[slot].epoch = epoch;
+    }
+    if (d->dsp_dma_pages[slot].count == count) return true;
+    uint32_t *physical = calloc(count, sizeof(*physical));
+    uint8_t **host = calloc(count, sizeof(*host));
+    if (!physical || !host) { free(physical); free(host); return false; }
+    uint32_t keep = d->dsp_dma_pages[slot].count;
+    if (keep > count) keep = count;
+    if (keep) {
+        memcpy(physical, d->dsp_dma_pages[slot].physical, keep * sizeof(*physical));
+        memcpy(host, d->dsp_dma_pages[slot].host, keep * sizeof(*host));
+    }
+    /* Bind newly registered pages together, before later graphics allocations
+     * can reuse their numeric offsets. Growing the table must not unpin the
+     * GP program/control pages which were already in use. */
+    for (uint32_t page = keep; page < count; ++page) {
+        physical[page] = ldl_le_phys(address_space_memory, table + (hwaddr)page * 8);
+        host[page] = dsp_page_backing(d, physical[page]);
+    }
+    free(d->dsp_dma_pages[slot].physical); free(d->dsp_dma_pages[slot].host);
+    d->dsp_dma_pages[slot].physical = physical;
+    d->dsp_dma_pages[slot].host = host;
+    d->dsp_dma_pages[slot].count = count;
+    return true;
+}
+
+static void scatter_gather_rw(MCPXAPUState *d, unsigned slot, hwaddr sge_base,
                               unsigned int max_sge, uint8_t *ptr, uint32_t addr,
                               size_t len, bool dir)
 {
@@ -335,7 +389,10 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
     unsigned int offset_in_page = addr % TARGET_PAGE_SIZE;
     unsigned int bytes_to_copy = TARGET_PAGE_SIZE - offset_in_page;
 
-    (void)d;
+    if (!dsp_bind_pages(d, slot, sge_base, max_sge)) {
+        if (!dir) memset(ptr, 0, len);
+        return;
+    }
 
     while (len > 0) {
         /* Past the end of the page table: xemu asserts here. Writes are
@@ -360,8 +417,16 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
         /* Only the bytes copied from this page: a whole page from a mid-page
          * offset reaches into the next physical page, which need not be
          * stored with this one -- the lookup then fails and the APU aborts. */
-        uint8_t *guest = dsp_dma_address(prd_address + offset_in_page,
-                                         bytes_to_copy);
+        if (d->dsp_dma_pages[slot].physical[page_entry] != prd_address) {
+            d->dsp_dma_pages[slot].physical[page_entry] = prd_address;
+            d->dsp_dma_pages[slot].host[page_entry] = dsp_page_backing(d, prd_address);
+        }
+        uint8_t *page = d->dsp_dma_pages[slot].host[page_entry];
+        if (!page) {
+            if (!dir) memset(ptr, 0, len);
+            return;
+        }
+        uint8_t *guest = page + offset_in_page;
 
         /* Diagnostic: force DSP payload writes to ordinary RAM instead of the
          * contiguous redirect, to test whether the write to the window is what
@@ -470,7 +535,7 @@ static void gp_scratch_rw(void *opaque, uint8_t *ptr, uint32_t addr, size_t len,
     MCPXAPUState *d = opaque;
     if (dir) surround_capture(d, ptr, addr, len);
     scratch_trace(d, "GP", d->regs[NV_PAPU_GPSADDR], addr, len, dir);
-    scatter_gather_rw(d, d->regs[NV_PAPU_GPSADDR], d->regs[NV_PAPU_GPSMAXSGE],
+    scatter_gather_rw(d, 0, d->regs[NV_PAPU_GPSADDR], d->regs[NV_PAPU_GPSMAXSGE],
                       ptr, addr, len, dir);
 }
 
@@ -480,7 +545,7 @@ static void ep_scratch_rw(void *opaque, uint8_t *ptr, uint32_t addr, size_t len,
     s_dsp_dma_count[1]++;
     MCPXAPUState *d = opaque;
     scratch_trace(d, "EP", d->regs[NV_PAPU_EPSADDR], addr, len, dir);
-    scatter_gather_rw(d, d->regs[NV_PAPU_EPSADDR], d->regs[NV_PAPU_EPSMAXSGE],
+    scatter_gather_rw(d, 1, d->regs[NV_PAPU_EPSADDR], d->regs[NV_PAPU_EPSMAXSGE],
                       ptr, addr, len, dir);
 }
 
@@ -503,7 +568,7 @@ static bool fifo_empty_range(MCPXAPUState *d, const char *dsp, bool dir, unsigne
     return true;
 }
 
-static uint32_t circular_scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
+static uint32_t circular_scatter_gather_rw(MCPXAPUState *d, unsigned slot, hwaddr sge_base,
                                            unsigned int max_sge, uint8_t *ptr,
                                            uint32_t base, uint32_t end,
                                            uint32_t cur, size_t len, bool dir)
@@ -520,7 +585,7 @@ static uint32_t circular_scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
                 dir ? "write" : "read", base, end, cur, bytes_to_copy, len);
 
         assert((cur >= base) && ((cur + bytes_to_copy) <= end));
-        scatter_gather_rw(d, sge_base, max_sge, ptr, cur, bytes_to_copy, dir);
+        scatter_gather_rw(d, slot, sge_base, max_sge, ptr, cur, bytes_to_copy, dir);
 
         ptr += bytes_to_copy;
         len -= bytes_to_copy;
@@ -572,7 +637,7 @@ static void gp_fifo_rw(void *opaque, uint8_t *ptr, unsigned int index,
         cur = base;
     }
 
-    cur = circular_scatter_gather_rw(d,
+    cur = circular_scatter_gather_rw(d, 2,
         d->regs[NV_PAPU_GPFADDR], d->regs[NV_PAPU_GPFMAXSGE],
         ptr, base, end, cur, len, dir);
 
@@ -639,7 +704,7 @@ static void ep_fifo_rw(void *opaque, uint8_t *ptr, unsigned int index,
         cur = base;
     }
 
-    cur = circular_scatter_gather_rw(d,
+    cur = circular_scatter_gather_rw(d, 3,
         d->regs[NV_PAPU_EPFADDR], d->regs[NV_PAPU_EPFMAXSGE],
         ptr, base, end, cur, len, dir);
 
