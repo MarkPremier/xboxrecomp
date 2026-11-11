@@ -2305,14 +2305,22 @@ class Lifter:
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
-        cnt = _fmt_operand_read(ops[1])
+        if ops[1].type == "imm" and (ops[1].imm & 31) == 0:
+            return [f"/* {insn.mnemonic}: masked count zero, value and flags unchanged */"]
+        cnt = (str(ops[1].imm & 31) if ops[1].type == "imm" else
+               f"((uint32_t)({_fmt_operand_read(ops[1])}) & 31u)")
         out = []
         if self.needs_cf:
             w = (_operand_width(ops[0]) or 4) * 8
             # CF is the last bit shifted out; a zero count leaves CF alone.
             bit = f"({cnt}) - 1" if c_op == ">>" else f"{w} - ({cnt})"
-            out.append(f"if ({cnt}) _cf = (int)((({dst}) >> ({bit})) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"{dst} {c_op} {cnt}"))
+            # Narrow left shifts past the width have undefined hardware CF;
+            # choose zero without creating a negative C shift count.
+            carry = f"(((uint32_t)({dst}) >> ({bit})) & 1u)"
+            if c_op == "<<" and w < 32:
+                carry = f"(({cnt}) <= {w} ? {carry} : 0u)"
+            out.append(f"if ({cnt}) _cf = (int)({carry});")
+        out.append(_fmt_operand_write(ops[0], f"(uint32_t)({dst}) {c_op} {cnt}"))
         out.append(self._result_snapshot(ops, "shift"))
         return out
 
@@ -4254,6 +4262,9 @@ def lift_basic_block(lifter, bb, flag_state=None):
             last_flag_ops = list(curr.operands)
         elif curr.mnemonic in _SSE_CMP_NAMED:
             pass  # SSE compares write a mask, not EFLAGS
+        elif (curr.mnemonic in ("shl", "sal", "shr") and curr.operands
+              and curr.operands[-1].type == "imm" and (curr.operands[-1].imm & 31) == 0):
+            pass  # A masked zero-count shift does not replace the incoming flags.
         elif curr.mnemonic in FLAG_SETTERS:
             last_flag_setter, last_flag_ops = normalise_zero_test(
                 curr.mnemonic, list(curr.operands))
