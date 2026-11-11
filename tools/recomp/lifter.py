@@ -572,7 +572,7 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # The MSVC CPUID-support probe is `pushfd; pop eax; xor eax,0x200000;
     # push eax; popfd; pushfd; pop eax; ...; cmp eax,ebx; je` -- with popfd a
     # no-op the two words were always equal and cpuid was never reached.
-    if flag_setter == "popfd":
+    if flag_setter in ("popfd", "sahf"):
         cf = "(g_eflags & 0x1u) != 0"
         pf = "(g_eflags & 0x4u) != 0"
         zf = "(g_eflags & 0x40u) != 0"
@@ -637,7 +637,7 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
-                        "fucomip", "fcomi", "sahf"):
+                        "fucomip", "fcomi"):
         # g_fp_cmp is -1 less, 0 equal, 1 greater, 2 unordered. An
         # unordered compare sets ZF, PF and CF all three, so it reads as
         # below AND equal AND parity. Comparing g_fp_cmp against 0 made 2 look
@@ -1689,7 +1689,18 @@ class Lifter:
         if m == "lahf":
             return ["/* lahf - load AH from flags (used in FPU compare idiom) */"]
         if m == "sahf":
-            return ["/* sahf - store AH to flags */"]
+            # SAHF reads AH, not the last floating-point comparison. FPREM
+            # changes C2 without comparing, and FNSTSW exposes that new bit.
+            # Snapshot AH so later writes to EAX cannot change these flags.
+            out = []
+            fs, fo = self.last_flag_setter, self.last_flag_ops
+            if fs and fs not in ("popfd", "sahf"):
+                overflow = _make_condition("jo", fs, fo)
+                if overflow:
+                    out.append(f"g_eflags = (g_eflags & ~0x800u) | "
+                               f"(({overflow[0]}) ? 0x800u : 0u); /* OF preserved by sahf */")
+            out.append("g_eflags = (g_eflags & ~0xD5u) | (HI8(eax) & 0xD5u) | 0x2u; /* sahf */")
+            return out
         if m == "shld":
             return self._lift_shld(insn, ops)
         if m == "shrd":
@@ -3907,7 +3918,8 @@ class Lifter:
             # fprem truncates toward zero, fprem1 rounds to nearest (IEEE), which
             # is the difference between fmod and remainder.
             fn = "fmod" if m == "fprem" else "remainder"
-            return [f"fp_top() = {fn}(fp_top(), fp_st1()); /* {m} */"]
+            return [f"fp_top() = {fn}(fp_top(), fp_st1());"
+                    f" g_fp_cc &= (uint16_t)~0x0400u; /* {m}: complete, clear C2 */"]
         if m == "fscale":
             return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
         if m == "frndint":

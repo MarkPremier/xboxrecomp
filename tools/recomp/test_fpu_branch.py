@@ -43,6 +43,7 @@ class _Op:
 
 class _Insn:
     def __init__(self, mnemonic, operands, op_str=""):
+        self.address = 0
         self.mnemonic = mnemonic
         self.operands = operands
         self.op_str = op_str

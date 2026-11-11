@@ -48,4 +48,5 @@ class FpuUnorderedTest(unittest.TestCase):
         self.assertIn("g_fp_cmp == 1", ja)
         self.assertNotIn(">", ja)
         self.assertIn("g_fp_cmp == 2", jb)
-        self.assertIn("g_fp_cmp == 2", jp)
+        self.assertIn("g_eflags & 0x4u", jp)
+        self.assertNotIn("g_fp_cmp", jp)
