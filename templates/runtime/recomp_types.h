@@ -319,6 +319,18 @@ static inline uint16_t recomp_fxam(double value) {
          value == 0.0 ? 0x4000u : 0x0400u));
 }
 
+/* Trig instructions report failed range reduction through C2 and do not
+ * change ST(0) or push a second result in that case. Completed operations
+ * must clear C2, even when it was set by an earlier FXAM/compare. */
+static inline int recomp_trig_ready(double value) {
+    if (isfinite(value) && fabs(value) >= 0x1p63) {
+        g_fp_cc |= 0x0400u;
+        return 0;
+    }
+    g_fp_cc &= (uint16_t)~0x0400u;
+    return 1;
+}
+
 /* Result of an x87 compare, in the shape the status word wants:
  *   -1 less, 0 equal, 1 greater, 2 unordered (either operand is NaN).
  * The unordered case is not a curiosity: `fucompp` of a value with itself

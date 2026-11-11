@@ -3888,18 +3888,19 @@ class Lifter:
         # real x87 are not reproduced -- fp_stack is double -- which is the same
         # approximation every other op here already makes.
         if m == "fsin":
-            return [f"fp_top() = sin(fp_top()); /* fsin */"]
+            return ["if (recomp_trig_ready(fp_top())) fp_top() = sin(fp_top()); /* fsin */"]
         if m == "fcos":
-            return [f"fp_top() = cos(fp_top()); /* fcos */"]
+            return ["if (recomp_trig_ready(fp_top())) fp_top() = cos(fp_top()); /* fcos */"]
         if m == "fsincos":
             # Replaces st0 with sin, then pushes cos. Order matters: the push
             # must see the sine already stored.
-            return [f"{{ double _a = fp_top(); fp_top() = sin(_a);"
+            return [f"if (recomp_trig_ready(fp_top())) {{ double _a = fp_top(); fp_top() = sin(_a);"
                     f" fp_push(cos(_a)); }} /* fsincos */"]
         if m == "fptan":
             # st0 = tan(st0), then push 1.0. The constant push is not decoration:
             # callers use it as the denominator of a subsequent fdiv.
-            return [f"{{ fp_top() = tan(fp_top()); fp_push(1.0); }} /* fptan */"]
+            return ["if (recomp_trig_ready(fp_top())) { double _a = tan(fp_top());"
+                    " fp_top() = _a; fp_push(isnan(_a) ? _a : 1.0); } /* fptan */"]
         if m == "fpatan":
             # st1 = atan2(st1, st0), pop. Argument order is st1 over st0.
             return [f"{{ fp_st1() = atan2(fp_st1(), fp_top()); fp_pop(); }}"
