@@ -3922,7 +3922,7 @@ class Lifter:
             return [f"fp_top() = {fn}(fp_top(), fp_st1());"
                     f" g_fp_cc &= (uint16_t)~0x0400u; /* {m}: complete, clear C2 */"]
         if m == "fscale":
-            return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
+            return [f"fp_top() = recomp_fscale(fp_top(), fp_st1()); /* fscale */"]
         if m == "frndint":
             # Rounds under the guest's x87 RC bits, like FIST. rint() used the
             # host's rounding mode, which the guest's fldcw never reaches, so

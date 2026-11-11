@@ -60,6 +60,7 @@
  * CMakeLists) -- MSVC's C4013 was emitted and discarded. Same failure as the
  * missing stdlib.h in kernel_bridge.c, in a hotter path. */
 #include <math.h>
+#include <limits.h>
 #include <fenv.h>
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
 #include <xmmintrin.h>
@@ -329,6 +330,21 @@ static inline int recomp_trig_ready(double value) {
     }
     g_fp_cc &= (uint16_t)~0x0400u;
     return 1;
+}
+
+/* FSCALE truncates the exponent toward zero, independently of RC. Bound it
+ * before converting to int: a large positive exponent must overflow upward,
+ * rather than becoming INT_MIN (or invoking an undefined C conversion). */
+static inline double recomp_fscale(double value, double exponent) {
+    int shift;
+    if (isnan(value) || isnan(exponent)) return value + exponent;
+    if (isinf(exponent)) {
+        if (exponent > 0.0) return value == 0.0 ? NAN : copysign(INFINITY, value);
+        return isinf(value) ? NAN : copysign(0.0, value);
+    }
+    shift = exponent >= (double)INT_MAX ? INT_MAX :
+            exponent <= (double)INT_MIN ? INT_MIN : (int)exponent;
+    return ldexp(value, shift);
 }
 
 /* Result of an x87 compare, in the shape the status word wants:
