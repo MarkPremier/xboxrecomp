@@ -3783,6 +3783,30 @@ static void raster_batch(void)
                     s_gpu.polygon_offset_enable, s_gpu.polygon_offset_scale, s_gpu.polygon_offset_bias,
                     s_gpu.color_mask, s_gpu.depth_offset & 0x0FFFFFFFu, s_gpu.control0,
                     (s_gpu.control0 & 0x10000u) ? " w-buffer" : "");
+            /* Multiplicative shadow quads need all corners in an F11 capture:
+             * the first vertex alone cannot expose a near-plane crossing,
+             * zero intensity, or a shadow projected underneath its receiver. */
+            if (s_gpu.blend_enable && s_gpu.blend_sfactor == 0 &&
+                s_gpu.blend_dfactor == 0x301 && s_gpu.prim == NV_PRIM_QUADS) {
+                uint32_t v;
+                fprintf(info_out, "[BINFO]   shadow composite %04X depth-range %u/%X %.9g..%.9g\n",
+                        s_gpu.composite_valid, s_gpu.depth_range_valid, s_gpu.zmin_max_control,
+                        s_gpu.depth_clip_min, s_gpu.depth_clip_max);
+                for (v = 0; v < 4; v++)
+                    fprintf(info_out, "[BINFO]   shadow matrix%u %.9g,%.9g,%.9g,%.9g\n", v,
+                            s_gpu.vp_constants[v][0], s_gpu.vp_constants[v][1],
+                            s_gpu.vp_constants[v][2], s_gpu.vp_constants[v][3]);
+                for (v = 0; v < s_gpu.idx_count && v < 1024u; v++) {
+                    Nv2aCpuVertex cv;
+                    float p[4];
+                    if (!fetch_attr(&s_gpu.attr[0], s_gpu.idx[v], p) ||
+                        !fetch_shader_vertex(s_gpu.idx[v], &cv)) continue;
+                    fprintf(info_out, "[BINFO]   shadow v%u in %.9g,%.9g,%.9g,%.9g screen %.9g,%.9g,%.9g,%.9g color %.9g,%.9g,%.9g,%.9g\n",
+                            v, p[0], p[1], p[2], p[3], cv.output[0][0], cv.output[0][1],
+                            cv.output[0][2], cv.output[0][3], cv.output[3][0], cv.output[3][1],
+                            cv.output[3][2], cv.output[3][3]);
+                }
+            }
             if ((s_gpu.transform_execution_mode & 3u) == 2u) {
                 /* Where the batch lands (logical pixels) and the oFog its
                  * vertex program wrote, from the CPU interpreter. */
