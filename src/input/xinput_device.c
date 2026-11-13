@@ -459,10 +459,16 @@ void xbox_KbmPulse(const char *target, int ms)
  * (virtual-key codes, or the mouse codes 0x101 left, 0x102 right, 0x103
  * middle, 0x104 wheel up, 0x105 wheel down, 0x106 and 0x107 the side
  * buttons), up to three; none unbinds it. Any thread. */
+static void kbm_load_map(void);
+
 void xbox_KbmSetBinding(const char *target, const int *keys, int count)
 {
     unsigned i;
     int k;
+    /* Load environment defaults before a title applies saved bindings. The
+     * first input poll must not overwrite them later. INIT_ONCE also covers
+     * a settings thread racing that first poll. */
+    kbm_load_map();
     for (i = 0; i < KB_COUNT; i++)
         if (!strcmp(kbm_binds[i].name, target))
             for (k = 0; k < 3; k++)
@@ -517,10 +523,18 @@ static void kbm_parse_map(const char *variable, struct kbm_bind *binds, int *lis
     free(spec);
 }
 
-static void kbm_load_map(void)
+static BOOL CALLBACK kbm_load_map_once(PINIT_ONCE once, PVOID parameter, PVOID *context)
 {
+    (void)once; (void)parameter; (void)context;
     kbm_parse_map("RECOMP_KBM_MAP", kbm_binds, NULL);
     kbm_parse_map("RECOMP_KBM_MENU_MAP", kbm_menu_binds, kbm_menu_listed);
+    return TRUE;
+}
+
+static void kbm_load_map(void)
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&once, kbm_load_map_once, NULL, NULL);
 }
 
 /* A wheel notch is one poll, which the title's per-frame input barely sees,
