@@ -1623,6 +1623,15 @@ int xbox_KeObjectSignal(uint32_t guest_va)
     if (!guest_va)
         return -1;
 
+    {   /* An event the title built itself (see ke_guest_event): its state
+         * lives in guest memory, as bridge_KeSetEvent keeps it. */
+        int type;
+        HANDLE ge = ke_guest_event(guest_va, &type);
+        if (ge) {
+            BRIDGE_MEM32(guest_va + 4) = 1;
+            return SetEvent(ge) ? 0 : -1;
+        }
+    }
     h = ke_shadow_lookup(guest_va);
     if (!h) {
         h = CreateEventW(NULL, FALSE, FALSE, NULL);
