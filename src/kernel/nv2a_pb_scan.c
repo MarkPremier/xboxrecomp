@@ -534,6 +534,22 @@ void nv2a_pb_run(uint32_t put_va)
         {
             uint32_t src = va - 4u;
             uint32_t tgt = win_lo | off;
+            /* A called buffer that ends in a JUMP to the word after its CALL
+             * has returned: XDK 4627 D3D (Turok Evolution) patches that JUMP
+             * on instead of a RETURN. Left pending, `ret` (which persists
+             * across kicks) kept DMA_GET from being published for the rest
+             * of the walk, and of most walks after it: GET then sat a whole
+             * submission behind what had been read. D3D's BlockOnTime trusts
+             * a fence slot only while GET is 8 KB short of it, patched its
+             * wake-up into slots already passed, and slept for ever.
+             * RECOMP_PB_JUMP_RETURN=0: as before. */
+            static int jump_return = -1;
+            if (jump_return < 0) {
+                const char *e = getenv("RECOMP_PB_JUMP_RETURN");
+                jump_return = !(e && *e == '0');
+            }
+            if (jump_return && (w & 3u) != 2u && ret && !call_end && tgt == ret)
+                ret = 0;
             if ((w & 3u) != 2u) {                    /* a real CALL sets ret above */
                 if (tgt > src && (tgt >> 16) != (src >> 16)) {
                     /* Out-of-line forward JUMP into the shared geometry buffer.
@@ -661,6 +677,28 @@ void nv2a_pb_run(uint32_t put_va)
                             *(const uint32_t *)(mem + a));
                 }
             }
+        }
+    }
+    {   /* RECOMP_PB_GET_DBG: walks that end with a frame still open (GET
+         * was not published from where it was entered to here). */
+        static int dbg = -1;
+        static unsigned shown, walks, open_call, open_jump;
+        if (dbg < 0) dbg = getenv("RECOMP_PB_GET_DBG") != NULL;
+        if (dbg) {
+            walks++;
+            if (ret) open_call++;
+            if (ret_u_n) open_jump++;
+            if ((ret || ret_u_n) && shown < 12) {
+                shown++;
+                fprintf(stderr, "[PBGET] walk ends at %08X with ret %08X call_end %08X, %u jump frames (top pc %08X exit %08X); %u jumps/calls:",
+                        put_va, ret, call_end, ret_u_n, ret_u_n ? ret_u[ret_u_n - 1u].pc : 0u,
+                        ret_u_n ? ret_u[ret_u_n - 1u].exit_va : 0u, jtrace_n);
+                for (unsigned k = jtrace_n > 6u ? jtrace_n - 6u : 0u; k < jtrace_n; k++)
+                    fprintf(stderr, " %08X:%08X", jtrace[k & 15u].from, jtrace[k & 15u].w);
+                fprintf(stderr, "\n");
+            }
+            if (walks % 20000u == 0)
+                fprintf(stderr, "[PBGET] %u walks: %u ended inside a CALL, %u inside a jump frame\n", walks, open_call, open_jump);
         }
     }
     /* A kick that did not stop cleanly at PUT leaves no packet to resume. */
