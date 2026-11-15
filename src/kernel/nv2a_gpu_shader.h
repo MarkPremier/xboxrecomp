@@ -563,6 +563,14 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
     * -- for GREATER/GEQUAL (lit while the stored depth is beyond the
     * reference; Turok's). */
    if((textureFlags&4096) && (func==4 || func==6))reference+=0.05;
+   /* At or near the end of the light's depth range (the sky, a distant
+    * backdrop) the reference clamps to the map's maximum, which is also what
+    * a texel no caster reached holds, so GREATER failed and the far sky
+    * darkened over the map's footprint. 16384: a reference within half a
+    * step of the maximum passes where nothing was drawn (a caster's texel,
+    * always nearer, still shadows it). After the exact map's tolerance, or
+    * the band it lifts to the maximum stays dark (a contour on the sky). */
+   if((textureFlags&16384) && reference>=maxDepth-0.5 && (func==4 || func==6))reference=maxDepth-0.5;
    /* A linear filter compares the four texels of the bilinear footprint and
     * blends the results (percentage-closer filtering), as the NV2A does;
     * point sampling compares one texel. */

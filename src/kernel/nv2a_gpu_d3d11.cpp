@@ -4011,6 +4011,20 @@ static void write_depth_pgm(DepthSurface &surface, const char *path, bool wide)
 extern "C" volatile LONG g_nv2a_capture_active;
 volatile LONG g_nv2a_capture_active;
 
+/* Receivers beyond the shadow light's depth range count as lit where no
+ * caster was drawn (see the shader's compare): on with the title's enhanced
+ * shadows (nv2a_gpu_set_exact_shadows), off with its own, where the far sky
+ * stays darkened over the map's footprint as on the Xbox.
+ * RECOMP_SHADOW_FAR_LIT=0/1 overrides that. */
+static bool shadow_far_lit()
+{
+    static const int forced = [] {
+        const char *value = std::getenv("RECOMP_SHADOW_FAR_LIT");
+        return value && *value ? (*value != '0' ? 1 : 0) : -1;
+    }();
+    return forced >= 0 ? forced != 0 : exact_shadows_setting.load() != 0;
+}
+
 /* Whether the shadow map get_texture last returned is exact (float depth). */
 static bool shadow_view_exact;
 
@@ -5434,7 +5448,8 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
                 (binding.format == 0x2A || binding.format == 0x2B || binding.format == 0x2E ||
                  binding.format == 0x2F ? 128u : 0u) |
                  (((binding.filter >> 24) & 15u) == 2u ? 2048u : 0u) : 0u) |
-            (mapped_haze ? 8192u : 0u));
+            (mapped_haze ? 8192u : 0u) |
+            (binding.shadow && shadow_far_lit() ? 16384u : 0u));
         if (sign_mask) signed_texture_stages++;
         switch (binding.format) {
         case 0x01: case 0x16: case 0x17: case 0x1A: case 0x1B: case 0x20: case 0x28: case 0x29:
