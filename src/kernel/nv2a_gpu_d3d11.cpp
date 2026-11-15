@@ -389,6 +389,136 @@ static void end_gpu_sample(GpuDrawSample *sample)
     sample->pending = true;
 }
 
+/* RECOMP_GPU_PROFILE=<seconds>: GPU time per kind of draw. Every draw that
+ * finds a free slot in a ring of timestamp queries is timed on the GPU and
+ * added to a bucket for what it is -- combiner stages, its first two
+ * textures' formats and sizes, blending, topology -- and every <seconds> the
+ * ten costliest buckets are logged with their draws, GPU milliseconds and
+ * pixels shaded, and the buckets start over. For finding what makes a scene
+ * slow on the GPU; off, it costs nothing. */
+struct ProfileSample {
+    ComPtr<ID3D11Query> disjoint, begin, end, statistics;
+    uint64_t key = 0;
+    bool pending = false;
+};
+struct ProfileBucket {
+    uint64_t draws = 0, pixels = 0;
+    double seconds = 0;
+    std::string what;
+};
+static std::vector<ProfileSample> profile_ring;
+static std::unordered_map<uint64_t, ProfileBucket> profile_buckets;
+static std::unordered_map<uint64_t, std::string> profile_names;
+static uint32_t profile_next;
+static uint64_t profile_busy, profile_timed;
+
+static int gpu_profile_seconds()
+{
+    static const int seconds = []() {
+        const char *value = std::getenv("RECOMP_GPU_PROFILE");
+        return value ? std::atoi(value) : 0;
+    }();
+    return seconds;
+}
+
+static bool collect_profile_sample(ProfileSample &sample)
+{
+    if (!sample.pending) return true;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT frequency = {};
+    UINT64 begin = 0, end = 0;
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS statistics = {};
+    if (context->GetData(sample.disjoint.Get(), &frequency, sizeof frequency, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+        context->GetData(sample.begin.Get(), &begin, sizeof begin, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+        context->GetData(sample.end.Get(), &end, sizeof end, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+        context->GetData(sample.statistics.Get(), &statistics, sizeof statistics, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+        return false;
+    sample.pending = false;
+    if (frequency.Disjoint || !frequency.Frequency || end < begin) return true;
+    auto &bucket = profile_buckets[sample.key];
+    bucket.draws++;
+    bucket.seconds += (double)(end - begin) / frequency.Frequency;
+    bucket.pixels += statistics.PSInvocations;
+    if (bucket.what.empty()) bucket.what = profile_names[sample.key];
+    profile_timed++;
+    return true;
+}
+
+static ProfileSample *begin_profile_sample(const Nv2aGpuDraw &state, uint32_t count)
+{
+    if (!gpu_profile_seconds() || !device || !context) return nullptr;
+    if (profile_ring.empty()) profile_ring.resize(8192);
+    auto &sample = profile_ring[profile_next++ % profile_ring.size()];
+    if (!collect_profile_sample(sample)) { profile_busy++; return nullptr; }
+    if (!sample.disjoint) {
+        auto create = [&](D3D11_QUERY type, ComPtr<ID3D11Query> &query) {
+            D3D11_QUERY_DESC description = {type, 0};
+            return SUCCEEDED(device->CreateQuery(&description, &query));
+        };
+        if (!create(D3D11_QUERY_TIMESTAMP_DISJOINT, sample.disjoint) || !create(D3D11_QUERY_TIMESTAMP, sample.begin) ||
+            !create(D3D11_QUERY_TIMESTAMP, sample.end) || !create(D3D11_QUERY_PIPELINE_STATISTICS, sample.statistics)) {
+            sample.disjoint.Reset();
+            return nullptr;
+        }
+    }
+    const auto &t0 = state.textures[0], &t1 = state.textures[1];
+    uint64_t key = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
+    mix(state.stage_program); mix(state.combiners.control); mix(state.vertex_program ? 1 : 0);
+    mix(t0.format); mix(t0.width); mix(t0.height); mix(t1.format); mix(t1.width); mix(t1.height);
+    mix(state.blend_enable); mix(state.blend_source); mix(state.blend_destination);
+    mix(state.topology); mix(state.depth_mask); mix(state.color ? 1 : 0);
+    if (!profile_names.count(key)) {
+        char text[256];
+        std::snprintf(text, sizeof text,
+                      "stages %X comb %X %s tex0 %02X %ux%u tex1 %02X %ux%u blend %u %X/%X topo %u zwrite %u target %ux%u%s",
+                      state.stage_program, state.combiners.control, state.vertex_program ? "vp" : "ff",
+                      t0.format, t0.width, t0.height, t1.format, t1.width, t1.height,
+                      state.blend_enable, state.blend_source, state.blend_destination, state.topology, state.depth_mask,
+                      state.width, state.height, state.color ? "" : " depth-only");
+        profile_names[key] = text;
+    }
+    (void)count;
+    sample.key = key;
+    context->Begin(sample.disjoint.Get());
+    context->Begin(sample.statistics.Get());
+    context->End(sample.begin.Get());
+    return &sample;
+}
+
+static void end_profile_sample(ProfileSample *sample)
+{
+    if (!sample) return;
+    context->End(sample->end.Get());
+    context->End(sample->statistics.Get());
+    context->End(sample->disjoint.Get());
+    sample->pending = true;
+}
+
+/* Called every flip. */
+static void report_gpu_profile()
+{
+    static DWORD last;
+    int seconds = gpu_profile_seconds();
+    if (!seconds || !context) return;
+    DWORD now = GetTickCount();
+    if (!last) last = now;
+    if (now - last < (DWORD)seconds * 1000u) return;
+    last = now;
+    for (auto &sample : profile_ring) collect_profile_sample(sample);
+    std::vector<std::pair<uint64_t, ProfileBucket>> sorted(profile_buckets.begin(), profile_buckets.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) { return a.second.seconds > b.second.seconds; });
+    double total = 0;
+    for (auto &entry : sorted) total += entry.second.seconds;
+    std::fprintf(stderr, "[GPU-PROFILE] %.1f ms GPU over %d s in %llu timed draws (%llu not timed: ring busy)\n",
+                 total * 1e3, seconds, (unsigned long long)profile_timed, (unsigned long long)profile_busy);
+    for (size_t i = 0; i < sorted.size() && i < 10; i++)
+        std::fprintf(stderr, "[GPU-PROFILE]   %6.1f ms %5.1f%% %6llu draws %7.1f Mpix  %s\n",
+                     sorted[i].second.seconds * 1e3, total > 0 ? 100.0 * sorted[i].second.seconds / total : 0.0,
+                     (unsigned long long)sorted[i].second.draws, sorted[i].second.pixels / 1e6, sorted[i].second.what.c_str());
+    profile_buckets.clear();
+    profile_timed = profile_busy = 0;
+}
+
 static void report_gpu_samples()
 {
     if (!gpu_sampling_enabled() || !context) return;
@@ -3039,6 +3169,7 @@ static void flip_bookkeeping()
     release_stream(constant_stream);
     s_texture_validate_serial++;
     surface_frame_serial++;
+    report_gpu_profile();
     for (auto &surface : surfaces)
         if (!surface.dirty) surface.needs_refresh = true;
     for (auto &surface : depth_surfaces)
@@ -5482,8 +5613,10 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     bool writes = region.left < region.right && region.top < region.bottom;
     context->RSSetState(raster_state.Get()); context->RSSetViewports(1, &viewport); context->RSSetScissorRects(1, &clip);
     GpuDrawSample *sample = begin_gpu_sample(*state);
+    ProfileSample *profile = begin_profile_sample(*state, count);
     if (state->indices) context->DrawIndexed(state->index_count, 0, 0);
     else context->Draw(count, 0);
+    end_profile_sample(profile);
     end_gpu_sample(sample);
     phase_timer.next_phase(gpu_timing.draw_bookkeeping);
     if (state->topology == NV2A_GPU_TOPOLOGY_LINES) gpu_timing.line_primitives += element_count / 2;
