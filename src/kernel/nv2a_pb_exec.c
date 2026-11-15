@@ -32,6 +32,7 @@
 #include <string.h>
 #include <time.h>
 #include <xmmintrin.h>   /* _mm_prefetch */
+#include <nmmintrin.h>   /* _mm_crc32_u64 (geometry cache keys) */
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
@@ -2956,6 +2957,168 @@ static double gpu_clock_seconds(void)
     return (double)counter.QuadPart / (double)frequency.QuadPart;
 }
 
+/* The batch's per-attribute fetch plans (see FastAttr), for the program's
+ * attributes. */
+static void gpu_prepare_fast_attrs(void)
+{
+    uint32_t fetch_mask = gpu_attribute_mask & 0xFFFFu, stage;
+    if (gpu_zero_unread < 0) {
+        const char *zero = getenv("RECOMP_NV2A_VERTEX_ZERO");
+        gpu_zero_unread = zero && *zero && strcmp(zero, "0") != 0;
+    }
+    gpu_fetch_count = gpu_zero_count = 0;
+    for (stage = 0; stage < 16; stage++)
+        if (fetch_mask & (1u << stage)) {
+            fast_attr_prepare(&gpu_fast_attr[stage], &s_gpu.attr[stage]);
+            gpu_fetch_stages[gpu_fetch_count++] = (uint8_t)stage;
+        } else
+            gpu_zero_stages[gpu_zero_count++] = (uint8_t)stage;
+    gpu_fast_attr_ready = 1;
+}
+
+/* Geometry cache keys. A vertex-program batch's converted vertices and
+ * indices depend only on: the attributes the program reads, each one's
+ * format, stride and source (or its fixed value), the primitive type, the
+ * index list, and the bytes of vertex data those indices reach. All of that
+ * goes into a 64-bit key (two CRC32C lanes); the backend keeps a converted
+ * copy of a key seen twice (nv2a_gpu_geometry_find/hint) and later draws of
+ * it skip the conversion and upload. Data the title rewrites hashes to a new
+ * key, so it is converted as before -- and never kept, as a key must repeat
+ * first. Batches from inline or immediate vertices, with an attribute the
+ * fast fetch cannot plan, or over 64K indices are not cached.
+ * RECOMP_GEOMETRY_CACHE=0 turns it off; RECOMP_GEOMETRY_STATS=<seconds>
+ * logs hits, stores and size. */
+typedef struct { uint64_t a, b; } GeometryHash;
+static uint64_t geometry_lookups, geometry_uncacheable, geometry_why[6];
+
+static inline void geometry_hash_word(GeometryHash *h, uint64_t word)
+{
+    h->a = _mm_crc32_u64(h->a, word);
+    h->b = _mm_crc32_u64(h->b, word ^ 0x9E3779B97F4A7C15ull);
+}
+
+static void geometry_hash_bytes(GeometryHash *h, const uint8_t *p, size_t n)
+{
+    uint64_t a = h->a, b = h->b, w;
+    size_t i = 0;
+    /* Two independent lanes over alternating words keep the CRC unit busy. */
+    for (; i + 16 <= n; i += 16) {
+        uint64_t w0, w1;
+        memcpy(&w0, p + i, 8); memcpy(&w1, p + i + 8, 8);
+        a = _mm_crc32_u64(a, w0);
+        b = _mm_crc32_u64(b, w1);
+    }
+    for (; i + 8 <= n; i += 8) { memcpy(&w, p + i, 8); a = _mm_crc32_u64(a, w); }
+    for (; i < n; i++) b = _mm_crc32_u8((uint32_t)b, p[i]);
+    h->a = a; h->b = b;
+    geometry_hash_word(h, (uint64_t)n);
+}
+
+static int geometry_cache_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("RECOMP_GEOMETRY_CACHE");
+        enabled = !(value && *value == '0');
+    }
+    return enabled;
+}
+
+static int gpu_geometry_key(uint64_t *key)
+{
+    GeometryHash h = {0x243F6A8885A308D3ull, 0x13198A2E03707344ull};
+    uint32_t i, n = s_gpu.idx_count, lowest = UINT32_MAX, highest = 0;
+    const uint8_t *span_low = NULL, *span_high = NULL;
+    size_t span_sum = 0;
+
+    if (!geometry_cache_enabled() || (s_gpu.transform_execution_mode & 3u) != 2u) return 0;
+    if (s_gpu.immediate_active) { geometry_why[0]++; return 0; }
+    if (!n || n > 65536u) { geometry_why[2]++; return 0; }
+    if (!gpu_fast_attr_ready) gpu_prepare_fast_attrs();
+    for (i = 0; i < n; i++) {
+        uint32_t index = s_gpu.idx[i];
+        if (index < lowest) lowest = index;
+        if (index > highest) highest = index;
+    }
+    geometry_hash_word(&h, ((uint64_t)gpu_attribute_mask << 32) | ((uint64_t)s_gpu.prim << 24) | gpu_fetch_count);
+    geometry_hash_word(&h, n);
+    for (i = 0; i < gpu_fetch_count; i++) {
+        const FastAttr *f = &gpu_fast_attr[gpu_fetch_stages[i]];
+        if (f->mode == FAST_ATTR_FIXED) {
+            uint64_t w[2];
+            memcpy(w, f->fixed, sizeof w);
+            geometry_hash_word(&h, 1u | ((uint64_t)gpu_fetch_stages[i] << 8));
+            geometry_hash_word(&h, w[0]);
+            geometry_hash_word(&h, w[1]);
+            continue;
+        }
+        if (f->mode != FAST_ATTR_MEMORY) { geometry_why[3]++; return 0; }
+        if (highest > f->last_index) { geometry_why[4]++; return 0; }
+        geometry_hash_word(&h, 2u | ((uint64_t)gpu_fetch_stages[i] << 8) | ((uint64_t)f->type << 16) |
+                               ((uint64_t)f->size << 24) | ((uint64_t)f->stride << 32));
+        /* Inline vertices are known by their bytes alone, which the span
+         * hash below covers; memory ones also by where they are. */
+        geometry_hash_word(&h, s_gpu.inline_active
+            ? 0x494E4C494E450000ull ^ (uint64_t)(f->base - (const uint8_t *)s_gpu.inline_buf)
+            : (uint64_t)(uintptr_t)f->base);
+        {
+            const uint8_t *low = f->base + (size_t)lowest * f->stride;
+            const uint8_t *high = f->base + (size_t)highest * f->stride +
+                vertex_attribute_bytes(&s_gpu.attr[gpu_fetch_stages[i]]);
+            if (!span_low || low < span_low) span_low = low;
+            if (!span_high || high > span_high) span_high = high;
+            span_sum += (size_t)(high - low);
+        }
+    }
+    geometry_hash_bytes(&h, (const uint8_t *)s_gpu.idx, (size_t)n * sizeof s_gpu.idx[0]);
+    if (span_low) {
+        /* Interleaved attributes share one span: hash it once. Separate
+         * streams far apart are hashed each on its own. */
+        if ((size_t)(span_high - span_low) <= span_sum * 2u + 64u)
+            geometry_hash_bytes(&h, span_low, (size_t)(span_high - span_low));
+        else
+            for (i = 0; i < gpu_fetch_count; i++) {
+                const FastAttr *f = &gpu_fast_attr[gpu_fetch_stages[i]];
+                if (f->mode != FAST_ATTR_MEMORY) continue;
+                geometry_hash_bytes(&h, f->base + (size_t)lowest * f->stride,
+                    (size_t)(highest - lowest) * f->stride + vertex_attribute_bytes(&s_gpu.attr[gpu_fetch_stages[i]]));
+            }
+    }
+    *key = (h.a << 32) ^ h.b ^ (h.a >> 32);
+    return 1;
+}
+
+/* Keys seen once, by low bits: a key is kept only when it repeats. */
+static uint64_t geometry_seen[8192];
+static uint32_t gpu_chunk_submits;
+
+static void geometry_stats_report(void)
+{
+    static int seconds = -1;
+    static DWORD last;
+    DWORD now;
+    if (seconds < 0) {
+        const char *value = getenv("RECOMP_GEOMETRY_STATS");
+        seconds = value ? atoi(value) : 0;
+        last = GetTickCount();
+    }
+    if (seconds <= 0) return;
+    now = GetTickCount();
+    if (now - last < (DWORD)seconds * 1000u) return;
+    last = now;
+    {
+        uint64_t hits, stores, entries, bytes;
+        nv2a_gpu_geometry_stats(&hits, &stores, &entries, &bytes);
+        fprintf(stderr, "[GEOMETRY] %llu look-ups, %llu hits, %llu kept, %llu not cacheable "
+                "(immediate %llu, inline %llu, count %llu, attribute %llu, extent %llu); %llu entries, %.1f MiB\n",
+                (unsigned long long)geometry_lookups, (unsigned long long)hits, (unsigned long long)stores,
+                (unsigned long long)geometry_uncacheable, (unsigned long long)geometry_why[0],
+                (unsigned long long)geometry_why[1], (unsigned long long)geometry_why[2],
+                (unsigned long long)geometry_why[3], (unsigned long long)geometry_why[4],
+                (unsigned long long)entries, bytes / 1048576.0);
+    }
+}
+
 static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint32_t *indices, uint32_t vertex_count)
 {
     Nv2aCpuVertex vertices[3];
@@ -2976,20 +3139,8 @@ static int gpu_append_primitive(Nv2aGpuDraw *state, uint32_t *count, const uint3
         const VertexAttr *tattr0 = texcoord_attr();
         uint32_t fetch_mask = program ? (gpu_attribute_mask & 0xFFFFu) : 0u;
 
-        if (program && !gpu_fast_attr_ready) {
-            if (gpu_zero_unread < 0) {
-                const char *zero = getenv("RECOMP_NV2A_VERTEX_ZERO");
-                gpu_zero_unread = zero && *zero && strcmp(zero, "0") != 0;
-            }
-            gpu_fetch_count = gpu_zero_count = 0;
-            for (stage = 0; stage < 16; stage++)
-                if (fetch_mask & (1u << stage)) {
-                    fast_attr_prepare(&gpu_fast_attr[stage], &s_gpu.attr[stage]);
-                    gpu_fetch_stages[gpu_fetch_count++] = (uint8_t)stage;
-                } else
-                    gpu_zero_stages[gpu_zero_count++] = (uint8_t)stage;
-            gpu_fast_attr_ready = 1;
-        }
+        (void)fetch_mask;
+        if (program && !gpu_fast_attr_ready) gpu_prepare_fast_attrs();
 
         for (vertex = 0; vertex < vertex_count; vertex++) {
             uint32_t index = indices[vertex];
@@ -3385,6 +3536,27 @@ static int gpu_raster_batch(void)
         if (!bytes || (uint64_t)physical_alias(texture->offset) + bytes > XBOX_CONTIG_SIZE) return gpu_batch_rejected("texture memory extent");
         binding->source_bytes = (uint32_t)bytes;
     }
+    uint64_t geometry_key = 0;
+    int geometry_keep = 0;
+    geometry_stats_report();
+    if (gpu_geometry_key(&geometry_key)) {
+        uint32_t cached_count, cached_indices;
+        geometry_lookups++;
+        if (nv2a_gpu_geometry_find(geometry_key, &cached_count, &cached_indices) &&
+            cached_count <= gpu_vertex_capacity) {
+            /* The kept copy is drawn; gpu_vertices/gpu_indices are not read. */
+            count = cached_count;
+            gpu_index_count = cached_indices;
+            nv2a_gpu_geometry_hint(geometry_key, 1);
+            if (!gpu_submit_chunk(&state, &count)) return 0;
+            if (s_gpu.batch_array32_count && s_gpu.gpu_batches != prior_batches) s_gpu.native_array32_batches++;
+            return 1;
+        }
+        if (geometry_seen[geometry_key & 8191u] == geometry_key) geometry_keep = 1;
+        else geometry_seen[geometry_key & 8191u] = geometry_key;
+    } else if ((s_gpu.transform_execution_mode & 3u) == 2u)
+        geometry_uncacheable++;
+    gpu_chunk_submits = 0;
     switch (s_gpu.prim) {
     case NV_PRIM_POINTS:
         for (index = 0; index < s_gpu.idx_count; index++)
@@ -3427,6 +3599,8 @@ static int gpu_raster_batch(void)
         break;
     default: return 0;
     }
+    /* Kept only if the whole batch is this one chunk. */
+    if (geometry_keep && !gpu_chunk_submits && count) nv2a_gpu_geometry_hint(geometry_key, 2);
     if (!gpu_submit_chunk(&state, &count)) return 0;
     if (s_gpu.batch_array32_count && s_gpu.gpu_batches != prior_batches) s_gpu.native_array32_batches++;
     return 1;
@@ -3436,6 +3610,7 @@ static int gpu_submit_chunk(Nv2aGpuDraw *state, uint32_t *count)
 {
     uint32_t index;
     if (!*count) return 1;
+    gpu_chunk_submits++;
     state->indices = gpu_indices; state->index_count = gpu_index_count;
     double started = gpu_clock_seconds();
     int drawn = nv2a_gpu_draw(state, gpu_vertices, *count);

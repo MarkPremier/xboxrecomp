@@ -96,6 +96,7 @@ static struct {
     uint64_t color_refresh_reused, depth_refresh_reused;
     uint64_t color_readbacks, depth_readbacks, color_masked_draws, completion_waits;
     uint64_t constant_uploads, constant_reuses;
+    uint64_t geometry_cache_hits, geometry_cache_stores;
     uint64_t color_copy_bytes, color_publish_bytes, depth_publish_bytes, depth_convert_bytes;
     uint64_t coverage_mask_updates, coverage_mask_rows;
     uint64_t color_refresh_bytes, color_refresh_full_bytes;
@@ -4761,8 +4762,80 @@ static bool clear_target_rectangle(const Nv2aGpuDraw &state, Surface *surface, D
     return true;
 }
 
+/* Geometry cache. A vertex-program batch's packed vertices and indices are
+ * a pure function of its vertex data, formats and index list, which the
+ * executor keys (nv2a_pb_exec.c, gpu_geometry_key). Dense scenes draw the
+ * same few meshes -- plants, rocks -- hundreds of times a frame, and each
+ * draw converted and uploaded the same vertices again, on one thread. A key
+ * seen twice is kept here as an immutable buffer; later draws with that key
+ * bind it and skip the conversion and the upload. The executor sets the
+ * hint just before nv2a_gpu_draw (same thread); the draw consumes it. */
+struct CachedGeometry {
+    ComPtr<ID3D11Buffer> buffer;
+    UINT stride = 0, count = 0, index_count = 0, index_offset = 0, bytes = 0;
+    uint64_t last_use = 0;
+};
+static std::unordered_map<uint64_t, CachedGeometry> geometry_cache;
+static uint64_t geometry_clock, geometry_cache_bytes;
+static uint64_t geometry_hint_key;
+static int geometry_hint_mode;   /* 0 none, 1 draw the cached copy, 2 keep this one */
+static const uint64_t kGeometryCacheBytes = 384ull << 20;
+static const size_t kGeometryCacheEntries = 32768;
+
+static void geometry_cache_trim()
+{
+    /* Drop what has not been drawn for a while (counted in look-ups, not
+     * frames); if that is not enough, start over. */
+    uint64_t horizon = geometry_clock > 200000 ? geometry_clock - 200000 : 0;
+    for (auto it = geometry_cache.begin(); it != geometry_cache.end();) {
+        if (it->second.last_use < horizon) {
+            geometry_cache_bytes -= it->second.bytes;
+            it = geometry_cache.erase(it);
+        } else ++it;
+    }
+    if (geometry_cache.size() >= kGeometryCacheEntries || geometry_cache_bytes >= kGeometryCacheBytes) {
+        geometry_cache.clear();
+        geometry_cache_bytes = 0;
+    }
+}
+
+extern "C" int nv2a_gpu_geometry_find(uint64_t key, uint32_t *count, uint32_t *index_count)
+{
+    auto it = geometry_cache.find(key);
+    geometry_clock++;
+    if (it == geometry_cache.end()) return 0;
+    it->second.last_use = geometry_clock;
+    *count = it->second.count;
+    *index_count = it->second.index_count;
+    return 1;
+}
+
+extern "C" void nv2a_gpu_geometry_hint(uint64_t key, int mode)
+{
+    geometry_hint_key = key;
+    geometry_hint_mode = mode;
+}
+
+extern "C" void nv2a_gpu_geometry_stats(uint64_t *hits, uint64_t *stores, uint64_t *entries, uint64_t *bytes)
+{
+    *hits = gpu_timing.geometry_cache_hits;
+    *stores = gpu_timing.geometry_cache_stores;
+    *entries = geometry_cache.size();
+    *bytes = geometry_cache_bytes;
+}
+
 extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, uint32_t count)
 {
+    /* The hint is for this draw alone, whatever path it takes. */
+    const uint64_t geometry_key = geometry_hint_key;
+    const int geometry_mode = state && state->vertex_program ? geometry_hint_mode : 0;
+    geometry_hint_mode = 0;
+    CachedGeometry *cached_geometry = nullptr;
+    if (geometry_mode == 1) {
+        auto found = geometry_cache.find(geometry_key);
+        if (found == geometry_cache.end() || found->second.count != count) return 0;
+        cached_geometry = &found->second;
+    }
     GpuTimer draw_timer(gpu_timing.draw);
     GpuTimer phase_timer(gpu_timing.draw_setup);
     auto reject = [](const char *reason) {
@@ -4797,7 +4870,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         (state->indices && element_count > NV2A_GPU_MAX_INDICES)) return reject("primitive element count");
     if (state->topology == NV2A_GPU_TOPOLOGY_POINTS && state->point_size && state->point_size != 8)
         return reject("non-unit point size");
-    if (state->indices) {
+    if (state->indices && !cached_geometry) {   /* a cached copy was checked when kept */
         for (uint32_t index = 0; index < state->index_count; index++)
             if (state->indices[index] >= count) return reject("vertex index extent");
     }
@@ -5250,27 +5323,64 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     auto &vertex_stream = vertex_streams[state->vertex_program ? 1 : 0];
     UINT vertex_bytes = count * vertex_stride;
     UINT index_bytes = state->indices ? state->index_count * sizeof(uint32_t) : 0;
-    UINT vertex_offset;
-    /* Vertex and index data share one dynamic buffer, appended and unmapped
-     * before the draw (see map_stream). */
-    if (!map_stream(vertex_stream, vertex_bytes + index_bytes,
-                    D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER, "geometry", vertex_offset))
-        return 0;
-    uint8_t *vertex_destination = (uint8_t *)vertex_stream.mapped.pData + vertex_offset;
-    if (state->vertex_program) for (uint32_t vertex = 0; vertex < count; vertex++) {
-        uint8_t *packed = vertex_destination + vertex * vertex_stride;
-        for (uint32_t a = 0; a < packed_count; a++)
-            std::memcpy(packed + a * 16u, vertices[vertex].attributes[packed_attributes[a]], 16);
+    UINT vertex_offset = 0, index_offset = 0;
+    ID3D11Buffer *geometry_buffer = vertex_stream.buffer.Get();
+    if (cached_geometry) {
+        if (cached_geometry->stride != vertex_stride ||
+            cached_geometry->index_count != (state->indices ? state->index_count : 0u))
+            return reject("cached geometry layout");
+        geometry_buffer = cached_geometry->buffer.Get();
+        index_offset = cached_geometry->index_offset;
+        gpu_timing.geometry_cache_hits++;
+    } else {
+        /* A copy to keep is packed in system memory first: the mapped stream
+         * is write-combined, and reading it back would crawl. */
+        static std::vector<uint8_t> keep;
+        const bool keeping = geometry_mode == 2 && vertex_bytes + index_bytes <= (64u << 20);
+        /* Vertex and index data share one dynamic buffer, appended and unmapped
+         * before the draw (see map_stream). */
+        if (!map_stream(vertex_stream, vertex_bytes + index_bytes,
+                        D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER, "geometry", vertex_offset))
+            return 0;
+        geometry_buffer = vertex_stream.buffer.Get();
+        if (keeping) keep.resize(vertex_bytes + index_bytes);
+        uint8_t *vertex_destination = keeping ? keep.data() : (uint8_t *)vertex_stream.mapped.pData + vertex_offset;
+        if (state->vertex_program) for (uint32_t vertex = 0; vertex < count; vertex++) {
+            uint8_t *packed = vertex_destination + vertex * vertex_stride;
+            for (uint32_t a = 0; a < packed_count; a++)
+                std::memcpy(packed + a * 16u, vertices[vertex].attributes[packed_attributes[a]], 16);
+        }
+        else for (uint32_t vertex = 0; vertex < count; vertex++)
+            std::memcpy(vertex_destination + vertex * vertex_stride, &vertices[vertex], offsetof(Nv2aGpuVertex, attributes));
+        if (state->indices) std::memcpy(vertex_destination + vertex_bytes, state->indices, index_bytes);
+        if (keeping)
+            std::memcpy((uint8_t *)vertex_stream.mapped.pData + vertex_offset, keep.data(), vertex_bytes + index_bytes);
+        if (state->indices) index_offset = vertex_offset + vertex_bytes;
+        release_stream(vertex_stream);
+        if (keeping) {
+            D3D11_BUFFER_DESC description = {};
+            description.ByteWidth = vertex_bytes + index_bytes;
+            description.Usage = D3D11_USAGE_IMMUTABLE;
+            description.BindFlags = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER;
+            D3D11_SUBRESOURCE_DATA initial = {keep.data(), 0, 0};
+            CachedGeometry entry;
+            if (SUCCEEDED(device->CreateBuffer(&description, &initial, entry.buffer.GetAddressOf()))) {
+                if (geometry_cache.size() >= kGeometryCacheEntries ||
+                    geometry_cache_bytes + description.ByteWidth > kGeometryCacheBytes)
+                    geometry_cache_trim();
+                entry.stride = vertex_stride; entry.count = count;
+                entry.index_count = state->indices ? state->index_count : 0u;
+                entry.index_offset = vertex_bytes; entry.bytes = description.ByteWidth;
+                entry.last_use = geometry_clock;
+                auto previous = geometry_cache.find(geometry_key);
+                if (previous != geometry_cache.end()) geometry_cache_bytes -= previous->second.bytes;
+                geometry_cache_bytes += entry.bytes;
+                geometry_cache[geometry_key] = std::move(entry);
+                gpu_timing.geometry_cache_stores++;
+            }
+        }
     }
-    else for (uint32_t vertex = 0; vertex < count; vertex++)
-        std::memcpy(vertex_destination + vertex * vertex_stride, &vertices[vertex], offsetof(Nv2aGpuVertex, attributes));
-    UINT index_offset = 0;
-    if (state->indices) {
-        index_offset = vertex_offset + vertex_bytes;
-        std::memcpy((uint8_t *)vertex_stream.mapped.pData + index_offset, state->indices, index_bytes);
-    }
-    release_stream(vertex_stream);
-    if (state->indices) context->IASetIndexBuffer(vertex_stream.buffer.Get(), DXGI_FORMAT_R32_UINT, index_offset);
+    if (state->indices) context->IASetIndexBuffer(geometry_buffer, DXGI_FORMAT_R32_UINT, index_offset);
     else context->IASetIndexBuffer(nullptr, DXGI_FORMAT_R32_UINT, 0);
     UINT constants_offset = 0;
     bool constants_ring = false;
@@ -5326,7 +5436,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     }
     phase_timer.next_phase(gpu_timing.draw_submit);
     UINT stride = vertex_stride, offset = vertex_offset;
-    ID3D11Buffer *buffers[] = {vertex_stream.buffer.Get()}, *constants_buffer[] = {constant_buffer.Get()};
+    ID3D11Buffer *buffers[] = {geometry_buffer}, *constants_buffer[] = {constant_buffer.Get()};
     ID3D11Buffer *constant_ring_buffer = constant_stream.buffer.Get();
     ID3D11RenderTargetView *target = nullptr;
     ID3D11DepthStencilView *depth_target = nullptr;

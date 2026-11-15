@@ -158,6 +158,13 @@ typedef struct Nv2aGpuDraw {
 } Nv2aGpuDraw;
 
 int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, uint32_t count);
+/* Geometry cache for vertex-program batches (nv2a_gpu_d3d11.cpp). find: 1 and
+ * the kept copy's vertex/index counts if `key` is kept. hint: for the next
+ * nv2a_gpu_draw only -- mode 1 draws the kept copy (vertices unread), mode 2
+ * keeps this draw's under `key`. Executor thread only. */
+int nv2a_gpu_geometry_find(uint64_t key, uint32_t *count, uint32_t *index_count);
+void nv2a_gpu_geometry_hint(uint64_t key, int mode);
+void nv2a_gpu_geometry_stats(uint64_t *hits, uint64_t *stores, uint64_t *entries, uint64_t *bytes);
 /* During nv2a_gpu_draw: 1 if the batch being drawn reaches both the left and
  * the right edge of a screen `width` logical pixels wide (nv2a_pb_exec.c). */
 int nv2a_pb_exec_batch_spans(float width);
