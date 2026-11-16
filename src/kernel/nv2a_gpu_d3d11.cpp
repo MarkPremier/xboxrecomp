@@ -1190,6 +1190,17 @@ static HRESULT compile_shader_cached(const char *source, size_t size, const char
                                      const char *entry, const char *profile, UINT flags,
                                      ComPtr<ID3DBlob> &code, ComPtr<ID3DBlob> &errors, bool compile = true)
 {
+    /* RECOMP_DEPTH_INTERP=screen: the pixel's z from a noperspective
+     * interpolant, as before (see finish_pixel); for comparing. */
+    static const bool screen_depth = [] {
+        const char *value = std::getenv("RECOMP_DEPTH_INTERP");
+        return value && !std::strcmp(value, "screen");
+    }();
+    std::string prefixed;
+    if (screen_depth) {
+        prefixed.assign("#define NV_DEPTH_SCREEN 1\n").append(source, size);
+        source = prefixed.data(); size = prefixed.size();
+    }
     const std::wstring &directory = shader_cache_directory();
     std::wstring path;
     if (!directory.empty()) {
@@ -5727,6 +5738,22 @@ static ComPtr<IDXGIAdapter1> high_performance_adapter()
     ComPtr<IDXGIFactory6> factory6;
     ComPtr<IDXGIAdapter1> adapter;
     DXGI_ADAPTER_DESC1 description = {};
+    /* RECOMP_GPU_ADAPTER=<part of its name>: that adapter (case ignored;
+     * "AMD", "Intel", "RTX"...), for a PC with several and to compare
+     * vendors. The log's "adapter:" line shows which was taken. */
+    const char *wanted = std::getenv("RECOMP_GPU_ADAPTER");
+    if (wanted && *wanted && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        for (UINT index = 0; factory->EnumAdapters1(index, &adapter) != DXGI_ERROR_NOT_FOUND; index++) {
+            char name[128] = "";
+            if (SUCCEEDED(adapter->GetDesc1(&description)))
+                WideCharToMultiByte(CP_UTF8, 0, description.Description, -1, name, sizeof name - 1, nullptr, nullptr);
+            for (const char *at = name; *at; at++)
+                if (!_strnicmp(at, wanted, std::strlen(wanted))) return adapter;
+            adapter.Reset();
+        }
+        std::fprintf(stderr, "[GPU-D3D11] RECOMP_GPU_ADAPTER=%s: no adapter with that in its name\n", wanted);
+        factory.Reset();
+    }
     /* IDXGIFactory6 needs Windows 10 1803; before it, the default adapter. */
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) || FAILED(factory.As(&factory6)) ||
             FAILED(factory6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
@@ -5761,8 +5788,20 @@ extern "C" int nv2a_gpu_available(void)
             DXGI_ADAPTER_DESC description = {};
             if (SUCCEEDED(device.As(&dxgi_device)) && SUCCEEDED(dxgi_device->GetAdapter(&used)) &&
                     SUCCEEDED(used->GetDesc(&description)))
-                std::fprintf(stderr, "[GPU-D3D11] adapter: %ls, %u MB video memory\n", description.Description,
-                             (unsigned)(description.DedicatedVideoMemory >> 20));
+            {
+                /* The driver version too: rendering faults are often one
+                 * vendor's or one driver branch's. */
+                LARGE_INTEGER driver = {};
+                bool versioned = SUCCEEDED(used->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver));
+                std::fprintf(stderr, "[GPU-D3D11] adapter: %ls, %u MB video memory, vendor %04X device %04X",
+                             description.Description, (unsigned)(description.DedicatedVideoMemory >> 20),
+                             (unsigned)description.VendorId, (unsigned)description.DeviceId);
+                if (versioned)
+                    std::fprintf(stderr, ", driver %u.%u.%u.%u", (unsigned)HIWORD(driver.HighPart),
+                                 (unsigned)LOWORD(driver.HighPart), (unsigned)HIWORD(driver.LowPart),
+                                 (unsigned)LOWORD(driver.LowPart));
+                std::fprintf(stderr, "\n");
+            }
         }
         if (SUCCEEDED(context.As(&context1))) {
             D3D11_FEATURE_DATA_D3D11_OPTIONS options = {};

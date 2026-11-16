@@ -75,6 +75,7 @@ struct Pixel {
  noperspective float depthZ:TEXCOORD5;
  float fog:TEXCOORD6;
  nointerpolation float depthSlope:TEXCOORD7;
+ float depthClip:TEXCOORD8;
 };
 float fog_factor(float distance) {
  if(textureControl.z==0)return 1;
@@ -238,6 +239,7 @@ Pixel vs_main(Vertex input) {
  output.tex0=input.tex0; output.tex1=input.tex1; output.tex2=input.tex2; output.tex3=input.tex3;
  output.depthW=input.position.w;
  output.depthZ=input.position.z;
+ output.depthClip=input.position.z*input.position.w;
  output.fog=fog_factor(distance);
  output.depthSlope=0;
  return output;
@@ -359,7 +361,20 @@ PixelOutput finish_pixel(float4 color,Pixel input,bool frontFacing) {
  if(control.z && !compare_alpha(control.w,(uint)(color.a*255+0.5),misc.x))discard;
  PixelOutput output;
  output.color=color;
- float depth=NV_W_DEPTH?input.depthW:input.depthZ;
+ /* The screen z of a pixel: the vertices' z*w and w, both interpolated
+    with perspective, divided. That is the screen-linear z a noperspective
+    interpolant gives, but it also holds on a triangle the driver has to
+    clip (one that crosses the camera plane -- the ground at the player's
+    feet -- or leaves its guard band): the values a clipper makes for a
+    noperspective input at its new vertices are driver-dependent, and a
+    wrong one put the triangle outside the depth range, a black hole for
+    a frame (seen on an AMD RX 580). NV_DEPTH_SCREEN keeps the old way. */
+#ifdef NV_DEPTH_SCREEN
+ float screenZ=input.depthZ;
+#else
+ float screenZ=input.depthClip/input.depthW;
+#endif
+ float depth=NV_W_DEPTH?input.depthW:screenZ;
  if(NV_W_DEPTH && (!(depth>0) || !isfinite(depth)))depth=3.402823466e38;
  /* The depth range clips the primitive as it is; polygon offset comes
     after and is only clamped. Clipping the offset depth threw away decals
