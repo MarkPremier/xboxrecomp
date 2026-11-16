@@ -342,7 +342,37 @@ bool compare_alpha(uint function,uint incoming,uint reference) {
  case 0x206:return incoming>=reference; default:return true;
  }
 }
-struct PixelOutput { float4 color:SV_TARGET; float depth:NV_DEPTH_SEMANTIC; };
+struct PixelOutput { float4 color:SV_TARGET; float depth:NV_DEPTH_SEMANTIC; uint coverage:SV_Coverage; };
+/* Alpha test on a multisampled target (MSAA on): an alpha-tested pixel is
+   all in or all out, so grass, leaves and fences stayed as jagged as without
+   MSAA. For the four ordered tests it now covers a share of the pixel's
+   samples by how far its alpha is past the reference, measured in the
+   alpha's own change across one pixel (its screen gradient): fully in or
+   out a pixel away from the edge, a ramp across the edge. The pass/fail
+   point is the original's, so with no gradient (or one sample) it is the
+   original test. The samples taken are rotated per pixel so partial
+   coverage does not form a fixed pattern. Its own setting
+   (nv2a_gpu_set_alpha_coverage): bit 0x10000 of the alpha function
+   (control.w) says it is on; off, the plain test. */
+uint alpha_coverage(uint function,float alpha,float gradient,uint reference,float2 position) {
+ uint samples=(function&0x10000u)?GetRenderTargetSampleCount():1u;
+ function&=0xFFFFu;
+ bool greater=function==0x204 || function==0x206, less=function==0x201 || function==0x203;
+ if(samples<=1 || samples>16 || !(greater || less) || !(gradient>0))
+  return compare_alpha(function,(uint)(alpha+0.5),reference)?0xFFFFFFFFu:0u;
+ /* The original passes at a rounded alpha strictly beyond (or at) the
+    reference: the edge is half way into the boundary value's step. */
+ float edge=(float)reference+((function==0x204 || function==0x203)?0.5:-0.5);
+ float distance=greater?alpha-edge:edge-alpha;
+ float share=saturate(distance/gradient+0.5);
+ uint count=(uint)(share*samples+0.5);
+ if(count==0)return 0;
+ if(count>=samples)return 0xFFFFFFFFu;
+ uint2 pixel=(uint2)position;
+ uint rotation=(pixel.x*7u+pixel.y*13u)%samples;
+ uint full=(1u<<samples)-1u, mask=(1u<<count)-1u;
+ return ((mask<<rotation)|(mask>>(samples-rotation)))&full;
+}
 void window_clip_pixel(float2 position) {
  if(NV_WINDOW_CLIP_MODE!=0) {
   float2 coordinate=position-0.5;
@@ -356,11 +386,18 @@ void window_clip_pixel(float2 position) {
  }
 }
 PixelOutput finish_pixel(float4 color,Pixel input,bool frontFacing) {
- window_clip_pixel(input.position.xy);
  color=saturate(color);
- if(control.z && !compare_alpha(control.w,(uint)(color.a*255+0.5),misc.x))discard;
+ /* before any discard, while the whole quad still runs */
+ float alphaGradient=fwidth(color.a*255);
+ window_clip_pixel(input.position.xy);
+ uint coverage=0xFFFFFFFFu;
+ if(control.z) {
+  coverage=alpha_coverage(control.w,color.a*255,alphaGradient,misc.x,input.position.xy);
+  if(coverage==0)discard;
+ }
  PixelOutput output;
  output.color=color;
+ output.coverage=coverage;
  /* The screen z of a pixel: the vertices' z*w and w, both interpolated
     with perspective, divided. That is the screen-linear z a noperspective
     interpolant gives, but it also holds on a triangle the driver has to

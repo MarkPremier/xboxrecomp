@@ -1191,14 +1191,17 @@ static HRESULT compile_shader_cached(const char *source, size_t size, const char
                                      ComPtr<ID3DBlob> &code, ComPtr<ID3DBlob> &errors, bool compile = true)
 {
     /* RECOMP_DEPTH_INTERP=screen: the pixel's z from a noperspective
-     * interpolant, as before (see finish_pixel); for comparing. */
-    static const bool screen_depth = [] {
-        const char *value = std::getenv("RECOMP_DEPTH_INTERP");
-        return value && !std::strcmp(value, "screen");
+     * interpolant, as before (see finish_pixel); for comparing. It goes in
+     * front of the source, so the shader cache keeps the variants apart. */
+    static const std::string switches = [] {
+        std::string text;
+        const char *depth = std::getenv("RECOMP_DEPTH_INTERP");
+        if (depth && !std::strcmp(depth, "screen")) text += "#define NV_DEPTH_SCREEN 1\n";
+        return text;
     }();
     std::string prefixed;
-    if (screen_depth) {
-        prefixed.assign("#define NV_DEPTH_SCREEN 1\n").append(source, size);
+    if (!switches.empty()) {
+        prefixed.assign(switches).append(source, size);
         source = prefixed.data(); size = prefixed.size();
     }
     const std::wstring &directory = shader_cache_directory();
@@ -2478,6 +2481,17 @@ extern "C" void nv2a_gpu_set_msaa(int samples)
 extern "C" void nv2a_gpu_set_heat_haze(int mode)
 {
     pending_heat_haze.store(mode >= 3 ? 3 : mode == 2 ? 2 : mode == 1 ? 1 : 0);
+}
+
+/* Alpha-tested pixels (grass, leaves, fences) take a share of the MSAA
+ * samples by how far past the test they are (alpha_coverage in the shader),
+ * so their edges get antialiased too. Only matters with MSAA; costs ~5% of
+ * the frame when the GPU is the limit (2160p, 8x, jungle). Live: the next
+ * draw sees it. */
+static std::atomic<bool> alpha_coverage_on{true};
+extern "C" void nv2a_gpu_set_alpha_coverage(int on)
+{
+    alpha_coverage_on.store(on != 0);
 }
 
 /* Shadow maps drawn 1, 2 or 4 times the title's size, from the next flip. */
@@ -5182,7 +5196,9 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         }
     }
     constants.control[0] = state->combiners.control & 255u; constants.control[1] = state->stage_program;
-    constants.control[2] = state->alpha_enable; constants.control[3] = state->alpha_function; constants.misc[0] = state->alpha_reference;
+    constants.control[2] = state->alpha_enable; constants.misc[0] = state->alpha_reference;
+    constants.control[3] = state->alpha_function |
+        (state->alpha_enable && msaa_samples > 1 && alpha_coverage_on.load(std::memory_order_relaxed) ? 0x10000u : 0u);
     constants.misc[1] = state->control0;
     constants.misc[2] = state->fixed_transform; constants.misc[3] = state->flat_shading;
     constants.final_input[0] = state->combiners.final_input[0]; constants.final_input[1] = state->combiners.final_input[1];

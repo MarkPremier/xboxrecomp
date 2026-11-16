@@ -48,6 +48,9 @@ void nv2a_gpu_set_msaa(int samples);
  * enhanced (full-resolution refraction, feathered edges and fade), 3 off.
  * From the next flip; any thread. */
 void nv2a_gpu_set_heat_haze(int mode);
+/* Antialiased alpha-test edges with MSAA (grass, leaves): 1 on, 0 off. Any
+ * thread; the next draw sees it. */
+void nv2a_gpu_set_alpha_coverage(int on);
 void nv2a_gpu_set_shadow_scale(int factor);
 void nv2a_gpu_surface_modified(const void *addr, size_t bytes);
 void nv2a_gpu_surface_publish(const void *addr, size_t bytes);
