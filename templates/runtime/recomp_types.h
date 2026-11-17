@@ -411,7 +411,18 @@ void recomp_trace_esp(const char *name, const char *tag);
  * uintptr_t cast preserves the overflow bits, landing us 4GB+ past
  * our mapping and causing access violations.
  */
+/* Generated code reads the offset through a const alias of the same
+ * variable (the linker points the name at it): set before any guest code
+ * runs and never after, so a guest memory write -- volatile, and to the
+ * compiler possibly anywhere -- need not make every function reload it
+ * before its next access. */
+#if defined(RECOMP_GENERATED_CODE) && defined(_MSC_VER)
+extern const ptrdiff_t g_xbox_mem_offset_fixed;
+#pragma comment(linker, "/alternatename:g_xbox_mem_offset_fixed=g_xbox_mem_offset")
+#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset_fixed)
+#else
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
+#endif
 
 /** Read/write N bytes at a flat Xbox memory address. */
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))

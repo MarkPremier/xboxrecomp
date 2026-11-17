@@ -5136,8 +5136,16 @@ static struct {
 
 static uint64_t taa_mix(uint64_t hash, const void *data, size_t bytes)
 {
+    /* Eight bytes a step: byte by byte, the vertex programs' words made
+     * this a seventh of the executor thread. */
     const uint8_t *at = (const uint8_t *)data;
-    for (size_t i = 0; i < bytes; i++) { hash ^= at[i]; hash *= 1099511628211ull; }
+    for (; bytes >= 8; at += 8, bytes -= 8) {
+        uint64_t word;
+        std::memcpy(&word, at, 8);
+        hash = (hash ^ word) * 0x9E3779B97F4A7C15ull;
+        hash ^= hash >> 29;
+    }
+    for (; bytes; bytes--) { hash ^= *at++; hash *= 1099511628211ull; }
     return hash;
 }
 
