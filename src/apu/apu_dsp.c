@@ -155,7 +155,7 @@ void mcpx_apu_dsp_ack_frame(MCPXAPUState *d)
                         s_dsp_ack[i].offset, last);
                 exit(EXIT_FAILURE);
             }
-            uint32_t base = ldl_le_phys(address_space_memory, (uint64_t)table + page * NV_PSGE_SIZE) & 0xFFFFF000u;
+            uint32_t base = ds_ldl((uint64_t)table + page * NV_PSGE_SIZE) & 0xFFFFF000u;
             if (!base) continue;
             physical = (uint64_t)base + (s_dsp_ack[i].offset & 0xFFFu);
         }
@@ -352,8 +352,25 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
             if (!dir) memset(ptr, 0, len);
             return;
         }
-        uint32_t prd_address = ldl_le_phys(address_space_memory,
-                                           sge_base + page_entry * 8 + 0);
+        /* The page table is DirectSound's contiguous allocation: read it as
+         * the voice processor reads its SGE and SSL tables (ds_ldl), where a
+         * live contiguous block owning the page wins. Through the general
+         * mapper a later ordinary retag of that page number made the DSP read
+         * ordinary RAM as its table -- garbage page addresses, so it mixed
+         * from nowhere (static) and wrote its scratch over whatever RAM they
+         * named (pushbuffer desyncs, its own program). Flight multiplayer
+         * above 60 fps, where the title retags pages far more often. */
+        uint32_t prd_address = ds_ldl(sge_base + page_entry * 8 + 0);
+        {
+            uint32_t general = ldl_le_phys(address_space_memory, sge_base + page_entry * 8 + 0);
+            static unsigned int differed;
+            if (general != prd_address && differed < 8) {
+                differed++;
+                fprintf(stderr, "[APU-DSP] page table %08llX entry %u: contiguous %08X, general lookup %08X "
+                                "(would have been used before)\n", (unsigned long long)sge_base, page_entry,
+                        prd_address, general);
+            }
+        }
         if (bytes_to_copy > len) {
             bytes_to_copy = len;
         }
@@ -411,7 +428,7 @@ static void scratch_trace(MCPXAPUState *d, const char *who, hwaddr sge_base, uin
     if (on < 0) on = getenv("RECOMP_APU_SCRATCH_TRACE") != NULL;
     if (!on || n >= 400) return;
     {
-        uint32_t prd = ldl_le_phys(address_space_memory, sge_base + (addr / TARGET_PAGE_SIZE) * 8);
+        uint32_t prd = ds_ldl(sge_base + (addr / TARGET_PAGE_SIZE) * 8);
         fprintf(stderr, "[SCRATCH] %s %s off %06X len %5zu -> phys %08X host %p\n", who, dir ? "write" : "read ",
                 addr, len, prd + addr % TARGET_PAGE_SIZE,
                 (void *)dsp_ram_address(prd + addr % TARGET_PAGE_SIZE, 4));
