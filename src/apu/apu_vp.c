@@ -955,6 +955,27 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
         segment_offset = ds_ldl(addr);
         segment_length = ds_ldl(addr + 4);
+        /* A stream segment outside RAM: DirectSound's packet table (SSL)
+         * reads as garbage. Say which entry, of which table, and what the
+         * table holds around it -- the first few times. */
+        if (segment_offset >= 0x08000000u) {
+            static unsigned reported;
+            if (reported < 6) {
+                reported++;
+                fprintf(stderr, "[APU-SSL] voice %d: ssl %d seg %d (base %u count %u) page %d of table %08X: "
+                                "entry %08X %08X; voices %08X, sge %08X\n",
+                        v, ssl_index, ssl_seg, (unsigned)d->vp.ssl[v].base[ssl_index],
+                        (unsigned)d->vp.ssl[v].count[ssl_index], page,
+                        (unsigned)d->regs[NV_PAPU_VPSSLADDR], (unsigned)segment_offset,
+                        (unsigned)segment_length, (unsigned)d->regs[NV_PAPU_VPVADDR],
+                        (unsigned)d->regs[NV_PAPU_VPSGEADDR]);
+                for (int k = page - 4 < 0 ? 0 : page - 4; k < page + 4; k++)
+                    fprintf(stderr, "[APU-SSL]   page %d: %08X %08X\n", k,
+                            ds_ldl(d->regs[NV_PAPU_VPSSLADDR] + k * 8),
+                            ds_ldl(d->regs[NV_PAPU_VPSSLADDR] + k * 8 + 4));
+                fflush(stderr);
+            }
+        }
         assert(segment_offset != 0);
         assert(segment_length != 0);
         seg_len = (segment_length >> 0) & 0xffff;
