@@ -31,7 +31,11 @@ cbuffer State : register(b0) {
  uint4 texgen[4]; uint4 textureMatrixEnable;
  uint4 windowClipControl; uint4 windowClipRects[8];
  float4 heatTransform[4];
+ /* Temporal AA (nv2a_gpu_set_taa): xy the frame's jitter in clip units, z 1
+    when previousConstants hold this draw's constants of the frame before. */
+ float4 taa;
 };
+cbuffer Previous : register(b2) { float4 previousConstants[192]; };
 #ifndef NV_WINDOW_CLIP_MODE
 #define NV_WINDOW_CLIP_MODE windowClipControl.x
 #endif
@@ -76,6 +80,8 @@ struct Pixel {
  float fog:TEXCOORD6;
  nointerpolation float depthSlope:TEXCOORD7;
  float depthClip:TEXCOORD8;
+ /* Clip positions now (before jitter) and a frame ago: the motion target. */
+ float4 motionNow:TEXCOORD9; float4 motionBefore:TEXCOORD10;
 };
 float fog_factor(float distance) {
  if(textureControl.z==0)return 1;
@@ -115,6 +121,37 @@ float4 fixed_matrix(float4 value,uint firstRow) {
  }
  return result;
 }
+float4 previous_matrix(float4 value,uint firstRow) {
+ float4 result;
+ [unroll]for(uint row=0;row<4;row++) {
+  float4 products=guest_multiply(value,previousConstants[firstRow+row]);
+  result[row]=products.x+products.y+products.z+products.w;
+ }
+ return result;
+}
+/* The fixed-function screen position with the frame before's matrices. */
+float4 fixed_previous_position(Vertex input) {
+ uint mode=lightControl.z;
+ uint count=mode==0?1:(mode+3)/2;
+ float remaining=1;
+ float4 position=0;
+ [unroll]for(uint slot=0;slot<4;slot++) {
+  if(slot<count) {
+   float weight=mode==0?1:((mode&1)!=0 && slot==count-1?remaining:input.weights[slot]);
+   remaining-=weight;
+   position+=previous_matrix(input.position,8+slot*8)*weight;
+  }
+ }
+ float4 transformed=previous_matrix(mode==0?input.position:position,0);
+ transformed.w=guest_clip_w(transformed.w);
+ transformed.xyz/=transformed.w;
+ transformed.xy+=previousConstants[59].xy;
+ return transformed;
+}
+float4 screen_clip(float4 position) {
+ float w=guest_clip_w(position.w);
+ return float4((2*position.x/viewport.x-1)*w,(1-2*position.y/viewport.y)*w,0,w);
+}
 void fixed_eye_transform(Vertex input,out float4 position,out float3 normal) {
  uint mode=lightControl.z;
  uint count=mode==0?1:(mode+3)/2;
@@ -145,10 +182,13 @@ float4 fixed_texcoord(float4 coordinate,uint stage,float4 objectPosition,float4 
 #ifndef NV_FIXED_TRANSFORM
 #define NV_FIXED_TRANSFORM misc.z
 #endif
-Pixel vs_main(Vertex input) {
+/* previous: a vertex program's screen position with the frame before's
+   constants (vs_guest), or this one's; fixed function finds its own. */
+Pixel vs_core(Vertex input,float4 previous) {
  Pixel output;
  float distance=fogControl.x==6?input.fogCoordinate:saturate(input.specular.a);
  if(NV_FIXED_TRANSFORM!=0) {
+  if(taa.z!=0)previous=fixed_previous_position(input);
   float4 eyeSpacePosition;
   float3 eyeSpaceNormal;
   fixed_eye_transform(input,eyeSpacePosition,eyeSpaceNormal);
@@ -230,6 +270,7 @@ Pixel vs_main(Vertex input) {
   transformed.xyz/=transformed.w;
   transformed.xy+=vertexConstants[59].xy;
   input.position=transformed;
+  if(taa.z==0)previous=transformed;
  }
  input.position.w=guest_clip_w(input.position.w);
  output.position=float4((2*input.position.x/viewport.x-1)*input.position.w,
@@ -242,7 +283,13 @@ Pixel vs_main(Vertex input) {
  output.depthClip=input.position.z*input.position.w;
  output.fog=fog_factor(distance);
  output.depthSlope=0;
+ output.motionNow=float4(output.position.xy,0,output.position.w);
+ output.motionBefore=screen_clip(previous);
+ output.position.xy+=taa.xy*output.position.w;
  return output;
+}
+Pixel vs_main(Vertex input) {
+ return vs_core(input,input.position);
 }
 )HLSL" R"HLSL(
 [maxvertexcount(3)]
@@ -342,7 +389,14 @@ bool compare_alpha(uint function,uint incoming,uint reference) {
  case 0x206:return incoming>=reference; default:return true;
  }
 }
-struct PixelOutput { float4 color:SV_TARGET; float depth:NV_DEPTH_SEMANTIC; uint coverage:SV_Coverage; };
+/* motion: where this pixel was a frame ago, as a texture-coordinate offset
+   (now minus then); written only with the motion target bound. */
+struct PixelOutput { float4 color:SV_TARGET; float2 motion:SV_TARGET1; float depth:NV_DEPTH_SEMANTIC; uint coverage:SV_Coverage; };
+float2 pixel_motion(Pixel input) {
+ if(!(input.motionNow.w>0) || !(input.motionBefore.w>0))return 0;
+ float2 motion=(input.motionNow.xy/input.motionNow.w-input.motionBefore.xy/input.motionBefore.w)*float2(0.5,-0.5);
+ return all(isfinite(motion))?motion:0;
+}
 /* Alpha test on a multisampled target (MSAA on): an alpha-tested pixel is
    all in or all out, so grass, leaves and fences stayed as jagged as without
    MSAA. For the four ordered tests it now covers a share of the pixel's
@@ -398,6 +452,7 @@ PixelOutput finish_pixel(float4 color,Pixel input,bool frontFacing) {
  PixelOutput output;
  output.color=color;
  output.coverage=coverage;
+ output.motion=pixel_motion(input);
  /* The screen z of a pixel: the vertices' z*w and w, both interpolated
     with perspective, divided. That is the screen-linear z a noperspective
     interpolant gives, but it also holds on a triangle the driver has to
