@@ -5391,6 +5391,18 @@ static bool taa_pipeline()
         "float4 sharpen(float4 p:SV_Position):SV_Target{\n"
         " int2 pixel=int2(p.xy),last=int2(size.xy)-1;\n"
         " float4 e=history.Load(int3(pixel,0));\n"
+        /* DLAA can retain old dynamic lighting over static geometry.
+           Limit its colour to the current frame's local range, with a
+           little tolerance for subpixel detail and reconstruction. */
+        " if(moving.w!=0){\n"
+        "  float4 here=current.Load(int3(pixel,0));\n"
+        "  float3 low=ycocg(here.rgb),high=low;\n"
+        "  [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++){\n"
+        "   float3 color=ycocg(current.Load(int3(clamp(pixel+int2(x,y),0,last),0)).rgb);\n"
+        "   low=min(low,color);high=max(high,color);\n"
+        "  }\n"
+        "  return float4(saturate(rgb(clamp(ycocg(e.rgb),low-0.02,high+0.02))),here.a);\n"
+        " }\n"
         " if(params.w<=0)return e;\n"
         " float3 b=history.Load(int3(clamp(pixel+int2(0,-1),0,last),0)).rgb,d=history.Load(int3(clamp(pixel+int2(-1,0),0,last),0)).rgb;\n"
         " float3 f=history.Load(int3(clamp(pixel+int2(1,0),0,last),0)).rgb,h=history.Load(int3(clamp(pixel+int2(0,1),0,last),0)).rgb;\n"
@@ -5524,7 +5536,22 @@ static bool taa_scene_draw(Surface &surface, const Nv2aGpuDraw &state, const Nv2
 }
 
 /* The scene so far, blended with the frames before, written back into it. */
+static bool dlss_inputs_match(ID3D11Resource *color, ID3D11Resource *depth, ID3D11Resource *motion,
+                              ID3D11Resource *output, UINT width, UINT height)
+{
+    for (ID3D11Resource *resource : {color, depth, motion, output}) {
+        ComPtr<ID3D11Texture2D> texture;
+        D3D11_TEXTURE2D_DESC description = {};
+        if (!resource || FAILED(resource->QueryInterface(IID_PPV_ARGS(&texture)))) return false;
+        texture->GetDesc(&description);
+        if (description.Width != width || description.Height != height || description.SampleDesc.Count != 1)
+            return false;
+    }
+    return true;
+}
+
 enum { TAA_AT_2D, TAA_AT_SAMPLE, TAA_AT_FLIP };
+
 static void taa_resolve(Surface &surface, int at)
 {
     taa_frame.pending = false;
@@ -5559,7 +5586,17 @@ static void taa_resolve(Surface &surface, int at)
         dlss.last_ms = now;
         ComPtr<ID3D11Resource> color;
         input->GetResource(&color);
-        if (depth && color &&
+        /* Every input the scene's size and single-sampled, or the TAA here
+         * this frame: a scene redrawn at another size mid-frame (widescreen
+         * switching on as a cutscene ends) could leave the motion target the
+         * old size, and DLSS fed mismatched inputs hung the GPU. */
+        bool matching = dlss_inputs_match(color.Get(), depth, taa.motion.Get(), taa.history[write].Get(), width, height);
+        if (!matching) {
+            static unsigned reported;
+            if (reported++ < 8)
+                std::fprintf(stderr, "[DLSS] inputs not the scene's size (%ux%u): TAA this frame\n", width, height);
+        }
+        if (matching &&
                 dlss.evaluate(context.Get(), color.Get(), depth, taa.motion.Get(), taa.history[write].Get(), width, height,
                               jitter_sign * taa_frame.jitter[0], jitter_sign * taa_frame.jitter[1],
                               -(float)width, -(float)height, reset ? 1 : 0, frame_ms))
@@ -5590,7 +5627,7 @@ static void taa_resolve(Surface &surface, int at)
         if (FAILED(context->Map(taa.parameters.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return;
         float values[12] = {(float)width, (float)height, 1.0f / width, 1.0f / height,
                             reset ? 1.0f : 0.0f, feedback, clip, by_dlss ? 0.0f : sharpness, feedback_moving, 4.0f,
-                            still_box, 0.0f};
+                            still_box, by_dlss ? 1.0f : 0.0f};
         std::memcpy(mapped.pData, values, sizeof values);
         context->Unmap(taa.parameters.Get(), 0);
     }
@@ -5621,7 +5658,7 @@ static void taa_resolve(Surface &surface, int at)
     context->PSSetShaderResources(0, 3, none);
     ID3D11RenderTargetView *scene_target = surface.target.Get();
     context->OMSetRenderTargets(1, &scene_target, nullptr);
-    ID3D11ShaderResourceView *resolved[2] = {nullptr, taa.history_view[write].Get()};
+    ID3D11ShaderResourceView *resolved[2] = {by_dlss ? input : nullptr, taa.history_view[write].Get()};
     context->PSSetShaderResources(0, 2, resolved);
     context->PSSetShader(taa.sharpen.Get(), nullptr, 0);
     context->Draw(3, 0);
