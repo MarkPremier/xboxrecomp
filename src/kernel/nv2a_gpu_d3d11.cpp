@@ -5046,9 +5046,11 @@ extern "C" void nv2a_gpu_geometry_stats(uint64_t *hits, uint64_t *stores, uint64
  * (the setting from then on); RECOMP_TAA_TRACE=1 reports every 5 s. */
 static std::atomic<int> taa_setting{-1};
 
-extern "C" void nv2a_gpu_set_taa(int on)
+/* 0 off, 1 the TAA here, 2 NVIDIA DLSS (DLAA) through dlss_bridge.dll,
+ * which falls back to the TAA here when it cannot run. */
+extern "C" void nv2a_gpu_set_taa(int mode)
 {
-    taa_setting.store(on ? 1 : 0);
+    taa_setting.store(mode <= 0 ? 0 : mode >= 2 ? 2 : 1);
 }
 
 static struct {
@@ -5080,6 +5082,7 @@ static struct {
 
 static struct {
     const uint8_t *scene = nullptr;   /* this frame's scene surface */
+    const uint8_t *scene_depth = nullptr;   /* the depth its 3D draws used (DLSS) */
     bool pending = false, resolved = false, motion_ready = false;
     uint32_t jitter_index = 0;
     float jitter[2] = {};   /* this frame's offset in target pixels */
@@ -5093,7 +5096,8 @@ static bool taa_active()
     int setting = taa_setting.load(std::memory_order_relaxed);
     if (setting < 0) {
         const char *value = std::getenv("RECOMP_TAA");
-        setting = value && *value && std::strcmp(value, "0") != 0 ? 1 : 0;
+        /* RECOMP_TAA=1 the TAA here, =2 DLSS. */
+        setting = !value || !*value || std::strcmp(value, "0") == 0 ? 0 : std::atoi(value) >= 2 ? 2 : 1;
         int expected = -1;
         taa_setting.compare_exchange_strong(expected, setting);
         setting = taa_setting.load();
@@ -5110,6 +5114,100 @@ static bool taa_trace()
 static bool taa_scene_surface(const Surface &surface)
 {
     return screen_shaped(surface.width, surface.height);
+}
+
+/* NVIDIA DLSS as DLAA (input and output the scene's own size), for the
+ * setting's value 2. NVIDIA's SDK lives in dlss_bridge.dll beside the program
+ * (the game's src/dlss_bridge.cpp, with NVIDIA's nvngx_dlss.dll), loaded the
+ * first time DLSS is wanted; without it, or on a GPU that cannot run DLSS,
+ * the TAA here runs instead. It takes this TAA's inputs: the scene before the
+ * HUD (the snapshot), its jitter, the motion target (texture-coordinate
+ * offsets, now minus then, which the scale turns into DLSS's pixels, then
+ * minus now) and the scene's depth, copied to R32_FLOAT. Its result goes
+ * into the history texture and from there back into the scene, as the TAA's
+ * does. Single-sampled only: the settings turn MSAA off with it.
+ * RECOMP_DLSS_JITTER_SIGN=-1 flips the jitter handed to it. */
+typedef int (*DlssInit)(ID3D11Device *, const wchar_t *);
+typedef int (*DlssEvaluate)(ID3D11DeviceContext *, ID3D11Resource *, ID3D11Resource *, ID3D11Resource *,
+                            ID3D11Resource *, unsigned, unsigned, float, float, float, float, int, float);
+typedef void (*DlssShutdown)(void);
+static struct {
+    int state = 0;   /* 0 not tried, 1 ready, -1 unavailable */
+    HMODULE module = nullptr;
+    DlssEvaluate evaluate = nullptr;
+    ComPtr<ID3D11PixelShader> depth_copy;
+    ComPtr<ID3D11Texture2D> depth;
+    ComPtr<ID3D11RenderTargetView> depth_target;
+    UINT depth_width = 0, depth_height = 0;
+    ULONGLONG last_ms = 0;
+} dlss;
+
+static bool dlss_ready()
+{
+    if (dlss.state) return dlss.state > 0;
+    dlss.state = -1;
+    wchar_t path[MAX_PATH] = {}, directory[MAX_PATH] = {};
+    DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (!length || length >= MAX_PATH) return false;
+    std::wcsncpy(directory, path, MAX_PATH - 1);
+    wchar_t *slash = std::wcsrchr(directory, L'\\');
+    if (slash) *slash = 0;
+    std::swprintf(path, MAX_PATH, L"%ls\\dlss_bridge.dll", directory);
+    dlss.module = LoadLibraryW(path);
+    if (!dlss.module) {
+        std::fprintf(stderr, "[DLSS] dlss_bridge.dll not found beside the program: using TAA\n");
+        return false;
+    }
+    DlssInit init = (DlssInit)(void *)GetProcAddress(dlss.module, "dlss_bridge_init");
+    dlss.evaluate = (DlssEvaluate)(void *)GetProcAddress(dlss.module, "dlss_bridge_evaluate");
+    if (!init || !dlss.evaluate || !init(device.Get(), directory)) {
+        std::fprintf(stderr, "[DLSS] unavailable: using TAA\n");
+        dlss.evaluate = nullptr;
+        return false;
+    }
+    dlss.state = 1;
+    return true;
+}
+
+/* The scene's depth as R32_FLOAT, the size of the scene. */
+static ID3D11Texture2D *dlss_depth(ID3D11ShaderResourceView *source, UINT width, UINT height)
+{
+    if (!source || !dlss.depth_copy) return nullptr;
+    if (!dlss.depth || dlss.depth_width != width || dlss.depth_height != height) {
+        dlss.depth.Reset(); dlss.depth_target.Reset();
+        D3D11_TEXTURE2D_DESC description = {};
+        description.Width = width; description.Height = height;
+        description.MipLevels = description.ArraySize = 1;
+        description.Format = DXGI_FORMAT_R32_FLOAT; description.SampleDesc.Count = 1;
+        description.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(device->CreateTexture2D(&description, nullptr, &dlss.depth)) ||
+            FAILED(device->CreateRenderTargetView(dlss.depth.Get(), nullptr, &dlss.depth_target))) {
+            dlss.depth.Reset(); dlss.depth_target.Reset();
+            return nullptr;
+        }
+        dlss.depth_width = width; dlss.depth_height = height;
+    }
+    ID3D11ShaderResourceView *none[4] = {};
+    context->PSSetShaderResources(0, 4, none);
+    ID3D11RenderTargetView *target = dlss.depth_target.Get();
+    context->OMSetRenderTargets(1, &target, nullptr);
+    context->OMSetBlendState(taa.blend.Get(), nullptr, UINT_MAX);
+    context->OMSetDepthStencilState(taa.depth_off.Get(), 0);
+    context->IASetInputLayout(nullptr);
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->VSSetShader(taa.vertex.Get(), nullptr, 0);
+    context->GSSetShader(nullptr, nullptr, 0);
+    context->PSSetShader(dlss.depth_copy.Get(), nullptr, 0);
+    context->PSSetShaderResources(3, 1, &source);
+    context->RSSetState(taa.raster.Get());
+    D3D11_VIEWPORT viewport = {0, 0, (float)width, (float)height, 0, 1};
+    context->RSSetViewports(1, &viewport);
+    D3D11_RECT clip_all = {0, 0, (LONG)width, (LONG)height};
+    context->RSSetScissorRects(1, &clip_all);
+    context->Draw(3, 0);
+    context->PSSetShaderResources(0, 4, none);
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    return dlss.depth.Get();
 }
 
 /* Halton (2, 3), eight steps, centred on the pixel. */
@@ -5288,6 +5386,8 @@ static bool taa_pipeline()
            pixel has around it (AMD's CAS, its cross of five): blending frames
            softens what the jitter does not move, and this gives it back
            without sharpening the history itself. params.w: 0 none, 1 most. */
+        "Texture2D<float> sceneDepth:register(t3);\n"
+        "float depthcopy(float4 p:SV_Position):SV_Target{return sceneDepth.Load(int3(p.xy,0));}\n"
         "float4 sharpen(float4 p:SV_Position):SV_Target{\n"
         " int2 pixel=int2(p.xy),last=int2(size.xy)-1;\n"
         " float4 e=history.Load(int3(pixel,0));\n"
@@ -5299,7 +5399,7 @@ static bool taa_pipeline()
         " float3 w=amount*lerp(-0.125,-0.2,saturate(params.w));\n"
         " return float4(saturate((e.rgb+(b+d+f+h)*w)/(1+4*w)),e.a);\n"
         "}\n";
-    ComPtr<ID3DBlob> vertex, pixel[2], sharpen, errors;
+    ComPtr<ID3DBlob> vertex, pixel[2], sharpen, depthcopy, errors;
     D3D_SHADER_MACRO single[] = {{"NV_TAA_MS", "0"}, {nullptr, nullptr}}, multi[] = {{"NV_TAA_MS", "1"}, {nullptr, nullptr}};
     HRESULT result = shader_compile(text, sizeof text - 1, "NV2A TAA", single, nullptr, "vs", "vs_5_0",
                                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vertex, &errors);
@@ -5310,6 +5410,9 @@ static bool taa_pipeline()
     if (SUCCEEDED(result)) result = shader_compile(text, sizeof text - 1, "NV2A TAA", single, nullptr, "sharpen", "ps_5_0",
                                                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &sharpen, &errors);
     if (SUCCEEDED(result)) result = device->CreatePixelShader(sharpen->GetBufferPointer(), sharpen->GetBufferSize(), nullptr, &taa.sharpen);
+    if (SUCCEEDED(result)) result = shader_compile(text, sizeof text - 1, "NV2A TAA", single, nullptr, "depthcopy", "ps_5_0",
+                                                   D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &depthcopy, &errors);
+    if (SUCCEEDED(result)) result = device->CreatePixelShader(depthcopy->GetBufferPointer(), depthcopy->GetBufferSize(), nullptr, &dlss.depth_copy);
     if (SUCCEEDED(result)) result = device->CreateVertexShader(vertex->GetBufferPointer(), vertex->GetBufferSize(), nullptr, &taa.vertex);
     for (int index = 0; index < 2 && SUCCEEDED(result); index++)
         result = device->CreatePixelShader(pixel[index]->GetBufferPointer(), pixel[index]->GetBufferSize(), nullptr, &taa.pixel[index]);
@@ -5376,7 +5479,8 @@ static bool taa_history(UINT width, UINT height, bool &fresh)
     description.Width = width; description.Height = height;
     description.MipLevels = description.ArraySize = 1;
     description.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; description.SampleDesc.Count = 1;
-    description.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    /* Unordered access too: DLSS writes its result here. */
+    description.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
     for (int index = 0; index < 2; index++)
         if (FAILED(device->CreateTexture2D(&description, nullptr, &taa.history[index])) ||
             FAILED(device->CreateRenderTargetView(taa.history[index].Get(), nullptr, &taa.history_target[index])) ||
@@ -5434,6 +5538,33 @@ static void taa_resolve(Surface &surface, int at)
     if (!input) return;
     bool reset = fresh || taa.history_frame + 1 != surface_frame_serial || !taa_frame.motion_ready;
     int read = taa.history_index, write = read ^ 1;
+    bool by_dlss = false;
+    if (taa_setting.load(std::memory_order_relaxed) == 2 && taa.motion_samples <= 1 && taa_frame.motion_ready &&
+            taa_frame.scene_depth && dlss_ready()) {
+        DepthSurface *scene_depth = nullptr;
+        for (auto &candidate : depth_surfaces)
+            if (candidate.memory == taa_frame.scene_depth && candidate.texture && candidate.sample_view &&
+                    candidate.texture_width == width && candidate.texture_height == height) {
+                scene_depth = &candidate;
+                break;
+            }
+        ID3D11Texture2D *depth = scene_depth ? dlss_depth(scene_depth->sample_view.Get(), width, height) : nullptr;
+        static float jitter_sign = 0.0f;
+        if (jitter_sign == 0.0f) {
+            const char *text = std::getenv("RECOMP_DLSS_JITTER_SIGN");
+            jitter_sign = text && std::atof(text) < 0 ? -1.0f : 1.0f;
+        }
+        ULONGLONG now = GetTickCount64();
+        float frame_ms = dlss.last_ms ? (float)(now - dlss.last_ms) : 16.7f;
+        dlss.last_ms = now;
+        ComPtr<ID3D11Resource> color;
+        input->GetResource(&color);
+        if (depth && color &&
+                dlss.evaluate(context.Get(), color.Get(), depth, taa.motion.Get(), taa.history[write].Get(), width, height,
+                              jitter_sign * taa_frame.jitter[0], jitter_sign * taa_frame.jitter[1],
+                              -(float)width, -(float)height, reset ? 1 : 0, frame_ms))
+            by_dlss = true;
+    }
     {
         /* RECOMP_TAA_FEEDBACK: the history's weight held still (0.98);
          * RECOMP_TAA_FEEDBACK_MOVING: at 4 pixels a frame and more (0.9). */
@@ -5458,7 +5589,8 @@ static void taa_resolve(Surface &surface, int at)
         D3D11_MAPPED_SUBRESOURCE mapped = {};
         if (FAILED(context->Map(taa.parameters.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return;
         float values[12] = {(float)width, (float)height, 1.0f / width, 1.0f / height,
-                            reset ? 1.0f : 0.0f, feedback, clip, sharpness, feedback_moving, 4.0f, still_box, 0.0f};
+                            reset ? 1.0f : 0.0f, feedback, clip, by_dlss ? 0.0f : sharpness, feedback_moving, 4.0f,
+                            still_box, 0.0f};
         std::memcpy(mapped.pData, values, sizeof values);
         context->Unmap(taa.parameters.Get(), 0);
     }
@@ -5485,7 +5617,7 @@ static void taa_resolve(Surface &surface, int at)
     context->RSSetViewports(1, &viewport);
     D3D11_RECT clip_all = {0, 0, (LONG)width, (LONG)height};
     context->RSSetScissorRects(1, &clip_all);
-    context->Draw(3, 0);
+    if (!by_dlss) context->Draw(3, 0);   /* DLSS has written the history itself */
     context->PSSetShaderResources(0, 3, none);
     ID3D11RenderTargetView *scene_target = surface.target.Get();
     context->OMSetRenderTargets(1, &scene_target, nullptr);
@@ -5532,6 +5664,7 @@ static void taa_end_frame(const void *presented)
         }
     }
     taa_frame.scene = nullptr;
+    taa_frame.scene_depth = nullptr;
     taa_frame.pending = taa_frame.resolved = taa_frame.motion_ready = false;
     taa_frame.jitter_index++;
     taa_jitter(taa_frame.jitter_index, taa_frame.jitter);
@@ -5855,6 +5988,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             float viewport_height = (float)scale_edge((LONG)state->height, guest_height, target_height);
             taa_draw = taa_scene_draw(*surface, *state, vertices, count, geometry_mode, geometry_key, projection,
                                       constants, viewport_width, viewport_height, taa_before);
+            if (taa_draw && depth) taa_frame.scene_depth = depth->memory;
             taa_writes_motion = taa_draw && taa_frame.motion_ready && !state->blend_enable &&
                                 (state->color_mask & 0x10100u) == 0x10100u;
         }

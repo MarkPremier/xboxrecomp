@@ -679,6 +679,28 @@ static void throttle(MCPXAPUState *d)
         d->next_frame_time_us = now_us;
     }
 
+    /* And by the output queue. Paced by the clock alone, it held whatever
+     * lead the start left -- about four packets, 21 ms -- and with the
+     * system timer at its default 15.6 ms a wait could overshoot by three of
+     * them; a game running uncapped at 600+ fps, keeping cores busy, made
+     * the rest: the queue ran dry and the sound popped and crackled. Below
+     * RECOMP_APU_QUEUE packets (8, about 43 ms) the next is made at once;
+     * more than four over it, one is held back, which also takes up any
+     * drift between this clock and the device's. */
+    {
+        static int target = -1;
+        int queued = xa2_queued();
+        if (target < 0) {
+            const char *value = getenv("RECOMP_APU_QUEUE");
+            target = value && atoi(value) > 0 ? atoi(value) : 8;
+            if (target > 12) target = 12;   /* the backend holds 16 */
+        }
+        if (queued >= 0 && queued < target && d->next_frame_time_us > now_us)
+            d->next_frame_time_us = now_us;
+        else if (queued > target + 4)
+            d->next_frame_time_us += EP_FRAME_US;
+    }
+
     while (!d->pause_requested) {
         now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
@@ -819,6 +841,9 @@ static void se_frame(MCPXAPUState *d)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    /* Above the game's threads: a title running uncapped keeps cores busy,
+     * and a late packet is a pop. The thread sleeps between packets. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
