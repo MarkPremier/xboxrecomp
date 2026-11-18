@@ -772,15 +772,21 @@ static bool depth_scaled(const uint8_t *memory)
  * colour) is drawn as float depth, unrounded and without the title's polygon
  * offset (a tenth of a step, there for the rounding; exact, it would lift a
  * body lying flat off its own shadow). Guest RAM still gets 16-bit depth.
- * nv2a_gpu_set_exact_shadows switches it (a map changes kind at its next
+ * nv2a_gpu_set_shadow_mode switches it (a map changes kind at its next
  * draw, get_depth); RECOMP_SHADOW_EXACT=0/1 overrides that. Off is the 16-bit
  * map, as the Xbox draws it. */
 static std::set<const uint8_t *> shadow_map_targets;
-static std::atomic<int> exact_shadows_setting{1};
+static std::atomic<int> shadow_mode{1};
+static std::atomic<bool> shadow_indoor{false};
 
-extern "C" void nv2a_gpu_set_exact_shadows(int on)
+extern "C" void nv2a_gpu_set_shadow_mode(int mode)
 {
-    exact_shadows_setting = on ? 1 : 0;
+    shadow_mode.store(mode, std::memory_order_relaxed);
+}
+
+extern "C" void nv2a_gpu_set_shadow_indoor(int indoor)
+{
+    shadow_indoor.store(indoor != 0, std::memory_order_relaxed);
 }
 
 static bool exact_shadow_depth()
@@ -789,7 +795,13 @@ static bool exact_shadow_depth()
         const char *value = std::getenv("RECOMP_SHADOW_EXACT");
         return value ? (std::strcmp(value, "0") != 0 ? 1 : 0) : -1;
     }();
-    return forced >= 0 ? forced != 0 : exact_shadows_setting.load() != 0;
+    return forced >= 0 ? forced != 0 : shadow_mode.load(std::memory_order_relaxed) != 0;
+}
+
+static bool balcony_shadow_fade(bool exact, uint32_t stage, uint32_t format)
+{
+    return exact && stage == 3 && format == 0x30 && shadow_mode.load(std::memory_order_relaxed) == 2 &&
+           shadow_indoor.load(std::memory_order_relaxed);
 }
 
 static bool wants_exact_depth(const uint8_t *memory, uint32_t format)
@@ -4058,7 +4070,7 @@ volatile LONG g_nv2a_capture_active;
 
 /* Receivers beyond the shadow light's depth range count as lit where no
  * caster was drawn (see the shader's compare): on with the title's enhanced
- * shadows (nv2a_gpu_set_exact_shadows), off with its own, where the far sky
+ * shadow modes, off with the Xbox settings, where the far sky
  * stays darkened over the map's footprint as on the Xbox.
  * RECOMP_SHADOW_FAR_LIT=0/1 overrides that. */
 static bool shadow_far_lit()
@@ -4067,7 +4079,7 @@ static bool shadow_far_lit()
         const char *value = std::getenv("RECOMP_SHADOW_FAR_LIT");
         return value && *value ? (*value != '0' ? 1 : 0) : -1;
     }();
-    return forced >= 0 ? forced != 0 : exact_shadows_setting.load() != 0;
+    return forced >= 0 ? forced != 0 : shadow_mode.load(std::memory_order_relaxed) != 0;
 }
 
 /* Whether the shadow map get_texture last returned is exact (float depth). */
@@ -5045,6 +5057,12 @@ extern "C" void nv2a_gpu_geometry_stats(uint64_t *hits, uint64_t *stores, uint64
  * after that point in the frame is drawn as the title draws it. RECOMP_TAA=1 turns it on at start
  * (the setting from then on); RECOMP_TAA_TRACE=1 reports every 5 s. */
 static std::atomic<int> taa_setting{-1};
+static std::atomic<bool> dlaa_allowed{true};
+
+extern "C" void nv2a_gpu_allow_dlaa(int allowed)
+{
+    dlaa_allowed.store(allowed != 0, std::memory_order_relaxed);
+}
 
 /* 0 off, 1 the TAA here, 2 NVIDIA DLSS (DLAA) through dlss_bridge.dll,
  * which falls back to the TAA here when it cannot run. */
@@ -5075,6 +5093,7 @@ static struct {
     UINT history_width = 0, history_height = 0;
     int history_index = 0;
     uint64_t history_frame = 0;   /* surface_frame_serial of the last resolve */
+    uint64_t dlaa_frame = 0;      /* last successful DLAA frame, independent of TAA */
     ComPtr<ID3D11Texture2D> input;   /* the scene as drawn, read while the scene is written */
     ComPtr<ID3D11ShaderResourceView> input_view;
     DynamicStream previous_stream;   /* each draw's previous constants (cbuffer b2) */
@@ -5539,15 +5558,63 @@ static bool taa_scene_draw(Surface &surface, const Nv2aGpuDraw &state, const Nv2
 static bool dlss_inputs_match(ID3D11Resource *color, ID3D11Resource *depth, ID3D11Resource *motion,
                               ID3D11Resource *output, UINT width, UINT height)
 {
-    for (ID3D11Resource *resource : {color, depth, motion, output}) {
+    ID3D11Resource *resources[] = {color, depth, motion, output};
+    const DXGI_FORMAT formats[] = {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32_FLOAT,
+                                   DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT};
+    for (unsigned i = 0; i < 4; i++) {
         ComPtr<ID3D11Texture2D> texture;
         D3D11_TEXTURE2D_DESC description = {};
+        ID3D11Resource *resource = resources[i];
+        UINT binding = i == 3 ? D3D11_BIND_UNORDERED_ACCESS : D3D11_BIND_SHADER_RESOURCE;
         if (!resource || FAILED(resource->QueryInterface(IID_PPV_ARGS(&texture)))) return false;
         texture->GetDesc(&description);
-        if (description.Width != width || description.Height != height || description.SampleDesc.Count != 1)
+        if (description.Width != width || description.Height != height || description.SampleDesc.Count != 1 ||
+            description.Format != formats[i] || description.ArraySize != 1 ||
+            !(description.BindFlags & binding) || description.Usage != D3D11_USAGE_DEFAULT)
             return false;
     }
     return true;
+}
+
+static bool dlss_frame_ready()
+{
+    return taa_setting.load(std::memory_order_relaxed) == 2 && dlaa_allowed.load(std::memory_order_relaxed) &&
+           dlss.state >= 0 && taa.motion_samples == 1 && taa_frame.motion_ready && taa_frame.scene_depth;
+}
+
+/* Opt-in fault isolation: on the same immediate context, finish queued
+ * commands before the NGX call, then separately wait for NGX to finish.
+ * The normal path never waits on these queries. */
+static bool dlss_gpu_check(const char *phase)
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("RECOMP_DLSS_SYNC");
+        return value && std::atoi(value) > 0;
+    }();
+    if (!enabled) return true;
+    static ComPtr<ID3D11Query> fence;
+    HRESULT result = S_OK;
+    if (!fence) {
+        D3D11_QUERY_DESC description = {D3D11_QUERY_EVENT, 0};
+        result = device->CreateQuery(&description, &fence);
+    }
+    if (SUCCEEDED(result)) {
+        context->End(fence.Get());
+        context->Flush();
+        ULONGLONG deadline = GetTickCount64() + 3000;
+        do {
+            result = context->GetData(fence.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            if (result != S_FALSE) break;
+            Sleep(1);
+        } while (GetTickCount64() < deadline);
+    }
+    if (result == S_OK) return true;
+    std::fprintf(stderr, "[DLSS] GPU check %s, frame %llu: query 0x%08X, device 0x%08X\n",
+                 phase, (unsigned long long)surface_frame_serial, (unsigned)result,
+                 (unsigned)device->GetDeviceRemovedReason());
+    std::fflush(stderr);
+    dlss.state = -1;
+    return false;
 }
 
 enum { TAA_AT_2D, TAA_AT_SAMPLE, TAA_AT_FLIP };
@@ -5566,24 +5633,20 @@ static void taa_resolve(Surface &surface, int at)
     bool reset = fresh || taa.history_frame + 1 != surface_frame_serial || !taa_frame.motion_ready;
     int read = taa.history_index, write = read ^ 1;
     bool by_dlss = false;
-    if (taa_setting.load(std::memory_order_relaxed) == 2 && taa.motion_samples <= 1 && taa_frame.motion_ready &&
-            taa_frame.scene_depth && dlss_ready()) {
+    if (dlss_frame_ready()) {
         DepthSurface *scene_depth = nullptr;
         for (auto &candidate : depth_surfaces)
             if (candidate.memory == taa_frame.scene_depth && candidate.texture && candidate.sample_view &&
-                    candidate.texture_width == width && candidate.texture_height == height) {
+                candidate.texture_width == width && candidate.texture_height == height &&
+                candidate.used_frame == surface_frame_serial &&
+                (!scene_depth || candidate.last_used > scene_depth->last_used))
                 scene_depth = &candidate;
-                break;
-            }
         ID3D11Texture2D *depth = scene_depth ? dlss_depth(scene_depth->sample_view.Get(), width, height) : nullptr;
         static float jitter_sign = 0.0f;
         if (jitter_sign == 0.0f) {
             const char *text = std::getenv("RECOMP_DLSS_JITTER_SIGN");
             jitter_sign = text && std::atof(text) < 0 ? -1.0f : 1.0f;
         }
-        ULONGLONG now = GetTickCount64();
-        float frame_ms = dlss.last_ms ? (float)(now - dlss.last_ms) : 16.7f;
-        dlss.last_ms = now;
         ComPtr<ID3D11Resource> color;
         input->GetResource(&color);
         /* Every input the scene's size and single-sampled, or the TAA here
@@ -5594,13 +5657,22 @@ static void taa_resolve(Surface &surface, int at)
         if (!matching) {
             static unsigned reported;
             if (reported++ < 8)
-                std::fprintf(stderr, "[DLSS] inputs not the scene's size (%ux%u): TAA this frame\n", width, height);
+                std::fprintf(stderr, "[DLSS] missing or incompatible scene inputs (%ux%u): TAA this frame\n", width, height);
         }
-        if (matching &&
-                dlss.evaluate(context.Get(), color.Get(), depth, taa.motion.Get(), taa.history[write].Get(), width, height,
-                              jitter_sign * taa_frame.jitter[0], jitter_sign * taa_frame.jitter[1],
-                              -(float)width, -(float)height, reset ? 1 : 0, frame_ms))
-            by_dlss = true;
+        bool dlss_reset = reset || taa.dlaa_frame + 1 != surface_frame_serial;
+        if (matching && dlss_gpu_check("before evaluation") && dlss_ready()) {
+            ULONGLONG now = GetTickCount64();
+            float frame_ms = dlss_reset || !dlss.last_ms ? 16.7f :
+                             std::clamp((float)(now - dlss.last_ms), 1.0f, 250.0f);
+            dlss.last_ms = now;
+            int evaluated = dlss.evaluate(context.Get(), color.Get(), depth, taa.motion.Get(), taa.history[write].Get(),
+                                          width, height, jitter_sign * taa_frame.jitter[0], jitter_sign * taa_frame.jitter[1],
+                                          -(float)width, -(float)height, dlss_reset ? 1 : 0, frame_ms);
+            if (dlss_gpu_check("after evaluation") && evaluated) {
+                by_dlss = true;
+                taa.dlaa_frame = surface_frame_serial;
+            }
+        }
     }
     {
         /* RECOMP_TAA_FEEDBACK: the history's weight held still (0.98);
@@ -6222,7 +6294,8 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
                  binding.format == 0x2F ? 128u : 0u) |
                  (((binding.filter >> 24) & 15u) == 2u ? 2048u : 0u) : 0u) |
             (mapped_haze ? 8192u : 0u) |
-            (binding.shadow && shadow_far_lit() ? 16384u : 0u));
+            (binding.shadow && shadow_far_lit() ? 16384u : 0u) |
+            (binding.shadow && balcony_shadow_fade(shadow_view_exact, stage, binding.format) ? 32768u : 0u));
         if (sign_mask) signed_texture_stages++;
         switch (binding.format) {
         case 0x01: case 0x16: case 0x17: case 0x1A: case 0x1B: case 0x20: case 0x28: case 0x29:

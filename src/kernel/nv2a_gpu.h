@@ -56,6 +56,7 @@ void nv2a_gpu_set_alpha_coverage(int on);
  * program (the renderer's own when that cannot run). Any thread; from the
  * next frame. */
 void nv2a_gpu_set_taa(int mode);
+void nv2a_gpu_allow_dlaa(int allowed);
 void nv2a_gpu_set_shadow_scale(int factor);
 void nv2a_gpu_surface_modified(const void *addr, size_t bytes);
 void nv2a_gpu_surface_publish(const void *addr, size_t bytes);
@@ -178,9 +179,10 @@ void nv2a_gpu_geometry_stats(uint64_t *hits, uint64_t *stores, uint64_t *entries
 int nv2a_pb_exec_batch_spans(float width);
 /* 1 = queued, 0 = use CPU clear, -1 = native resource failure. */
 int nv2a_gpu_clear(const Nv2aGpuDraw *state, uint32_t flags, uint32_t color, uint32_t depth);
-/* Shadow maps as exact (float) depth, or the Xbox's 16-bit (see
- * exact_shadow_depth in nv2a_gpu_d3d11.cpp); from any thread. */
-void nv2a_gpu_set_exact_shadows(int on);
+/* Shadows: 0 Xbox, 1 Enhanced (exact float depth), 2 Enhanced+ (also fades
+ * spill across indoor floors). The level and mode can change independently. */
+void nv2a_gpu_set_shadow_mode(int mode);
+void nv2a_gpu_set_shadow_indoor(int indoor);
 int nv2a_gpu_execute_state(const uint32_t program[136][4], const uint32_t valid[136], uint32_t start,
 						  const float attributes[16][4], float constants[192][4]);
 

@@ -108,6 +108,30 @@ float4 guest_multiply(float4 left,float4 right) {
 float3 guest_project(float4 coordinate) {
  return guest_multiply(float4(coordinate.xyz,0),(1/coordinate.w).xxxx).xyz;
 }
+/* Enhanced+ fades shadows that travel far enough downward to reach the
+   next floor. The full-strength range includes the height of a standing
+   guard, so its torso and legs can both cast a solid floor shadow. */
+float2 balcony_shadow_gap(float3 projected) {
+ float3 s=vertexConstants[144].xyz;
+ float3 t=vertexConstants[145].xyz;
+ float4 r=vertexConstants[146];
+ float4 q=vertexConstants[147];
+ float3 txq=cross(t,q.xyz);
+ float determinant=dot(s,txq);
+ if(!(abs(determinant)>1 && projected.z>0 && projected.z<65535))return 0;
+ /* Invert S,T,Q to recover the drop in world Y per unit of light depth. */
+ float down=-dot(float3(projected.xy,1),float3(txq.y,cross(q.xyz,s).y,cross(s,t).y))/determinant;
+ if(!(down>=0.8 && down<=1.2))return 0;
+ /* r/q = A-B/q. Recover q from r/q because the guest can scale all
+    projective coordinates together when interpolating across a face. */
+ float a=dot(r.xyz,q.xyz)/dot(q.xyz,q.xyz);
+ float b=a*q.w-r.w;
+ if(!(a>65535 && a<65635 && b>5900 && b<7300))return 0;
+ float lightDepth=b/(a-projected.z);
+ float2 distance=min(float2(3.1,3.65)/down,float2(3.9,4.5));
+ if(!(lightDepth>distance.y+0.01))return 0;
+ return b*distance/(lightDepth*(lightDepth-distance));
+}
 float guest_clip_w(float value) {
  if(!isfinite(value))return value;
  float magnitude=clamp(abs(value),5.421010862427522e-20,1.8446744073709552e19);
@@ -395,7 +419,10 @@ struct PixelOutput { float4 color:SV_TARGET; float2 motion:SV_TARGET1; float dep
 float2 pixel_motion(Pixel input) {
  if(!(input.motionNow.w>0) || !(input.motionBefore.w>0))return 0;
  float2 motion=(input.motionNow.xy/input.motionNow.w-input.motionBefore.xy/input.motionBefore.w)*float2(0.5,-0.5);
- return all(isfinite(motion))?motion:0;
+ /* A mismatched previous draw, or a vertex close to the camera plane,
+    can yield a finite displacement that overflows the FP16 motion target.
+    Displacements over two screen extents have no usable history. */
+ return all(isfinite(motion)) && all(abs(motion)<=2)?motion:0;
 }
 /* Alpha test on a multisampled target (MSAA on): an alpha-tested pixel is
    all in or all out, so grass, leaves and fences stayed as jagged as without
@@ -690,10 +717,14 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
    }
    stored*=maxDepth;
    float4 lit;
+   float2 gap=0;
+   if((textureFlags&32768) && (func==4 || func==6) && coordinate.w>0)
+    gap=balcony_shadow_gap(uvw);
    [unroll]for(uint tap=0;tap<4;tap++) {
     float depth=stored[tap];
     lit[tap]=(func==1?depth<reference:func==2?depth==reference:func==3?depth<=reference:
               func==4?depth>reference:func==5?depth!=reference:func==6?depth>=reference:func==7)?1:0;
+    if(gap.y>gap.x)lit[tap]=max(lit[tap],smoothstep(gap.x,gap.y,uvw.z-depth));
    }
    float2 blend=frac(uv*size-0.5);   /* gather order: x (0,1) y (1,1) z (1,0) w (0,0) */
    if(!all(isfinite(blend)))blend=0;   /* q == 0 with a nonzero s or t */
