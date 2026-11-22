@@ -95,6 +95,13 @@ void xbox_InputInit(void);
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
 /**
+ * Reshape a real pad's stick axes (Xbox convention, +Y up) before the guest
+ * reads them. NULL removes the filter.
+ */
+typedef void (*XboxStickFilter)(DWORD port, SHORT *lx, SHORT *ly, SHORT *rx, SHORT *ry);
+void xbox_InputSetStickFilter(XboxStickFilter filter);
+
+/**
  * Set controller vibration.
  */
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);

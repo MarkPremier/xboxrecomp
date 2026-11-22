@@ -19,6 +19,19 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* A title may reshape the host pad's sticks before the guest sees them (for
+ * example to replace a game's own oversized deadzone with an optional one).
+ * It runs on the polling thread, only for a real pad, after the axis map. */
+static XboxStickFilter g_stick_filter;
+void xbox_InputSetStickFilter(XboxStickFilter filter) { g_stick_filter = filter; }
+static void apply_stick_filter(DWORD port, XBOX_INPUT_STATE *s)
+{
+    XboxStickFilter filter = g_stick_filter;
+    if (filter)
+        filter(port, &s->Gamepad.sThumbLX, &s->Gamepad.sThumbLY,
+               &s->Gamepad.sThumbRX, &s->Gamepad.sThumbRY);
+}
+
 /* ======================================================================== */
 #if defined(_WIN32)
 /* ====================  XInput backend  ================================== */
@@ -993,6 +1006,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     map_stick(g_axis_flags & 1 ? pad->sThumbLX : pad->sThumbRX,
               g_axis_flags & 1 ? pad->sThumbLY : pad->sThumbRY, 1,
               &pState->Gamepad.sThumbRX, &pState->Gamepad.sThumbRY);
+    apply_stick_filter(dwPort, pState);
 
     /* Merge the keyboard on top rather than only standing in for a missing
      * pad.
@@ -1171,6 +1185,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
     pState->Gamepad.sThumbRY =
         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
+    apply_stick_filter(dwPort, pState);
 
     return ERROR_SUCCESS;
 }
