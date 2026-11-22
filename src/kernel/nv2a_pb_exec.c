@@ -4895,7 +4895,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         uint32_t stage = (method - 0x1B00) >> 6;
         uint32_t offset = method & 63u;
         Texture *texture = stage ? &s_gpu.extra_tex[stage - 1] : &s_gpu.tex;
-        if (offset <= 0x34u) memcpy(&texture->bump_matrix[(offset - 0x28u) >> 2], &param, sizeof param);
+        /* The method's four floats come as MAT00, MAT01, MAT11, MAT10 (the
+         * Xbox's D3DTSS_BUMPENVMAT00/01/11/10 follow the same order; xemu
+         * swizzles them likewise); bump_matrix holds 00, 01, 10, 11. Kept in
+         * arrival order, Turok Evolution's heat haze (00 = 11 = 0.02) only
+         * ever moved the picture sideways. RECOMP_BUMP_ORDER=0: as before. */
+        static int arrival_order = -1;
+        if (arrival_order < 0) {
+            const char *value = getenv("RECOMP_BUMP_ORDER");
+            arrival_order = value && *value == '0';
+        }
+        if (offset <= 0x34u) {
+            static const uint8_t slot_of[4] = {0, 1, 3, 2};
+            uint32_t slot = (offset - 0x28u) >> 2;
+            memcpy(&texture->bump_matrix[arrival_order ? slot : slot_of[slot]], &param, sizeof param);
+        }
         else if (offset == 0x38u) memcpy(&texture->bump_scale, &param, sizeof param);
         else if (offset == 0x3Cu) memcpy(&texture->bump_offset, &param, sizeof param);
         else { note_unhandled(subch, method, param); return; }

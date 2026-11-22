@@ -583,6 +583,45 @@ float2 filtered_heat_offset(uint stage,float2 uv) {
  float2 top=lerp(float2(blue.x,green.x),float2(blue.y,green.y),blend.x);
  return lerp(bottom,top,blend.y);
 }
+/* The mean signed offset of the 2x2 texels around uv (gathered at their
+ * shared corner): one texel of the map at half its resolution. */
+float2 heat_block(uint stage,float2 uv) {
+ float4 green,blue;
+ switch(stage) {
+ case 0:green=image0.GatherGreen(sampler0,uv);blue=image0.GatherBlue(sampler0,uv);break;
+ case 1:green=image1.GatherGreen(sampler1,uv);blue=image1.GatherBlue(sampler1,uv);break;
+ case 2:green=image2.GatherGreen(sampler2,uv);blue=image2.GatherBlue(sampler2,uv);break;
+ default:green=image3.GatherGreen(sampler3,uv);blue=image3.GatherBlue(sampler3,uv);break;
+ }
+ uint sign=TEXTURE_SIGN(stage);
+ if(sign&4)green=2*green-1;
+ else {green*=255;green=(green-256*step(128,green))/127;}
+ if(sign&8)blue=2*blue-1;
+ else {blue*=255;blue=(blue-256*step(128,blue))/127;}
+ return float2(dot(blue,0.25),dot(green,0.25));
+}
+/* Heat haze as the GameCube release draws it (its shimmer post-effect,
+ * main.dol 0x800FBD90): the same distortion art, kept at 64x64 where the
+ * Xbox's is 128x128, warps a full-resolution copy of the scene through an
+ * indirect matrix of 0.05 x 2^1 -- 0.1 texel per offset step, at most 12.7
+ * texels of the 640x480 frame. Here the Xbox map is read at half its
+ * resolution (each texel the mean of a 2x2 block, bilinearly blended) and
+ * scaled to that reach, as a fraction of the screen, in the direction the
+ * Xbox's bump matrix gives it. */
+float2 gamecube_heat_offset(uint stage,float2 uv) {
+ uint width,height;
+ switch(stage) {
+ case 0:image0.GetDimensions(width,height);break;
+ case 1:image1.GetDimensions(width,height);break;
+ case 2:image2.GetDimensions(width,height);break;
+ default:image3.GetDimensions(width,height);break;
+ }
+ float2 fine=float2(width,height),coarse=max(fine*0.5,1);
+ float2 position=uv*coarse-0.5,base=floor(position),blend=position-base;
+ float2 a=heat_block(stage,(base+float2(0.5,0.5))/coarse),b=heat_block(stage,(base+float2(1.5,0.5))/coarse);
+ float2 c=heat_block(stage,(base+float2(0.5,1.5))/coarse),d=heat_block(stage,(base+float2(1.5,1.5))/coarse);
+ return lerp(lerp(a,b,blend.x),lerp(c,d,blend.x),blend.y);
+}
 PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
  float4 registers[16]; [unroll]for(uint index=0;index<16;index++)registers[index]=0;
  registers[4]=input.diffuse; registers[5]=input.specular; registers[3]=float4(fogColor.rgb,saturate(input.fog));
@@ -640,8 +679,16 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
          float2 particleUV=sourceCoordinate.xy;
          if(sourceCoordinate.w!=0)particleUV/=sourceCoordinate.w;
          if(textureInfo[sourceStage].z!=0)particleUV/=textureInfo[sourceStage].xy;
-         perturbation=filtered_heat_offset(sourceStage,particleUV);
-         displacement=2*float2(dot(bumpMatrix[stage].xz,perturbation),dot(bumpMatrix[stage].yw,perturbation));
+         if(textureFlags&65536) {
+          perturbation=gamecube_heat_offset(sourceStage,particleUV);
+          float4 matrixSize=abs(bumpMatrix[stage]);
+          float reach=max(max(matrixSize.x,matrixSize.y),max(matrixSize.z,matrixSize.w));
+          displacement=float2(dot(bumpMatrix[stage].xz,perturbation),dot(bumpMatrix[stage].yw,perturbation));
+          displacement=(reach>0?displacement/reach:perturbation)*float2(12.7/640,12.7/480);
+         } else {
+          perturbation=filtered_heat_offset(sourceStage,particleUV);
+          displacement=2*float2(dot(bumpMatrix[stage].xz,perturbation),dot(bumpMatrix[stage].yw,perturbation));
+         }
          /* A rounded, feathered footprint avoids trading a hard square for
           * a soft square. Both displacement and blend vanish at its border. */
          float2 centred=particleUV*2-1;
@@ -649,7 +696,7 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
          /* The combiner already applies particle alpha. Applying it again
           * hides the rocket launcher's deliberately faint barrel haze. */
          hazeCoverage*=coverage;
-         if(textureInfo[stage].z!=0)displacement/=textureInfo[stage].xy;
+         if(textureInfo[stage].z!=0 && !(textureFlags&65536))displacement/=textureInfo[stage].xy;
          float2 screenUV=input.position.xy*bumpLuminance[stage].zw;
          if(textureFlags&8192) {
           float2 capturedUV=coordinate.xy;

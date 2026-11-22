@@ -710,8 +710,9 @@ static bool screen_shaped(uint32_t width, uint32_t height)
 
 /* Heat haze (nv2a_gpu_set_heat_haze): 0 as the console draws it; 1 smooth,
  * the offsets of a bump stage read filtered (bump_source_smoothing); 2 sharp,
- * full-resolution scene refraction with feathered particle edges; 3 off.
- * RECOMP_SMOOTH_BUMP=1 starts at 1. */
+ * full-resolution scene refraction with feathered particle edges; 3 off;
+ * 4 as the GameCube release draws it (heat_haze_sharp, and the shader's
+ * gamecube_heat_offset). RECOMP_SMOOTH_BUMP=1 starts at 1. */
 static int heat_haze = -1;
 static std::atomic<int> pending_heat_haze{-1};
 
@@ -724,6 +725,13 @@ static int heat_haze_mode()
     return heat_haze;
 }
 
+/* Enhanced and GameCube: both refract the current full-resolution scene
+ * rather than the title's 256x256 copy of it. */
+static bool heat_haze_sharp()
+{
+    return heat_haze_mode() == 2 || heat_haze_mode() == 4;
+}
+
 /* How much finer than the render scale a target is drawn: with a sharp heat
  * haze, one well under the screen's size gets the screen's density, up to 4x. */
 static UINT extent_at(uint32_t size, float factor)
@@ -732,12 +740,26 @@ static UINT extent_at(uint32_t size, float factor)
     return std::min<UINT>((UINT)((float)size * factor + 0.5f), D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
 }
 
+/* Half-width DLAA (dlaa_half_width): a title that draws its 3D view twice
+ * the screen's width (Turok Evolution: 1280x480, squeezed to 640 for the
+ * screen -- two samples per pixel across, its own anti-aliasing) has those
+ * targets drawn at half that density across while DLAA is the chosen mode:
+ * the screen's own width, so DLAA (and every 3D draw) covers half the
+ * pixels; DLAA's samples over frames take the place of the title's two.
+ * 1, or 0.5 while it applies (apply_target_sizes). */
+static float double_width_density = 1.0f;
+
 /* A target's texture size: `scaled` false for a depth-only target. */
 static void texture_size(uint32_t width, uint32_t height, bool scaled, UINT &texture_width, UINT &texture_height)
 {
     float scale = scaled ? render_scale() : 1.0f;
     bool screen = screen_shaped(width, height);
     float wide = scaled && wide_frames && screen ? wide_factor : 1.0f;
+    uint32_t screen_width = 640, screen_height = 480;
+    if (scaled && screen && double_width_density != 1.0f) {
+        xbox_FramebufferSize(&screen_width, &screen_height);
+        if (width == 2 * screen_width) wide *= double_width_density;
+    }
     texture_width = extent_at(width, scale * wide);
     texture_height = extent_at(height, scale);
 }
@@ -2445,16 +2467,24 @@ static void resize_targets(const char *why)
     std::fprintf(stderr, "[GPU-D3D11] %s: %u colour and %u depth targets redrawn\n", why, colors, depths);
 }
 
+static bool dlaa_half_width();
+
 /* Between frames: a scale or widescreen asked for, and the 2D-frame test. */
 static void apply_target_sizes()
 {
     char why[96] = "";
+    float density = dlaa_half_width() ? 0.5f : 1.0f;
+    if (density != double_width_density) {
+        std::snprintf(why, sizeof why, "DLAA %s width", density < 1.0f ? "screen" : "double");
+        double_width_density = density;
+    }
     float requested = pending_render_scale.exchange(-1.0f);
     if (requested >= 0.0f) {
         float previous = render_scale(), scale = requested_render_scale(requested);
         if (scale != previous) {
             current_render_scale = scale;
-            std::snprintf(why, sizeof why, "render scale %gx -> %gx", previous, scale);
+            std::snprintf(why + std::strlen(why), sizeof why - std::strlen(why), "%srender scale %gx -> %gx",
+                          *why ? ", " : "", previous, scale);
         }
     }
     requested = pending_wide_factor.exchange(-1.0f);
@@ -2467,7 +2497,7 @@ static void apply_target_sizes()
     if (haze >= 0 && haze != heat_haze_mode()) {
         heat_haze = haze;
         std::fprintf(stderr, "[GPU-D3D11] heat haze %s\n",
-                     haze == 3 ? "off" : haze == 2 ? "enhanced" : haze == 1 ? "smooth" : "xbox");
+                     haze == 4 ? "gamecube" : haze == 3 ? "off" : haze == 2 ? "enhanced" : haze == 1 ? "smooth" : "xbox");
     }
     int shadow = pending_shadow_scale.exchange(-1);
     if (shadow > 0 && (float)shadow != shadow_scale()) {
@@ -2509,7 +2539,7 @@ extern "C" void nv2a_gpu_set_msaa(int samples)
 
 extern "C" void nv2a_gpu_set_heat_haze(int mode)
 {
-    pending_heat_haze.store(mode >= 3 ? 3 : mode == 2 ? 2 : mode == 1 ? 1 : 0);
+    pending_heat_haze.store(mode == 4 ? 4 : mode >= 3 ? 3 : mode == 2 ? 2 : mode == 1 ? 1 : 0);
 }
 
 /* Alpha-tested pixels (grass, leaves, fences) take a share of the MSAA
@@ -3284,6 +3314,63 @@ extern "C" uint32_t nv2a_gpu_flip(const void *presented, size_t bytes, uint32_t 
  * and reads the frame back every flip, and pins the window to 640x480. It
  * stays for frames whose pixels have to be in guest RAM (the movie overlay,
  * captures), which come here as CPU pixels instead. */
+/* Diagnostic: RECOMP_PRESENT_DUMP=<path.bmp> writes the surface shown on
+ * screen, at its render resolution (before any scaling to the window), once
+ * RECOMP_PRESENT_DUMP_SEC seconds (default 60) after the first present: for
+ * comparing settings' output, which F11/F12 (the console's 640x480) cannot. */
+static void present_dump(ID3D11ShaderResourceView *view)
+{
+    static const char *path = std::getenv("RECOMP_PRESENT_DUMP");
+    static ULONGLONG first;
+    static bool done;
+    if (!path || !*path || done || !view) return;
+    if (!first) first = GetTickCount64();
+    const char *seconds = std::getenv("RECOMP_PRESENT_DUMP_SEC");
+    if (GetTickCount64() - first < (ULONGLONG)(seconds ? std::atoi(seconds) : 60) * 1000ull) return;
+    done = true;
+    ComPtr<ID3D11Resource> resource;
+    view->GetResource(&resource);
+    ComPtr<ID3D11Texture2D> texture;
+    if (!resource || FAILED(resource.As(&texture))) return;
+    D3D11_TEXTURE2D_DESC desc = {};
+    texture->GetDesc(&desc);
+    bool rgba = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+                desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.MipLevels = 1; staging_desc.ArraySize = 1; staging_desc.SampleDesc = {1, 0};
+    staging_desc.Usage = D3D11_USAGE_STAGING; staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ; staging_desc.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> staging;
+    if (desc.SampleDesc.Count != 1 || FAILED(device->CreateTexture2D(&staging_desc, nullptr, &staging))) return;
+    context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, texture.Get(), 0, nullptr);
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return;
+    FILE *file = std::fopen(path, "wb");
+    if (file) {
+        uint32_t width = desc.Width, height = desc.Height, row = width * 3, padded = (row + 3) & ~3u;
+        uint8_t header[54] = {'B', 'M'};
+        uint32_t size = 54 + padded * height, offset = 54, info = 40, planes_bits = 1 | (24u << 16), image = padded * height;
+        std::memcpy(header + 2, &size, 4); std::memcpy(header + 10, &offset, 4); std::memcpy(header + 14, &info, 4);
+        std::memcpy(header + 18, &width, 4); std::memcpy(header + 22, &height, 4);
+        std::memcpy(header + 26, &planes_bits, 4); std::memcpy(header + 34, &image, 4);
+        std::fwrite(header, 1, 54, file);
+        std::vector<uint8_t> line(padded, 0);
+        for (uint32_t y = height; y-- > 0;) {
+            const uint8_t *source = (const uint8_t *)mapped.pData + (size_t)y * mapped.RowPitch;
+            for (uint32_t x = 0; x < width; x++) {
+                line[x * 3 + 0] = source[x * 4 + (rgba ? 2 : 0)];
+                line[x * 3 + 1] = source[x * 4 + 1];
+                line[x * 3 + 2] = source[x * 4 + (rgba ? 0 : 2)];
+            }
+            std::fwrite(line.data(), 1, padded, file);
+        }
+        std::fclose(file);
+        std::fprintf(stderr, "[GPU-D3D11] present dump: %ux%u (format %u) to %s\n", width, height,
+                     (unsigned)desc.Format, path);
+    }
+    context->Unmap(staging.Get(), 0);
+}
+
 struct Presenter {
     HWND window = nullptr;
     ComPtr<IDXGISwapChain1> chain;
@@ -3452,6 +3539,7 @@ static bool present_view(ID3D11ShaderResourceView *view, float u, float v, float
     context->PSSetShader(presenter.pixel.Get(), nullptr, 0);
     ID3D11Buffer *buffer = presenter.constants.Get();
     context->VSSetConstantBuffers(0, 1, &buffer);
+    present_dump(view);
     context->PSSetShaderResources(0, 1, &view);
     ID3D11SamplerState *sampler = presenter.sampler.Get();
     context->PSSetSamplers(0, 1, &sampler);
@@ -3916,7 +4004,7 @@ static std::unordered_map<const uint8_t *, HeatCopy> heat_copies;
 static void remember_heat_copy(const Nv2aGpuDraw &state, const Nv2aGpuVertex *vertices, uint32_t count, bool trace)
 {
     const auto &source = state.textures[0];
-    if (heat_haze_mode() != 2 || !state.color || !source.source || !source.linear ||
+    if (!heat_haze_sharp() || !state.color || !source.source || !source.linear ||
         !screen_shaped(source.width, source.height) || state.width > 512 || state.height > 512 ||
         !state.width || !state.height || count < 3 || count > 6 || !state.vertex_program || !state.vertex_constants ||
         (state.stage_program & 31u) != 1 || (source.format != 0x12 && source.format != 0x1E)) return;
@@ -4669,7 +4757,7 @@ static uint32_t heat_haze_stages(const Nv2aGpuDraw &state)
 static bool dark_matter_overlay(const Nv2aGpuDraw &state)
 {
     const auto &binding = state.textures[0];
-    return heat_haze_mode() == 2 && state.depth_enable && !state.depth_mask &&
+    return heat_haze_sharp() && state.depth_enable && !state.depth_mask &&
         state.blend_enable && state.blend_source == 0x302 && state.blend_destination == 0x303 &&
         binding.format == 0x0E && binding.width == 128 && binding.height == 128 &&
         binding.source && binding.source_bytes >= 16384 &&
@@ -4686,7 +4774,7 @@ static bool dark_matter_overlay(const Nv2aGpuDraw &state)
 static bool bump_source_smoothing(const Nv2aGpuDraw *state, uint32_t stage, const Nv2aGpuTexture &binding,
                                   Nv2aGpuTexture &smoothed)
 {
-    if (heat_haze_mode() != 1 && heat_haze_mode() != 2) return false;
+    if (heat_haze_mode() != 1 && !heat_haze_sharp()) return false;
     bool source = false;
     for (uint32_t later = stage + 1; later < 4 && !source; later++) {
         uint32_t mode = (state->stage_program >> (later * 5)) & 31u;
@@ -5576,6 +5664,29 @@ static bool dlss_inputs_match(ID3D11Resource *color, ID3D11Resource *depth, ID3D
     return true;
 }
 
+/* Half-width DLAA (double_width_density): while the chosen anti-aliasing is
+ * DLAA, NVIDIA DLSS has not been found missing, and it is asked for
+ * (nv2a_gpu_set_dlaa_half_width, or RECOMP_DLAA_HALF_WIDTH=1). Kept while
+ * DLAA pauses for menus and cutscenes (TAA then), so targets are not
+ * remade at every pause. */
+static std::atomic<int> dlaa_half_width_setting{-1};
+extern "C" void nv2a_gpu_set_dlaa_half_width(int on)
+{
+    dlaa_half_width_setting.store(on ? 1 : 0, std::memory_order_relaxed);
+}
+
+static bool dlaa_half_width()
+{
+    int setting = dlaa_half_width_setting.load(std::memory_order_relaxed);
+    if (setting < 0) {
+        const char *value = std::getenv("RECOMP_DLAA_HALF_WIDTH");
+        setting = value && *value && *value != '0' ? 1 : 0;
+        int expected = -1;
+        dlaa_half_width_setting.compare_exchange_strong(expected, setting);
+    }
+    return setting == 1 && taa_setting.load(std::memory_order_relaxed) == 2 && dlss.state >= 0;
+}
+
 static bool dlss_frame_ready()
 {
     return taa_setting.load(std::memory_order_relaxed) == 2 && dlaa_allowed.load(std::memory_order_relaxed) &&
@@ -5815,9 +5926,17 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     static const bool heat_trace = std::getenv("RECOMP_HEAT_TRACE") != nullptr;
     if (heat_trace && haze_stages) {
         static unsigned shown;
-        if (shown++ < 16)
+        if (shown++ < 16) {
             std::fprintf(stderr, "[HEAT] stages %X mode %d source %ux%u target %ux%u\n", haze_stages, heat_haze_mode(),
                          state->textures[2].width, state->textures[2].height, state->width, state->height);
+            for (uint32_t stage = 1; stage < 4; stage++)
+                if (haze_stages & (1u << stage))
+                    std::fprintf(stderr, "[HEAT]   stage %u bump matrix 00 %g 01 %g 10 %g 11 %g, copy %ux%u linear %u\n", stage,
+                                 state->textures[stage].bump_matrix[0], state->textures[stage].bump_matrix[1],
+                                 state->textures[stage].bump_matrix[2], state->textures[stage].bump_matrix[3],
+                                 state->textures[stage].width, state->textures[stage].height,
+                                 (unsigned)state->textures[stage].linear);
+        }
 
     }
     if (haze_stages && heat_haze_mode() == 3) return 1;  /* handled: suppress refraction, not fire/smoke */
@@ -6067,6 +6186,15 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     int projection = projection_register(*state);
     if (projection >= 0 && surface && screen_shaped(surface->width, surface->height)) screen_3d_draws++;
     float widened = ((float)target_width / (float)guest_width) / ((float)target_height / (float)guest_height);
+    /* Half-width DLAA draws a double-width target at half density across
+     * (double_width_density): that is not a wider view, so it is taken out
+     * here, or the 3D view lost its widescreen and stretched to the screen. */
+    if (double_width_density != 1.0f && surface && screen_shaped(surface->width, surface->height) &&
+            is_scaled(*surface)) {
+        uint32_t screen_width = 640, screen_height = 480;
+        xbox_FramebufferSize(&screen_width, &screen_height);
+        if (surface->width == 2 * screen_width) widened /= double_width_density;
+    }
     bool squeeze_2d = false;
     if (widened > 1.001f) {
         if (projection >= 0)
@@ -6232,7 +6360,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
             if ((mode == 1 || mode == 2) && vertices[vertex].texture[stage][3] == 0) return reject("zero projective texture coordinate");
         }
         if (!binding.source_bytes) return reject("missing texture data");
-        bool sharp_haze = (haze_stages & (1u << stage)) && heat_haze_mode() == 2 && surface;
+        bool sharp_haze = (haze_stages & (1u << stage)) && heat_haze_sharp() && surface;
         auto heat_copy = heat_copies.find(binding.source);
         bool mapped_haze = sharp_haze && heat_copy != heat_copies.end() &&
             heat_copy->second.scene == surface->memory && heat_copy->second.frame == surface_frame_serial;
@@ -6294,6 +6422,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
                  binding.format == 0x2F ? 128u : 0u) |
                  (((binding.filter >> 24) & 15u) == 2u ? 2048u : 0u) : 0u) |
             (mapped_haze ? 8192u : 0u) |
+            (sharp_haze && heat_haze_mode() == 4 ? 65536u : 0u) |
             (binding.shadow && shadow_far_lit() ? 16384u : 0u) |
             (binding.shadow && balcony_shadow_fade(shadow_view_exact, stage, binding.format) ? 32768u : 0u));
         if (sign_mask) signed_texture_stages++;
@@ -6526,7 +6655,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     pending_draws = true;
     if (surface && (state->color_mask & 0x01010101u)) { if (writes) mark_written_region(*surface, region); }
     else gpu_timing.color_masked_draws++;
-    if (surface && haze_stages && heat_haze_mode() == 2 && heat_scene.destination == surface->texture)
+    if (surface && haze_stages && heat_haze_sharp() && heat_scene.destination == surface->texture)
         heat_scene.serial = surface->content_serial;  /* these writes are the haze itself */
     bool stencil_writes = state->stencil_enable && (state->stencil_write_mask & 255u) &&
         (state->stencil_fail != 0x1E00 || state->stencil_depth_fail != 0x1E00 || state->stencil_pass != 0x1E00);
