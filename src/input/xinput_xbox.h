@@ -104,6 +104,9 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
  */
 BOOL xbox_InputIsConnected(DWORD dwPort);
 
+/* Read a gameplay key, mouse button, or latched wheel direction by code. */
+int xbox_KbmInputDown(int code);
+
 /**
  * Get controller capabilities.
  */

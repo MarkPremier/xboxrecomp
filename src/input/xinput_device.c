@@ -565,6 +565,11 @@ static BOOL kbm_input_down(int vk)
     }
 }
 
+int xbox_KbmInputDown(int code)
+{
+    return !kbm_capture && !kbm_menu_requested && !kbm_menu_active && kbm_input_down(code);
+}
+
 static BOOL kbm_down(int target)
 {
     const int *vk = kbm_menu_active && kbm_menu_listed[target] ? kbm_menu_binds[target].vk : kbm_binds[target].vk;
