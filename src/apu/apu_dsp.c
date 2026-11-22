@@ -24,6 +24,7 @@
 #include "apu_state.h"
 #include "apu.h"
 #include "fpconv.h"
+#include "apu_xaudio2.h"
 
 #include "dsp/dsp.h"
 #include "dsp/dsp_dma.h"
@@ -883,8 +884,12 @@ static void dsp_frame_engine(MCPXAPUState *d,
         }
     }
 
-    /* Run EP */
-    if ((d->ep.regs[NV_PAPU_EPRST] & NV_PAPU_GPRST_GPRST) &&
+    /* Run EP -- except with 5.1 output (xa2_set_output), which takes the
+     * GP's six channels itself: the EP then holds the title's AC-3 encoder,
+     * which needs a ROM the emulation lacks and spins through its whole
+     * budget (a second of every second), starving the frame thread. */
+    if (xa2_channels() != 6 &&
+        (d->ep.regs[NV_PAPU_EPRST] & NV_PAPU_GPRST_GPRST) &&
         (d->ep.regs[NV_PAPU_EPRST] & NV_PAPU_GPRST_GPDSPRST)) {
         if (d->ep_frame_div % 8 == 0) {
             dsp_start_frame(d->ep.dsp);

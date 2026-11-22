@@ -599,6 +599,32 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         apu_wav_capture((const int16_t (*)[2])d->monitor.frame_buf,
                         num_samples, 1);
 
+        /* 5.1 (xa2_set_output, the console's audio set to Dolby Digital):
+         * the title's own six channels, as the GP leaves them for the EP's
+         * AC-3 encoder in its scratch rings (mcpx_apu_surround_window, in
+         * AC-3's order: left, centre, right, left surround, right surround,
+         * LFE), sent on as PCM in the host's order (front left, front right,
+         * centre, LFE, back left, back right). The EP itself is not heard:
+         * its encoder needs a ROM the emulation lacks and stalls, which left
+         * Dolby Digital silent. The software mixer's stereo (FMV) goes to the
+         * front pair. */
+        if (xa2_channels() == 6) {
+            static int16_t surround_out[MIXER_FRAME_SAMPLES][6];
+            const int16_t (*rings)[6];
+            mcpx_apu_surround_window(&rings);
+            for (int i = 0; i < num_samples; i++) {
+                int left = rings[i][0] + d->monitor.frame_buf[i][0], right = rings[i][2] + d->monitor.frame_buf[i][1];
+                surround_out[i][0] = (int16_t)(left > 32767 ? 32767 : left < -32768 ? -32768 : left);
+                surround_out[i][1] = (int16_t)(right > 32767 ? 32767 : right < -32768 ? -32768 : right);
+                surround_out[i][2] = rings[i][1];
+                surround_out[i][3] = rings[i][5];
+                surround_out[i][4] = rings[i][3];
+                surround_out[i][5] = rings[i][4];
+            }
+            xa2_submit_samples((const int16_t *)surround_out, num_samples);
+            return;
+        }
+
         xa2_submit_samples((const int16_t *)d->monitor.frame_buf, num_samples);
         return;
     }
