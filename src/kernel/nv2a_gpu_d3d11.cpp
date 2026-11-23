@@ -740,12 +740,12 @@ static UINT extent_at(uint32_t size, float factor)
     return std::min<UINT>((UINT)((float)size * factor + 0.5f), D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION);
 }
 
-/* Half-width DLAA (dlaa_half_width): a title that draws its 3D view twice
+/* Screen-width 3D (scene_half_width): a title that draws its 3D view twice
  * the screen's width (Turok Evolution: 1280x480, squeezed to 640 for the
  * screen -- two samples per pixel across, its own anti-aliasing) has those
- * targets drawn at half that density across while DLAA is the chosen mode:
- * the screen's own width, so DLAA (and every 3D draw) covers half the
- * pixels; DLAA's samples over frames take the place of the title's two.
+ * targets drawn at half that density across: the screen's own width, so
+ * every 3D draw (and DLAA or TAA) covers half the pixels, and the render
+ * scale, MSAA or temporal AA take the place of the title's two samples.
  * 1, or 0.5 while it applies (apply_target_sizes). */
 static float double_width_density = 1.0f;
 
@@ -2467,15 +2467,15 @@ static void resize_targets(const char *why)
     std::fprintf(stderr, "[GPU-D3D11] %s: %u colour and %u depth targets redrawn\n", why, colors, depths);
 }
 
-static bool dlaa_half_width();
+static bool scene_half_width();
 
 /* Between frames: a scale or widescreen asked for, and the 2D-frame test. */
 static void apply_target_sizes()
 {
     char why[96] = "";
-    float density = dlaa_half_width() ? 0.5f : 1.0f;
+    float density = scene_half_width() ? 0.5f : 1.0f;
     if (density != double_width_density) {
-        std::snprintf(why, sizeof why, "DLAA %s width", density < 1.0f ? "screen" : "double");
+        std::snprintf(why, sizeof why, "3D view at %s width", density < 1.0f ? "the screen's" : "double");
         double_width_density = density;
     }
     float requested = pending_render_scale.exchange(-1.0f);
@@ -5664,27 +5664,33 @@ static bool dlss_inputs_match(ID3D11Resource *color, ID3D11Resource *depth, ID3D
     return true;
 }
 
-/* Half-width DLAA (double_width_density): while the chosen anti-aliasing is
- * DLAA, NVIDIA DLSS has not been found missing, and it is asked for
- * (nv2a_gpu_set_dlaa_half_width, or RECOMP_DLAA_HALF_WIDTH=1). Kept while
- * DLAA pauses for menus and cutscenes (TAA then), so targets are not
- * remade at every pause. */
-static std::atomic<int> dlaa_half_width_setting{-1};
-extern "C" void nv2a_gpu_set_dlaa_half_width(int on)
+/* Screen-width 3D (double_width_density): asked for by the title
+ * (nv2a_gpu_set_scene_width), or RECOMP_SCENE_HALF_WIDTH=1 (the older
+ * RECOMP_DLAA_HALF_WIDTH too). Any anti-aliasing: it was DLAA's alone at
+ * first. Changing it remakes the targets once, between frames. */
+static std::atomic<int> scene_half_width_setting{-1};
+extern "C" void nv2a_gpu_set_scene_width(int screen)
 {
-    dlaa_half_width_setting.store(on ? 1 : 0, std::memory_order_relaxed);
+    scene_half_width_setting.store(screen ? 1 : 0, std::memory_order_relaxed);
 }
 
-static bool dlaa_half_width()
+/* The earlier name, for titles built against it. */
+extern "C" void nv2a_gpu_set_dlaa_half_width(int on)
 {
-    int setting = dlaa_half_width_setting.load(std::memory_order_relaxed);
+    nv2a_gpu_set_scene_width(on);
+}
+
+static bool scene_half_width()
+{
+    int setting = scene_half_width_setting.load(std::memory_order_relaxed);
     if (setting < 0) {
-        const char *value = std::getenv("RECOMP_DLAA_HALF_WIDTH");
+        const char *value = std::getenv("RECOMP_SCENE_HALF_WIDTH");
+        if (!value || !*value) value = std::getenv("RECOMP_DLAA_HALF_WIDTH");
         setting = value && *value && *value != '0' ? 1 : 0;
         int expected = -1;
-        dlaa_half_width_setting.compare_exchange_strong(expected, setting);
+        scene_half_width_setting.compare_exchange_strong(expected, setting);
     }
-    return setting == 1 && taa_setting.load(std::memory_order_relaxed) == 2 && dlss.state >= 0;
+    return setting == 1;
 }
 
 static bool dlss_frame_ready()
@@ -6186,7 +6192,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     int projection = projection_register(*state);
     if (projection >= 0 && surface && screen_shaped(surface->width, surface->height)) screen_3d_draws++;
     float widened = ((float)target_width / (float)guest_width) / ((float)target_height / (float)guest_height);
-    /* Half-width DLAA draws a double-width target at half density across
+    /* Screen-width 3D draws a double-width target at half density across
      * (double_width_density): that is not a wider view, so it is taken out
      * here, or the 3D view lost its widescreen and stretched to the screen. */
     if (double_width_density != 1.0f && surface && screen_shaped(surface->width, surface->height) &&
