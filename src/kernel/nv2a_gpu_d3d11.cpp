@@ -3336,21 +3336,22 @@ extern "C" uint32_t nv2a_gpu_flip(const void *presented, size_t bytes, uint32_t 
 /* Diagnostic: RECOMP_PRESENT_DUMP=<path.bmp> writes the surface shown on
  * screen, at its render resolution (before any scaling to the window), once
  * RECOMP_PRESENT_DUMP_SEC seconds (default 60) after the first present: for
- * comparing settings' output, which F11/F12 (the console's 640x480) cannot. */
-static void present_dump(ID3D11ShaderResourceView *view)
+ * comparing settings' output, which F11/F12 (the console's 640x480) cannot.
+ * RECOMP_PRESENT_DUMP_WINDOW=1: the window's image instead, after scaling. */
+static void present_dump(ID3D11Resource *resource, bool window)
 {
     static const char *path = std::getenv("RECOMP_PRESENT_DUMP");
+    static const bool want_window = std::getenv("RECOMP_PRESENT_DUMP_WINDOW") &&
+                                    std::atoi(std::getenv("RECOMP_PRESENT_DUMP_WINDOW")) != 0;
     static ULONGLONG first;
     static bool done;
-    if (!path || !*path || done || !view) return;
+    if (!path || !*path || done || !resource || window != want_window) return;
     if (!first) first = GetTickCount64();
     const char *seconds = std::getenv("RECOMP_PRESENT_DUMP_SEC");
     if (GetTickCount64() - first < (ULONGLONG)(seconds ? std::atoi(seconds) : 60) * 1000ull) return;
     done = true;
-    ComPtr<ID3D11Resource> resource;
-    view->GetResource(&resource);
     ComPtr<ID3D11Texture2D> texture;
-    if (!resource || FAILED(resource.As(&texture))) return;
+    if (FAILED(resource->QueryInterface(IID_PPV_ARGS(&texture)))) return;
     D3D11_TEXTURE2D_DESC desc = {};
     texture->GetDesc(&desc);
     bool rgba = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
@@ -3487,7 +3488,18 @@ static bool presenter_ready(HWND window)
         "struct V{float4 position:SV_Position;float2 uv:TEXCOORD0;};"
         "V vs(uint id:SV_VertexID){V v;float2 t=float2((id<<1)&2,id&2);"
         "v.position=float4(t*float2(2,-2)+float2(-1,1),0,1);v.uv=t*extent.xy;return v;}"
-        "float4 ps(V v):SV_Target{return float4(image.SampleLevel(smooth,v.uv,0).rgb,1);}";
+        /* Larger than the window (1920p on a 1080p screen): each pixel the
+         * average of its footprint, n x n bilinear taps across it, n the
+         * texels it spans (at most 4). One tap there skipped rows and columns
+         * in a beat pattern -- even stripes, and fine texture crawling as
+         * "static" (issue #37). Smaller, one tap as before. */
+        "float4 ps(V v):SV_Target{float w,h;image.GetDimensions(w,h);float2 span=extent.zw;"
+        "float2 texels=span*float2(w,h);"
+        "if(max(texels.x,texels.y)<=1.0)return float4(image.SampleLevel(smooth,v.uv,0).rgb,1);"
+        "int2 n=clamp((int2)ceil(texels-0.01),1,4);float3 c=0;"
+        "[loop]for(int y=0;y<n.y;y++)[loop]for(int x=0;x<n.x;x++)"
+        "c+=image.SampleLevel(smooth,v.uv+((float2(x,y)+0.5)/float2(n)-0.5)*span,0).rgb;"
+        "return float4(c/(float)(n.x*n.y),1);}";
     ComPtr<ID3DBlob> vertex, pixel, errors;
     result = shader_compile(source, sizeof source - 1, "NV2A present", nullptr, nullptr, "vs", "vs_5_0",
                         D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vertex, &errors);
@@ -3546,7 +3558,8 @@ static bool present_view(ID3D11ShaderResourceView *view, float u, float v, float
     if (shown_height > height) { shown_height = height; shown_width = height * aspect; }
     D3D11_VIEWPORT viewport = {(width - shown_width) * 0.5f, (height - shown_height) * 0.5f,
                                shown_width, shown_height, 0.0f, 1.0f};
-    const float extent[4] = {u, v, 0, 0};
+    /* The shown part's size, and the step one window pixel takes across it. */
+    const float extent[4] = {u, v, u / shown_width, v / shown_height};
     context->UpdateSubresource(presenter.constants.Get(), 0, nullptr, extent, 0, 0);
     context->OMSetRenderTargets(1, &target, nullptr);
     context->OMSetBlendState(presenter.blend.Get(), nullptr, UINT_MAX);
@@ -3558,13 +3571,23 @@ static bool present_view(ID3D11ShaderResourceView *view, float u, float v, float
     context->PSSetShader(presenter.pixel.Get(), nullptr, 0);
     ID3D11Buffer *buffer = presenter.constants.Get();
     context->VSSetConstantBuffers(0, 1, &buffer);
-    present_dump(view);
+    context->PSSetConstantBuffers(0, 1, &buffer);
+    {
+        ComPtr<ID3D11Resource> source;
+        view->GetResource(&source);
+        present_dump(source.Get(), false);
+    }
     context->PSSetShaderResources(0, 1, &view);
     ID3D11SamplerState *sampler = presenter.sampler.Get();
     context->PSSetSamplers(0, 1, &sampler);
     context->RSSetState(presenter.raster.Get());
     context->RSSetViewports(1, &viewport);
     context->Draw(3, 0);
+    {
+        ComPtr<ID3D11Resource> shown;
+        target->GetResource(&shown);
+        present_dump(shown.Get(), true);
+    }
     /* The next draw binds its own state; the surface just sampled may be its
      * render target. */
     ID3D11ShaderResourceView *no_view = nullptr;
