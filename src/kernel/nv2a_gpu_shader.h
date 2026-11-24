@@ -743,7 +743,13 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
     * blotches. A twentieth of a 16-bit step counts as touching -- in shadow
     * -- for GREATER/GEQUAL (lit while the stored depth is beyond the
     * reference; Turok's). */
-   if((textureFlags&4096) && (func==4 || func==6))reference+=0.05;
+   /* NV_SHADOW_TOLERANCE (RECOMP_SHADOW_TOLERANCE, in 16-bit steps; a
+    * diagnostic): how far a surface may lie behind the stored caster and
+    * still count as touching it. */
+#ifndef NV_SHADOW_TOLERANCE
+#define NV_SHADOW_TOLERANCE 0.05
+#endif
+   if((textureFlags&4096) && (func==4 || func==6))reference+=NV_SHADOW_TOLERANCE;
    /* At or near the end of the light's depth range (the sky, a distant
     * backdrop) the reference clamps to the map's maximum, which is also what
     * a texel no caster reached holds, so GREATER failed and the far sky

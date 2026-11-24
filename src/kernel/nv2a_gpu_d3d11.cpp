@@ -1412,11 +1412,29 @@ static bool pixel_compiles_async()
     return enabled;
 }
 
+/* RECOMP_SHADOW_TOLERANCE=<16-bit steps>: the exact shadow map's touching
+ * tolerance (NV_SHADOW_TOLERANCE in the shader; 0.05 when unset). A
+ * diagnostic, for characters' own shadows flickering on them (issue #34). */
+static const char *shadow_tolerance()
+{
+    static std::string value = []() {
+        const char *setting = std::getenv("RECOMP_SHADOW_TOLERANCE");
+        double steps = setting && *setting ? std::atof(setting) : 0.05;
+        if (!(steps >= 0.0 && steps <= 64.0)) steps = 0.05;
+        char text[32];
+        std::snprintf(text, sizeof text, "%.6g", steps);
+        if (setting && *setting) std::fprintf(stderr, "[GPU-D3D11] shadow tolerance %s steps\n", text);
+        return std::string(text);
+    }();
+    return value.c_str();
+}
+
 static HRESULT compile_pixel_variant(const PixelCompileJob &job, ComPtr<ID3DBlob> &code, ComPtr<ID3DBlob> &errors,
                                      bool compile = true)
 {
+    const D3D_SHADER_MACRO generic_definitions[] = {{"NV_SHADOW_TOLERANCE", shadow_tolerance()}, {nullptr, nullptr}};
     if (job.generic)
-        return compile_shader_cached(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A-generic", nullptr,
+        return compile_shader_cached(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A-generic", generic_definitions,
                                      "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS,
                                      code, errors, compile);
     const auto &values = job.values;
@@ -1427,7 +1445,8 @@ static HRESULT compile_pixel_variant(const PixelCompileJob &job, ComPtr<ID3DBlob
         {"NV_TEXTURE_SIGNS",values[6].c_str()},
         {"NV_WINDOW_CLIP_MODE",values[7].c_str()},
         {"NV_DEPTH_ENABLED",job.key[37] ? "1" : "0"},
-        {"NV_DEPTH_SEMANTIC",job.key[36] ? "SV_DepthGreaterEqual" : "SV_DEPTH"}, {nullptr,nullptr}
+        {"NV_DEPTH_SEMANTIC",job.key[36] ? "SV_DepthGreaterEqual" : "SV_DEPTH"},
+        {"NV_SHADOW_TOLERANCE",shadow_tolerance()}, {nullptr,nullptr}
     };
     return compile_shader_cached(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A-guest", definitions,
                                  "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS,
