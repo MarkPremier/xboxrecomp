@@ -21,6 +21,10 @@ _SUB_DEF_RE = re.compile(r"^void (sub_([0-9A-Fa-f]{8}))\(void\)\s*(?:\{|$)", re.
 # recomp_manual.c wraps rather than replaces some functions: it defines sub_X
 # itself and calls the generated body as sub_X_gen.
 _WRAP_RE = re.compile(r"^extern void (sub_([0-9A-Fa-f]{8}))_gen\(void\);", re.M)
+# A macro wrapper, LIFTED_LEAF(XXXXXXXX): it expands to an `extern void
+# sub_X_gen(void);` and a `void sub_X(void)` definition that the regexes above
+# cannot see through the token pasting, so it counts as both.
+_LIFTED_RE = re.compile(r"^LIFTED_LEAF\(([0-9A-Fa-f]{8})\)", re.M)
 
 
 def strip_disabled(src):
@@ -89,4 +93,5 @@ def scan(path):
     skip = {int(m.group(2), 16) for m in _SUB_DEF_RE.finditer(live)}
     wrap = {int(m.group(2), 16) for m in _WRAP_RE.finditer(live)}
     referenced = {int(m.group(1), 16) for m in _REF_RE.finditer(live)}
-    return skip, wrap, referenced
+    lifted = {int(m.group(1), 16) for m in _LIFTED_RE.finditer(live)}
+    return skip | lifted, wrap | lifted, referenced | lifted

@@ -1412,6 +1412,9 @@ static void voice_process(MCPXAPUState *d,
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    static uint32_t idle_reported[MCPX_HW_MAX_VOICES], idle_serial;   /* when each was last reported idle */
+    int idle_pick = -1;
+
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {
@@ -1547,7 +1550,8 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 static uint16_t locked_idle_frames[MCPX_HW_MAX_VOICES];
                 if (!locked_now) {
                     locked_idle_frames[v] = 0;
-                    fe_method(d, SE2FE_IDLE_VOICE, v);
+                    if (idle_pick < 0 || idle_reported[v] < idle_reported[idle_pick])
+                        idle_pick = v;   /* reported after the walk (below) */
                 } else if (++locked_idle_frames[v] == 188) {
                     static unsigned reported;
                     if (reported++ < 16)
@@ -1561,6 +1565,25 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             qemu_mutex_unlock(&d->vp.voice_guard[v]);
             d->regs[current] = d->regs[next];
         }
+    }
+
+    /* One idle voice is reported a frame, through the front end's trap: the
+     * one reported least recently, checked again under its guard. Hardware
+     * stops on each idle voice's trap until the ISR resumes it and then goes
+     * on down the list, so every idle voice is reported. Taking the first in
+     * the list each frame instead starved the rest behind one DirectSound
+     * leaves linked -- a stereo stream's other half, whose report it ignores
+     * -- and the title's wait for the voice it stopped (sub_001B404B) ran to
+     * its 5 s timeout: Turok Evolution's New Game, after the start press. */
+    if (idle_pick >= 0 && (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE) != NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
+        uint16_t v = (uint16_t)idle_pick;
+        qemu_mutex_lock(&d->vp.voice_guard[v]);
+        if (!is_voice_locked(d, v) &&
+            !voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+            idle_reported[v] = ++idle_serial;
+            fe_method(d, SE2FE_IDLE_VOICE, v);
+        }
+        qemu_mutex_unlock(&d->vp.voice_guard[v]);
     }
 
     /* VP monitor output */

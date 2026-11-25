@@ -53,7 +53,11 @@ static void *tbl[] = { sub_00055000 };
 #if 0
 /* Disabled override kept as documentation -- must NOT count as defined. */
 void sub_00066000(void) { nothing(); }
+LIFTED_LEAF(00088000)
 #endif
+
+/* A macro wrapper: defines sub_00077000 and calls sub_00077000_gen. */
+LIFTED_LEAF(00077000)
 """
 
 
@@ -68,9 +72,9 @@ def test_scan_partitions_correctly():
     with tempfile.TemporaryDirectory() as tmp:
         skip, wrap, ref = scan(_write(tmp))
     # defined by hand (incl. the wrapper's own sub_X definition)
-    assert skip == {0x11000, 0x22000, 0x44000}, [hex(a) for a in sorted(skip)]
-    # wrapped
-    assert wrap == {0x44000}, [hex(a) for a in sorted(wrap)]
+    assert skip == {0x11000, 0x22000, 0x44000, 0x77000}, [hex(a) for a in sorted(skip)]
+    # wrapped (LIFTED_LEAF too; not the one inside #if 0)
+    assert wrap == {0x44000, 0x77000}, [hex(a) for a in sorted(wrap)]
     # every sub_ the file mentions at all
     assert {0x11000, 0x22000, 0x33000, 0x44000, 0x55000} <= ref, \
         [hex(a) for a in sorted(ref)]
