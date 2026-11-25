@@ -164,6 +164,10 @@ typedef struct Nv2aGpuDraw {
 	 * width/height/clip above are in real surface pixels, vertex positions
 	 * in logical ones, so the shader divides by the logical size. 0 = 1. */
 	uint32_t aa_scale_x, aa_scale_y;
+	/* Nonzero: changes whenever a program word is loaded, so with the
+	 * start it names the program's contents (what the draw path works out
+	 * from the program is kept until it changes). 0: work it out each time. */
+	uint64_t vertex_serial;
 } Nv2aGpuDraw;
 
 int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, uint32_t count);

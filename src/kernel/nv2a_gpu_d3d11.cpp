@@ -1038,7 +1038,7 @@ static std::string vertex_source(uint32_t mux, uint32_t temporary, uint32_t swiz
     return negate ? "-(" + result + ")" : result;
 }
 
-static uint32_t vertex_program_word_count(const Nv2aGpuDraw &state)
+static uint32_t vertex_program_word_count_scan(const Nv2aGpuDraw &state)
 {
     if (!state.vertex_program || !state.vertex_valid || !state.vertex_constants || state.vertex_start >= 136) return 0;
     for (uint32_t slot = state.vertex_start; slot < 136; slot++) {
@@ -1046,6 +1046,24 @@ static uint32_t vertex_program_word_count(const Nv2aGpuDraw &state)
         if (state.vertex_program[slot][3] & 1u) return (slot - state.vertex_start + 1) * 4;
     }
     return 0;
+}
+
+/* A draw asks for this four times over and the program rarely changes from
+ * one draw to the next: kept for the last (program, serial, start). */
+static uint32_t vertex_program_word_count(const Nv2aGpuDraw &state)
+{
+    static thread_local const void *cached_program;
+    static thread_local uint64_t cached_serial;
+    static thread_local uint32_t cached_start, cached_words;
+    if (!state.vertex_serial || !state.vertex_constants) return vertex_program_word_count_scan(state);
+    if (state.vertex_serial != cached_serial || state.vertex_start != cached_start ||
+            (const void *)state.vertex_program != cached_program) {
+        cached_words = vertex_program_word_count_scan(state);
+        cached_serial = state.vertex_serial;
+        cached_start = state.vertex_start;
+        cached_program = state.vertex_program;
+    }
+    return cached_words;
 }
 
 static bool vertex_program_key(const Nv2aGpuDraw &state, std::vector<uint32_t> &key)
@@ -1164,9 +1182,11 @@ static std::string vertex_program_source(const std::vector<uint32_t> &key, bool 
  * (nv2a_gpu_set_projection_registers): D3D's c0 by default. */
 static int projection_registers[4] = {96};
 static int projection_register_count = 1;
+static uint32_t projection_registers_serial = 1;
 
 extern "C" void nv2a_gpu_set_projection_registers(const int *registers, int count)
 {
+    projection_registers_serial++;
     projection_register_count = 0;
     for (int index = 0; index < count && index < 4; index++)
         if (registers[index] >= 0 && registers[index] < 192)
@@ -1175,9 +1195,8 @@ extern "C" void nv2a_gpu_set_projection_registers(const int *registers, int coun
 
 /* The register a draw projects x through, read directly (not through a0): -1
  * for a draw in screen space. The fixed-function transform's is c[0]. */
-static int projection_register(const Nv2aGpuDraw &state)
+static int projection_register_scan(const Nv2aGpuDraw &state)
 {
-    if (!state.vertex_program) return state.fixed_transform ? 0 : -1;
     uint32_t words = vertex_program_word_count(state), found = 0;
     for (uint32_t slot = state.vertex_start; slot < state.vertex_start + words / 4; slot++) {
         const uint32_t *word = state.vertex_program[slot];
@@ -1192,6 +1211,26 @@ static int projection_register(const Nv2aGpuDraw &state)
     for (int index = 0; index < projection_register_count; index++)
         if (found & (1u << index)) return projection_registers[index];
     return -1;
+}
+
+/* Kept like vertex_program_word_count's answer, and for the same registers. */
+static int projection_register(const Nv2aGpuDraw &state)
+{
+    if (!state.vertex_program) return state.fixed_transform ? 0 : -1;
+    static thread_local const void *cached_program;
+    static thread_local uint64_t cached_serial;
+    static thread_local uint32_t cached_start, cached_registers;
+    static thread_local int cached_projection;
+    if (!state.vertex_serial || !state.vertex_constants) return projection_register_scan(state);
+    if (state.vertex_serial != cached_serial || state.vertex_start != cached_start ||
+            (const void *)state.vertex_program != cached_program || projection_registers_serial != cached_registers) {
+        cached_projection = projection_register_scan(state);
+        cached_serial = state.vertex_serial;
+        cached_start = state.vertex_start;
+        cached_program = state.vertex_program;
+        cached_registers = projection_registers_serial;
+    }
+    return cached_projection;
 }
 
 /* Compiled shaders persist on disk: each guest shader variant costs fxc

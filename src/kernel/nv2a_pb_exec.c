@@ -3336,6 +3336,9 @@ static int gpu_raster_batch(void)
     if ((s_gpu.transform_execution_mode & 3u) == 2u) {
         state.vertex_program = s_gpu.vp_program; state.vertex_valid = s_gpu.vp_valid;
         state.vertex_constants = s_gpu.vp_constants; state.vertex_start = s_gpu.vp_start;
+        /* vp_words counts the program words loaded; it wraps only after 2^32
+         * of them, never between two draws. */
+        state.vertex_serial = (uint64_t)s_gpu.vp_words + 1u;
         static int fetch_all = -1;
         if (fetch_all < 0) {
             const char *value = getenv("RECOMP_NV2A_VERTEX_FETCH_ALL");
@@ -4396,6 +4399,43 @@ static void vertex_program_upload(uint32_t method, uint32_t param)
     }
 }
 
+/* vertex_program_upload for `count` words of one packet with incrementing
+ * methods, all within the program (0x0B00-0x0B7C) or all within the
+ * constants (0x0B80-0x0BFC): the component steps with the method and the
+ * cursor with every fourth, so the words land one after another from the
+ * cursor on. Kept in locals, which per word went back through memory. */
+static void vertex_program_upload_run(uint32_t method, const uint32_t *words, uint32_t count)
+{
+    uint32_t i;
+    if (method < 0x0B80) {
+        uint32_t component = ((method - 0x0B00) >> 2) & 3u, load = s_gpu.vp_load;
+        for (i = 0; i < count; i++) {
+            if (load < 136) {
+                s_gpu.vp_program[load][component] = words[i];
+                s_gpu.vp_valid[load] |= 1u << component;
+            }
+            if (component == 3) { component = 0; load++; }
+            else component++;
+        }
+        s_gpu.vp_load = load;
+        s_gpu.vp_words += count;
+    } else {
+        uint32_t component = ((method - 0x0B80) >> 2) & 3u, load = s_gpu.constant_load;
+        uint32_t composite = s_gpu.composite_valid;
+        for (i = 0; i < count; i++) {
+            if (load < 192)
+                memcpy(&s_gpu.vp_constants[load][component], &words[i], 4);
+            if (load < 4)
+                composite |= 1u << (load * 4 + component);
+            if (component == 3) { component = 0; load++; }
+            else component++;
+        }
+        s_gpu.composite_valid = composite;
+        s_gpu.constant_load = load;
+        s_gpu.constant_words += count;
+    }
+}
+
 /* A run of a packet's parameters (contiguous words) for nv2a_pb_run: the
  * ones nv2a_pb_exec_method's fast path would handle -- index lists, vertex-
  * program and constant uploads, zero no-ops -- in one call. Returns how many
@@ -4410,31 +4450,62 @@ uint32_t nv2a_pb_exec_run(uint32_t subch, uint32_t method, int noninc, const uin
     if (noninc && (method == NV097_ARRAY_ELEMENT16 || method == NV097_ARRAY_ELEMENT32)) {
         int sixteen = method == NV097_ARRAY_ELEMENT16;
         if (!require_index_capacity(count * (sixteen ? 2u : 1u), method)) return 0;
-        for (; taken < count; taken++) {
-            uint32_t word = words[taken];
-            if (sixteen) {
-                append_vertex_index(word & 0xFFFFu);
-                append_vertex_index(word >> 16);
-            } else
-                append_vertex_index(word);
-        }
-        if (sixteen) s_gpu.array16_indices += (uint64_t)count * 2;
-        else {
+        /* append_vertex_index for the run, its counters kept in locals: the
+         * stores into the index list could alias them, so per index they
+         * were read and written back through memory. */
+        uint32_t *dst = s_gpu.idx + s_gpu.idx_count;
+        if (sixteen) {
+            for (; taken < count; taken++) {
+                uint32_t word = words[taken];
+                dst[2 * taken] = word & 0xFFFFu;
+                dst[2 * taken + 1] = word >> 16;
+            }
+            s_gpu.idx_count += 2 * count;
+            s_gpu.array16_indices += (uint64_t)count * 2;
+        } else {
+            uint32_t wide = 0;
+            for (; taken < count; taken++) {
+                uint32_t word = words[taken];
+                dst[taken] = word;
+                wide += word > 65535u;
+            }
+            s_gpu.idx_count += count;
+            s_gpu.wide_indices += wide;
             s_gpu.array32_indices += count;
             s_gpu.batch_array32_count += count;
         }
+        if (s_gpu.idx_count > s_gpu.max_index_count) s_gpu.max_index_count = s_gpu.idx_count;
         return taken;
     }
     if (method >= 0x0B00 && method < 0x0C00) {
-        for (; taken < count && method >= 0x0B00 && method < 0x0C00; taken++) {
-            vertex_program_upload(method, words[taken]);
-            if (!noninc) method += 4;
+        if (noninc) {
+            for (; taken < count; taken++)
+                vertex_program_upload(method, words[taken]);
+            return taken;
+        }
+        while (taken < count && method < 0x0C00) {
+            uint32_t n = ((method < 0x0B80 ? 0x0B80u : 0x0C00u) - method) / 4u;
+            if (n > count - taken) n = count - taken;
+            vertex_program_upload_run(method, words + taken, n);
+            taken += n;
+            method += n * 4u;
         }
         return taken;
     }
     if (noninc && method == 0x0100) {
         while (taken < count && !words[taken]) taken++;
         return taken;
+    }
+    if (noninc && method == NV097_INLINE_ARRAY) {
+        /* nv2a_pb_exec_method's INLINE_ARRAY case for the run: kept while
+         * a batch is open and the buffer has room, dropped otherwise. */
+        if (s_gpu.prim) {
+            uint32_t room = NV_MAX_INLINE - s_gpu.inline_count;
+            uint32_t n = count < room ? count : room;
+            memcpy(s_gpu.inline_buf + s_gpu.inline_count, words, (size_t)n * 4u);
+            s_gpu.inline_count += n;
+        }
+        return count;
     }
     return 0;
 }
@@ -4527,11 +4598,32 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE)
                 s_gpu.inline_buf[s_gpu.inline_count++] = param;
             return;
+        /* The load cursors: a quarter of the other words in a Turok
+         * Evolution level, handled eighty-odd tests further down. */
+        case 0x1E9C: s_gpu.vp_load = param; return;
+        case 0x1EA0: s_gpu.vp_start = param; return;
+        case 0x1EA4: s_gpu.constant_load = param; return;
+        case NV097_SET_BEGIN_END: goto state_switch;
         default:
             if (method >= 0x0B00 && method < 0x0C00) {
                 vertex_program_upload(method, param);
                 return;
             }
+            /* The rest of the frequent state, straight to where it is
+             * handled: no test before each label claims a method sent to it
+             * (that is what makes it the same dispatch; keep it so when
+             * adding a test above one). 0x0310 can be claimed by the
+             * subchannel-class test below, and 0x0320/0x0324/0x0380 are
+             * benign_state_method's. */
+            if (method >= 0x1B00 && method < 0x1C00) goto texture_stages;
+            if (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET &&
+                    method < NV097_SET_VERTEX_DATA_ARRAY_FORMAT + NV_VERTEX_ATTRS * 4)
+                goto state_switch;
+            if (method >= 0x0300 && method < 0x0400 && method != 0x0310 && !benign_state_method(method))
+                goto render_state;
+            if ((method >= 0x0440 && method < 0x0940) || (method >= 0x0A20 && method < 0x0A30) ||
+                    (method >= 0x0A50 && method < 0x0A60) || (method >= 0x0AF0 && method < 0x0B00))
+                goto transform_registers;
             break;
         }
     }
@@ -4764,6 +4856,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.window_clip_valid = 1;
         return;
     }
+render_state:
     if (method == 0x037C) { s_gpu.shade_mode = param; return; }
     if (method == 0x0300) { s_gpu.alpha_enable = param; return; }
     if (method == 0x033C) { s_gpu.alpha_func = param; return; }
@@ -4891,6 +4984,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         memcpy(&s_gpu.fog_plane[(method - 0x09D0) >> 2], &param, sizeof param);
         return;
     }
+texture_stages:
     if (method >= 0x1B00 && method < 0x1C00 && (method & 63u) >= 0x28u) {
         uint32_t stage = (method - 0x1B00) >> 6;
         uint32_t offset = method & 63u;
@@ -4984,6 +5078,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         vertex_program_upload(method, param);
         return;
     }
+transform_registers:
     if (method >= 0x0A20 && method < 0x0A30) {
         uint32_t component = (method - 0x0A20) >> 2;
         memcpy(&s_gpu.viewport_offset[component], &param, 4);
@@ -5037,6 +5132,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     method, param);
         return;
     }
+state_switch:
     switch (method) {
     case NV097_CLEAR_REPORT_VALUE:
     case NV097_SET_ZPASS_PIXEL_COUNT_ENABLE:

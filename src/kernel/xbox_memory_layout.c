@@ -1144,12 +1144,21 @@ volatile uint32_t *xbox_Nv2aRegisterPointer(uint32_t offset, uint32_t bytes)
 
 void xbox_Nv2aAcknowledgeHandshakes(void)
 {
+    /* The executor calls this at every packet header: the aperture is
+     * checked once per call, and the table's offsets (all within it, see
+     * xbox_Nv2aRegisterPointer) once per run. */
+    static volatile int offsets_checked;
+    uint8_t *base = (uint8_t *)g_nv2a_memory;
+    if (!offsets_checked || !base) {
+        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++)
+            if (!xbox_Nv2aRegisterPointer(NV2A_ACK[i].offset, 4)) {
+                fflush(stderr);
+                _Exit(EXIT_FAILURE);
+            }
+        offsets_checked = 1;
+    }
     for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
-        volatile uint32_t *r = xbox_Nv2aRegisterPointer(NV2A_ACK[i].offset, 4);
-        if (!r) {
-            fflush(stderr);
-            _Exit(EXIT_FAILURE);
-        }
+        volatile uint32_t *r = (volatile uint32_t *)(base + NV2A_ACK[i].offset);
         if (*r & NV2A_ACK[i].busy_mask)
             *r &= ~NV2A_ACK[i].busy_mask;
     }
@@ -3890,27 +3899,72 @@ int xbox_ContiguousOwnsHead(uint32_t offset)
     return found;
 }
 
+/* Whether window offset `off` lies in a live block, and the largest range
+ * around it with the same answer: the block itself, or the gap between the
+ * live blocks on either side. */
+static int contig_classify(uint32_t off, uint32_t *lo, uint32_t *hi)
+{
+    uint32_t gap_lo = 0, gap_hi = CONTIG_ARENA_BYTES;
+    int i, found = 0;
+    AcquireSRWLockShared(&g_contig_lock);
+    g_cba_calls++;
+    for (i = 0; i < g_contig_block_count; i++) {
+        uint32_t s, e;
+        if (g_contig_blocks[i].free)
+            continue;
+        s = g_contig_blocks[i].addr - XBOX_CONTIG_BASE;
+        e = s + g_contig_blocks[i].size;
+        if (off >= s && off < e) {
+            gap_lo = s;
+            gap_hi = e;
+            found = 1;
+            break;
+        }
+        if (e <= off && e > gap_lo) gap_lo = e;
+        if (s > off && s < gap_hi) gap_hi = s;
+    }
+    g_cba_iters += (unsigned)(i + (i < g_contig_block_count));
+    ReleaseSRWLockShared(&g_contig_lock);
+    *lo = gap_lo;
+    *hi = gap_hi;
+    return found;
+}
+
 int xbox_ContigOwnsOffset(uint64_t physical)
 {
     /* The GPU executor asks this for every vertex array and texture it
-     * binds, mostly about the same few blocks: the last block found, kept
-     * per thread, answers without the lock until any allocation or free
-     * (g_contig_generation) could have changed it. */
+     * binds, about a few dozen blocks a frame and as many offsets outside
+     * any block (ordinary RAM). The answers, kept per thread with the range
+     * each holds for, stand until any allocation or free
+     * (g_contig_generation) could have changed them; a one-entry cache of
+     * owned blocks still left the executor scanning the table for most of
+     * them. The generation is read before the table, so a change in between
+     * only leaves the entry already stale. */
+    enum { OWN_CACHE = 16 };
     static __declspec(thread) LONG cached_generation = -1;
-    static __declspec(thread) uint32_t cached_start, cached_end;
-    uint32_t start, size;
+    static __declspec(thread) struct { uint32_t lo, hi; int owned; } cached[OWN_CACHE];
+    static __declspec(thread) unsigned cached_count, cached_next;
+    uint32_t off = (uint32_t)physical, lo, hi;
+    unsigned k;
     LONG generation;
+    int owned;
     if (physical >= CONTIG_ARENA_BYTES)
         return 0;
-    generation = InterlockedCompareExchange(&g_contig_generation, 0, 0);
-    if (generation == cached_generation && (uint32_t)physical >= cached_start && (uint32_t)physical < cached_end)
-        return 1;
-    if (!contig_block_at((uint32_t)physical, &start, &size))
-        return 0;
-    cached_generation = generation;
-    cached_start = start;
-    cached_end = start + size;
-    return 1;
+    generation = g_contig_generation;
+    if (generation != cached_generation) {
+        cached_generation = generation;
+        cached_count = cached_next = 0;
+    }
+    for (k = 0; k < cached_count; k++)
+        if (off >= cached[k].lo && off < cached[k].hi)
+            return cached[k].owned;
+    owned = contig_classify(off, &lo, &hi);
+    k = cached_next++ % OWN_CACHE;
+    cached[k].lo = lo;
+    cached[k].hi = hi;
+    cached[k].owned = owned;
+    if (cached_count < OWN_CACHE) cached_count++;
+    return owned;
 }
 
 /* Pages the APU actually wrote through the redirect (clash diagnostic). */
