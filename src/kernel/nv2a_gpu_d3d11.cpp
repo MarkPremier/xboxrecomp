@@ -969,6 +969,7 @@ struct ShaderVariant {
     std::array<uint32_t,44> key;
     ComPtr<ID3D11PixelShader> shader;
     uint64_t last_used, bytecode_bytes;
+    bool noted;   /* in this run's notes (the preload list) */
 };
 static std::vector<ShaderVariant> shader_variants;
 
@@ -978,6 +979,7 @@ struct VertexVariant {
     ComPtr<ID3D11InputLayout> layout;
     uint32_t input_mask = 0;   /* the packed attributes its layout reads */
     uint64_t last_used, bytecode_bytes;
+    bool noted = false;   /* in this run's notes (the preload list) */
 };
 static std::vector<VertexVariant> vertex_variants;
 
@@ -1425,10 +1427,13 @@ struct PixelCompileJob {
     ComPtr<ID3D11VertexShader> vertex_shader;
     ComPtr<ID3D11InputLayout> vertex_layout;
     uint32_t vertex_mask = 0;
+    bool preload = false;   /* from the preload list, not a draw's (see preload_shader_variants) */
 };
 static std::mutex pixel_jobs_lock;
 static std::condition_variable pixel_jobs_signal;
 static std::deque<std::shared_ptr<PixelCompileJob>> pixel_jobs_queued;
+/* Preloads: taken only when no draw's compile is queued. */
+static std::deque<std::shared_ptr<PixelCompileJob>> pixel_jobs_preload;
 static std::vector<std::shared_ptr<PixelCompileJob>> pixel_jobs_done;
 static std::vector<std::array<uint32_t,44>> pixel_jobs_pending;
 /* The same program can read differently packed attributes on another draw. */
@@ -1527,10 +1532,12 @@ static void pixel_compile_worker()
         std::shared_ptr<PixelCompileJob> job;
         {
             std::unique_lock<std::mutex> hold(pixel_jobs_lock);
-            pixel_jobs_signal.wait(hold, [] { return !pixel_jobs_queued.empty(); });
-            job = pixel_jobs_queued.front();
-            pixel_jobs_queued.pop_front();
+            pixel_jobs_signal.wait(hold, [] { return !pixel_jobs_queued.empty() || !pixel_jobs_preload.empty(); });
+            auto &queue = !pixel_jobs_queued.empty() ? pixel_jobs_queued : pixel_jobs_preload;
+            job = queue.front();
+            queue.pop_front();
         }
+        if (job->preload) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         /* The device is free-threaded: the driver's own compile of the
          * bytecode (long for the generic shader) happens here too. */
         if (job->vertex) {
@@ -1539,25 +1546,221 @@ static void pixel_compile_worker()
         } else if (SUCCEEDED(compile_pixel_variant(*job, job->code, job->errors)) &&
             FAILED(device->CreatePixelShader(job->code->GetBufferPointer(), job->code->GetBufferSize(), nullptr, &job->shader)))
             job->shader.Reset();
+        if (job->preload) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
         std::lock_guard<std::mutex> hold(pixel_jobs_lock);
         pixel_jobs_done.push_back(job);
         pixel_jobs_finished++;
     }
 }
 
-static void queue_pixel_compile(std::shared_ptr<PixelCompileJob> job)
+static void start_compile_workers()
 {
-    static bool started;
-    if (!started) {
-        started = true;
+    static std::once_flag started;
+    std::call_once(started, [] {
         unsigned threads = std::max(1u, std::min(3u, std::thread::hardware_concurrency() / 4));
         for (unsigned index = 0; index < threads; index++) std::thread(pixel_compile_worker).detach();
-    }
+    });
+}
+
+static void queue_pixel_compile(std::shared_ptr<PixelCompileJob> job)
+{
+    start_compile_workers();
     std::lock_guard<std::mutex> hold(pixel_jobs_lock);
     if (job->vertex) vertex_jobs_pending.emplace_back(job->vertex_key, job->vertex_mask);
     else if (!job->generic) pixel_jobs_pending.push_back(job->key);
     if (job->generic) pixel_jobs_queued.push_front(job); else pixel_jobs_queued.push_back(job);
     pixel_jobs_signal.notify_one();
+}
+
+/* Shader preloading. Each variant this machine creates is noted in
+ * <shader cache>\\<executable>.variants, and a preloaded one again when a draw
+ * first uses it, so the file lists them most recently used last. At the first
+ * draw a thread reads it (keeping each key's last note, and writing that back
+ * so the file stays short) and queues the newest 256 pixel and 256 vertex
+ * variants behind any compile a draw is waiting for: the workers load (or,
+ * with a changed shader source, compile) them and they are installed between
+ * draws, so a level's shaders are ready before it draws them -- not made in
+ * its first frame (11 ms of Turok Evolution's level start) or compiled while
+ * it plays. A preloaded variant takes a free place in the cache, never one in
+ * use, and is the first to go. RECOMP_SHADER_PRELOAD=0: none (still noted). */
+static std::mutex manifest_lock;
+static FILE *manifest_file;
+enum : uint32_t { MANIFEST_PIXEL = 0x31584950u /* PIX1 */, MANIFEST_VERTEX = 0x31585456u /* VTX1 */ };
+static constexpr size_t preload_limit = 256, manifest_limit = 1024, preload_room = 448;
+static std::atomic<int> preload_queued{-1}, preload_finished{0}, preload_installed{0};
+static std::chrono::steady_clock::time_point preload_started;
+
+static const std::wstring &manifest_path()
+{
+    static const std::wstring path = [] {
+        const std::wstring &directory = shader_cache_directory();
+        if (directory.empty()) return std::wstring();
+        wchar_t module[MAX_PATH];
+        DWORD length = GetModuleFileNameW(nullptr, module, MAX_PATH);
+        if (!length || length >= MAX_PATH) return std::wstring();
+        std::wstring name(module, length);
+        size_t slash = name.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) name.erase(0, slash + 1);
+        size_t dot = name.find_last_of(L'.');
+        if (dot != std::wstring::npos) name.erase(dot);
+        return directory + L"\\" + name + L".variants";
+    }();
+    return path;
+}
+
+static void manifest_note(uint32_t tag, const std::vector<uint32_t> &words)
+{
+    const std::wstring &path = manifest_path();
+    if (path.empty()) return;
+    std::lock_guard<std::mutex> hold(manifest_lock);
+    if (!manifest_file) manifest_file = _wfopen(path.c_str(), L"ab");
+    if (!manifest_file) return;
+    uint32_t header[2] = {tag, (uint32_t)words.size()};
+    std::fwrite(header, sizeof header, 1, manifest_file);
+    if (!words.empty()) std::fwrite(words.data(), sizeof(uint32_t), words.size(), manifest_file);
+    std::fflush(manifest_file);
+}
+
+static void note_pixel_variant(ShaderVariant &variant)
+{
+    if (variant.noted) return;
+    variant.noted = true;
+    manifest_note(MANIFEST_PIXEL, std::vector<uint32_t>(variant.key.begin(), variant.key.end()));
+}
+
+static void note_vertex_variant(VertexVariant &variant)
+{
+    if (variant.noted) return;
+    variant.noted = true;
+    std::vector<uint32_t> words;
+    words.reserve(variant.key.size() + 1);
+    words.push_back(variant.input_mask);
+    words.insert(words.end(), variant.key.begin(), variant.key.end());
+    manifest_note(MANIFEST_VERTEX, words);
+}
+
+/* The definitions a pixel variant compiles with, from its key. */
+static void pixel_job_values(PixelCompileJob &job)
+{
+    const auto &key = job.key;
+    std::array<std::string,8> &values = job.values;
+    values[0] = std::to_string(key[0] & 255u) + "u";
+    values[1] = std::to_string(key[0]) + "u"; values[2] = std::to_string(key[1]) + "u";
+    values[3] = std::to_string(key[2]) + "u"; values[4] = std::to_string(key[3]) + "u";
+    values[5] = "{";
+    for (uint32_t stage = 0; stage < 8; stage++) {
+        if (stage) values[5] += ",";
+        values[5] += "uint4(";
+        for (uint32_t component = 0; component < 4; component++) {
+            if (component) values[5] += ",";
+            values[5] += std::to_string(key[4+stage*4+component]) + "u";
+        }
+        values[5] += ")";
+    }
+    values[5] += "}";
+    values[6] = "uint4(";
+    for (uint32_t stage = 0; stage < 4; stage++) {
+        if (stage) values[6] += ",";
+        values[6] += std::to_string(key[38 + stage]) + "u";
+    }
+    values[6] += ")";
+    values[7] = std::to_string(key[42]) + "u";
+}
+
+static void preload_shader_variants()
+{
+    const std::wstring &path = manifest_path();
+    if (path.empty()) return;
+    struct Note { uint32_t tag; std::vector<uint32_t> words; };
+    std::vector<Note> notes;
+    {
+        std::lock_guard<std::mutex> hold(manifest_lock);
+        if (manifest_file) { std::fclose(manifest_file); manifest_file = nullptr; }
+        std::vector<uint32_t> data;
+        if (FILE *file = _wfopen(path.c_str(), L"rb")) {
+            uint32_t chunk[4096];
+            size_t read;
+            while ((read = std::fread(chunk, sizeof(uint32_t), 4096, file)) > 0) data.insert(data.end(), chunk, chunk + read);
+            std::fclose(file);
+        }
+        /* Each key once, where it was last noted. */
+        std::vector<Note> all;
+        for (size_t at = 0; at + 2 <= data.size();) {
+            uint32_t tag = data[at], count = data[at + 1];
+            if ((tag != MANIFEST_PIXEL && tag != MANIFEST_VERTEX) || count > 4096 || at + 2 + count > data.size()) break;
+            all.push_back({tag, std::vector<uint32_t>(data.begin() + at + 2, data.begin() + at + 2 + count)});
+            at += 2 + count;
+        }
+        std::set<std::pair<uint32_t, std::vector<uint32_t>>> seen;
+        size_t pixels = 0, vertices = 0;
+        for (size_t index = all.size(); index-- > 0;) {
+            auto &note = all[index];
+            size_t &kept = note.tag == MANIFEST_PIXEL ? pixels : vertices;
+            if (kept >= manifest_limit || !seen.insert({note.tag, note.words}).second) continue;
+            kept++;
+            notes.push_back(std::move(note));
+        }
+        std::reverse(notes.begin(), notes.end());
+        std::wstring temporary = path + L".tmp";
+        if (FILE *file = _wfopen(temporary.c_str(), L"wb")) {
+            bool complete = true;
+            for (const auto &note : notes) {
+                uint32_t header[2] = {note.tag, (uint32_t)note.words.size()};
+                complete = complete && std::fwrite(header, sizeof header, 1, file) == 1 &&
+                           (note.words.empty() ||
+                            std::fwrite(note.words.data(), sizeof(uint32_t), note.words.size(), file) == note.words.size());
+            }
+            complete = std::fclose(file) == 0 && complete;
+            if (!complete || !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) DeleteFileW(temporary.c_str());
+        }
+    }
+    const char *setting = std::getenv("RECOMP_SHADER_PRELOAD");
+    if (setting && *setting == '0') return;
+    std::vector<std::shared_ptr<PixelCompileJob>> jobs;
+    size_t pixels = 0, vertices = 0;
+    for (size_t index = notes.size(); index-- > 0;) {   /* newest first */
+        const auto &note = notes[index];
+        auto job = std::make_shared<PixelCompileJob>();
+        job->preload = true;
+        if (note.tag == MANIFEST_PIXEL) {
+            if (pixels >= preload_limit || note.words.size() != job->key.size()) continue;
+            std::copy(note.words.begin(), note.words.end(), job->key.begin());
+            pixel_job_values(*job);
+            pixels++;
+        } else {
+            if (vertices >= preload_limit || note.words.size() < 2) continue;
+            job->vertex = true;
+            job->vertex_mask = note.words[0];
+            job->vertex_key.assign(note.words.begin() + 1, note.words.end());
+            job->vertex_source = vertex_program_source(job->vertex_key, false);
+            if (job->vertex_source.empty()) continue;
+            vertices++;
+        }
+        jobs.push_back(std::move(job));
+    }
+    preload_started = std::chrono::steady_clock::now();
+    preload_queued = (int)jobs.size();
+    if (jobs.empty()) return;
+    std::fprintf(stderr, "[GPU-D3D11] preloading %zu pixel and %zu vertex shaders\n", pixels, vertices);
+    start_compile_workers();
+    std::lock_guard<std::mutex> hold(pixel_jobs_lock);
+    for (auto &job : jobs) pixel_jobs_preload.push_back(std::move(job));
+    pixel_jobs_signal.notify_all();
+}
+
+static void start_shader_preload()
+{
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(preload_shader_variants).detach(); });
+}
+
+/* A preload the workers finished: counted, and reported when it was the last. */
+static void preload_done(bool installed)
+{
+    if (installed) preload_installed++;
+    if (++preload_finished == preload_queued.load())
+        std::fprintf(stderr, "[GPU-D3D11] preloaded %d of %d shaders in %.2f s\n", preload_installed.load(), preload_queued.load(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - preload_started).count());
 }
 
 /* Variants the workers finished since the last draw, into the cache. */
@@ -1581,6 +1784,25 @@ static void install_compiled_pixel_shaders()
     }
     for (const auto &job : done) {
         if (job->vertex) {
+            bool present = std::any_of(vertex_variants.begin(), vertex_variants.end(), [&](const VertexVariant &variant) {
+                return variant.input_mask == job->vertex_mask && variant.key == job->vertex_key;
+            });
+            if (job->preload) {
+                bool install = job->vertex_shader && !present && vertex_variants.size() < preload_room;
+                if (install) {
+                    VertexVariant variant;
+                    variant.key = job->vertex_key;
+                    variant.shader = job->vertex_shader;
+                    variant.layout = job->vertex_layout;
+                    variant.input_mask = job->vertex_mask;
+                    variant.bytecode_bytes = job->code->GetBufferSize();
+                    if (auto *cached = cache_shader_variant(vertex_variants, std::move(variant))) cached->last_used = 0;
+                    else install = false;
+                }
+                preload_done(install);
+                continue;
+            }
+            if (present) continue;
             if (!job->vertex_shader) {
                 vertex_jobs_failed.emplace(job->vertex_key, job->vertex_mask);
                 gpu_timing.vertex_shader_failures++;
@@ -1595,8 +1817,23 @@ static void install_compiled_pixel_shaders()
             variant.input_mask = job->vertex_mask;
             variant.bytecode_bytes = job->code->GetBufferSize();
             gpu_timing.vertex_async_compiles++;
-            if (!cache_shader_variant(vertex_variants, std::move(variant)))
-                vertex_jobs_failed.emplace(job->vertex_key, job->vertex_mask);
+            if (auto *cached = cache_shader_variant(vertex_variants, std::move(variant))) note_vertex_variant(*cached);
+            else vertex_jobs_failed.emplace(job->vertex_key, job->vertex_mask);
+            continue;
+        }
+        if (job->preload) {
+            bool present = std::any_of(shader_variants.begin(), shader_variants.end(),
+                                       [&](const ShaderVariant &variant) { return variant.key == job->key; });
+            bool install = job->shader && !present && shader_variants.size() < preload_room;
+            if (install) {
+                ShaderVariant variant = {};
+                variant.key = job->key;
+                variant.shader = job->shader;
+                variant.bytecode_bytes = job->code->GetBufferSize();
+                if (auto *cached = cache_shader_variant(shader_variants, std::move(variant))) cached->last_used = 0;
+                else install = false;
+            }
+            preload_done(install);
             continue;
         }
         if (!job->shader) {
@@ -1615,7 +1852,10 @@ static void install_compiled_pixel_shaders()
         variant.shader = job->shader;
         variant.bytecode_bytes = job->code->GetBufferSize();
         gpu_timing.pixel_async_compiles++;
-        if (!cache_shader_variant(shader_variants, std::move(variant))) pixel_jobs_failed.insert(job->key);
+        if (std::any_of(shader_variants.begin(), shader_variants.end(),
+                        [&](const ShaderVariant &cached) { return cached.key == job->key; })) continue;
+        if (auto *cached = cache_shader_variant(shader_variants, std::move(variant))) note_pixel_variant(*cached);
+        else pixel_jobs_failed.insert(job->key);
     }
 }
 
@@ -1627,6 +1867,7 @@ static void install_compiled_pixel_shaders()
 static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
 {
     *pending = false;
+    start_shader_preload();
     uint32_t words = vertex_program_word_count(state);
     if (!words) return nullptr;
     /* Finished compiles are installed by get_pixel_shader, which runs first:
@@ -1635,6 +1876,7 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
         !std::memcmp(cached.key.data(), state.vertex_program + state.vertex_start, words * sizeof(uint32_t))) {
         cached.last_used = ++shader_use_serial;
         gpu_timing.vertex_shader_hits++;
+        note_vertex_variant(cached);
         return &cached;
     }
     std::vector<uint32_t> key(state.vertex_program[state.vertex_start], state.vertex_program[state.vertex_start] + words);
@@ -1685,6 +1927,7 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
     variant.bytecode_bytes = code->GetBufferSize();
     auto *cached = cache_shader_variant(vertex_variants, std::move(variant));
     if (!cached) vertex_jobs_failed.insert(std::move(compile_key));
+    else note_vertex_variant(*cached);
     return cached;
 }
 
@@ -1704,6 +1947,7 @@ static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t wi
         variant.key[4+stage*4] = state.combiners.rgb_input[stage]; variant.key[5+stage*4] = state.combiners.alpha_input[stage];
         variant.key[6+stage*4] = state.combiners.rgb_output[stage]; variant.key[7+stage*4] = state.combiners.alpha_output[stage];
     }
+    start_shader_preload();
     install_compiled_pixel_shaders();
     /* RECOMP_SHADER_GENERIC=1: every draw with the generic shader, to check it
      * against the compiled variants. */
@@ -1712,6 +1956,7 @@ static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t wi
     for (auto &cached : shader_variants) if (cached.key == variant.key) {
         cached.last_used = ++shader_use_serial;
         gpu_timing.pixel_shader_hits++;
+        note_pixel_variant(cached);
         return cached.shader.Get();
     }
     if (pixel_jobs_failed.count(variant.key)) return generic_pixel_shader.Get();
@@ -1727,28 +1972,7 @@ static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t wi
     GpuTimer compile_timer(gpu_timing.pixel_compile);
     auto job = std::make_shared<PixelCompileJob>();
     job->key = variant.key;
-    std::array<std::string,8> &values = job->values;
-    values[0] = std::to_string(variant.key[0] & 255u) + "u";
-    values[1] = std::to_string(variant.key[0]) + "u"; values[2] = std::to_string(variant.key[1]) + "u";
-    values[3] = std::to_string(variant.key[2]) + "u"; values[4] = std::to_string(variant.key[3]) + "u";
-    values[5] = "{";
-    for (uint32_t stage = 0; stage < 8; stage++) {
-        if (stage) values[5] += ",";
-        values[5] += "uint4(";
-        for (uint32_t component = 0; component < 4; component++) {
-            if (component) values[5] += ",";
-            values[5] += std::to_string(variant.key[4+stage*4+component]) + "u";
-        }
-        values[5] += ")";
-    }
-    values[5] += "}";
-    values[6] = "uint4(";
-    for (uint32_t stage = 0; stage < 4; stage++) {
-        if (stage) values[6] += ",";
-        values[6] += std::to_string(variant.key[38 + stage]) + "u";
-    }
-    values[6] += ")";
-    values[7] = std::to_string(variant.key[42]) + "u";
+    pixel_job_values(*job);
     if (async && !generic_pixel_requested) {
         /* The generic shader itself, first in the workers' queue (from disk
          * after the first run); until it exists, misses compile in the draw. */
@@ -1780,6 +2004,7 @@ static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t wi
     variant.bytecode_bytes = code->GetBufferSize();
     auto *cached = cache_shader_variant(shader_variants, std::move(variant));
     if (!cached) pixel_jobs_failed.insert(job->key);
+    else note_pixel_variant(*cached);
     return cached ? cached->shader.Get() : generic_pixel_shader.Get();
 }
 
