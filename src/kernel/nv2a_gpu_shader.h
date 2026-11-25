@@ -344,9 +344,32 @@ void gs_main(triangle Pixel vertices[3],inout TriangleStream<Pixel> stream) {
    if(vertices[vertex].position.w!=0 && abs(vertices[vertex].position.x/vertices[vertex].position.w)>=0.98)edge=true;
   if(!edge)squeeze=viewport.w;
  }
+ /* Early depth: each pixel writes its own depth (finish_pixel), so the
+    rasterised z is only the early depth test's, and for a pixel declared
+    SV_DepthGreaterEqual it must never be above the depth written. That
+    depth is the pixel's, worked out at its centre or centroid and rounded
+    down; the test's is each sample's, up to a pixel away. So the triangle
+    goes down by its depth change across four of the title's pixels (a
+    rendered pixel is at most two), two depth units and 2^-18; with a
+    vertex behind the camera or edge-on, all the way (no early rejection).
+    A w-buffer's z is 0 already. */
+ float lower=0;
+ if(!(misc.y&0x10000)) {
+  lower=1;
+  if(vertices[0].position.w>0 && vertices[1].position.w>0 && vertices[2].position.w>0) {
+   float3 points[3];
+   [unroll]for(uint vertex=0;vertex<3;vertex++)
+    points[vertex]=float3(vertices[vertex].position.xy/vertices[vertex].position.w*float2(squeeze,1)*viewport.xy*0.5,
+                          vertices[vertex].position.z/vertices[vertex].position.w);
+   float3 plane=cross(points[1]-points[0],points[2]-points[0]);
+   float gradient=(abs(plane.x)+abs(plane.y))/abs(plane.z);
+   if(plane.z!=0 && isfinite(gradient))lower=min(1,gradient*4+2/viewport.z+3.814697265625e-6);
+  }
+ }
  [unroll]for(uint vertex=0;vertex<3;vertex++) {
   Pixel result=vertices[vertex];
   result.position.x*=squeeze;
+  result.position.z-=lower*result.position.w;
   result.depthSlope=slope;
   if(misc.w!=0) {result.diffuse=vertices[2].diffuse;result.specular=vertices[2].specular;}
   stream.Append(result);

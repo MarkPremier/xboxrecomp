@@ -966,7 +966,7 @@ struct SamplerVariant {
 static std::vector<SamplerVariant> sampler_cache;
 
 struct ShaderVariant {
-    std::array<uint32_t,43> key;
+    std::array<uint32_t,44> key;
     ComPtr<ID3D11PixelShader> shader;
     uint64_t last_used, bytecode_bytes;
 };
@@ -1413,7 +1413,7 @@ extern "C" int nv2a_gpu_execute_state(const uint32_t program[136][4], const uint
  * frames a compile takes, but it never stalls the frame. RECOMP_SHADER_ASYNC=0
  * compiles in the draw instead, as before. */
 struct PixelCompileJob {
-    std::array<uint32_t,43> key;
+    std::array<uint32_t,44> key;
     std::array<std::string,8> values;
     ComPtr<ID3DBlob> code, errors;
     ComPtr<ID3D11PixelShader> shader;
@@ -1430,14 +1430,14 @@ static std::mutex pixel_jobs_lock;
 static std::condition_variable pixel_jobs_signal;
 static std::deque<std::shared_ptr<PixelCompileJob>> pixel_jobs_queued;
 static std::vector<std::shared_ptr<PixelCompileJob>> pixel_jobs_done;
-static std::vector<std::array<uint32_t,43>> pixel_jobs_pending;
+static std::vector<std::array<uint32_t,44>> pixel_jobs_pending;
 /* The same program can read differently packed attributes on another draw. */
 using VertexCompileKey = std::pair<std::vector<uint32_t>, uint32_t>;
 static std::vector<VertexCompileKey> vertex_jobs_pending;
 /* A deterministic compiler/device failure is remembered for this run. Without
  * this, every draw of an unsupported shader can start the same failed job. */
 static std::set<VertexCompileKey> vertex_jobs_failed;
-static std::set<std::array<uint32_t,43>> pixel_jobs_failed;
+static std::set<std::array<uint32_t,44>> pixel_jobs_failed;
 static std::atomic<int> pixel_jobs_finished{0};
 static ComPtr<ID3D11PixelShader> generic_pixel_shader;
 static bool generic_pixel_requested;
@@ -1484,7 +1484,7 @@ static HRESULT compile_pixel_variant(const PixelCompileJob &job, ComPtr<ID3DBlob
         {"NV_TEXTURE_SIGNS",values[6].c_str()},
         {"NV_WINDOW_CLIP_MODE",values[7].c_str()},
         {"NV_DEPTH_ENABLED",job.key[37] ? "1" : "0"},
-        {"NV_DEPTH_SEMANTIC",job.key[36] ? "SV_DepthGreaterEqual" : "SV_DEPTH"},
+        {"NV_DEPTH_SEMANTIC",job.key[36] || job.key[43] ? "SV_DepthGreaterEqual" : "SV_DEPTH"},
         {"NV_SHADOW_TOLERANCE",shadow_tolerance()}, {nullptr,nullptr}
     };
     return compile_shader_cached(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A-guest", definitions,
@@ -1688,7 +1688,7 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
     return cached;
 }
 
-static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t window_clip_mode)
+static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t window_clip_mode, bool conservative_depth)
 {
     ShaderVariant variant = {};
     variant.key[0] = state.combiners.control; variant.key[1] = state.stage_program;
@@ -1696,6 +1696,7 @@ static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t wi
     variant.key[36] = (state.control0 & 0x10000) != 0;
     variant.key[37] = state.depth_enable != 0;
     variant.key[42] = window_clip_mode;
+    variant.key[43] = conservative_depth;
     for (uint32_t stage = 0; stage < 4; stage++)
         if (nv2a_gpu_texture_mode_samples((state.stage_program >> (stage * 5)) & 31u))
             variant.key[38 + stage] = state.textures[stage].filter >> 28;
@@ -6641,7 +6642,30 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
         if (((state->stage_program >> (stage * 5)) & 31u) == 5u ||
             ((uint32_t)constants.texture_info[stage][3] & 16u) ||
             constants.texture_key[stage][2] == 3u) uncombined = false;
-    ID3D11PixelShader *program = uncombined ? uncombined_shader.Get() : get_pixel_shader(*state, constants.window_clip_control[0]);
+    /* Early depth: every guest pixel shader writes its depth (the NV2A's
+     * rounding, polygon offset and depth range), which as SV_DEPTH keeps the
+     * GPU from rejecting a hidden pixel before shading it -- with Turok's
+     * layered foliage most of a frame's pixels. Declared SV_DepthGreaterEqual
+     * it may, provided the written depth is never below the rasterised one:
+     * the geometry shader puts that below the true depth by the
+     * triangle's change across a few pixels (gs_main), which covers the
+     * rounding down and the multisample positions, so it is for triangles
+     * drawn through it; what remains is a polygon offset (a decal pulled
+     * forward), a range clamp below the buffer's maximum, and depth off
+     * (written as 0). Those draws keep SV_DEPTH. A w-buffer's draws
+     * already declare it (their rasterised depth is 0).
+     * RECOMP_EARLY_DEPTH=0: SV_DEPTH for all. */
+    static const bool early_depth = []() {
+        const char *value = std::getenv("RECOMP_EARLY_DEPTH");
+        return !(value && *value == '0');
+    }();
+    bool conservative_depth = early_depth && depth && state->depth_enable && !(state->control0 & 0x10000u) &&
+                              state->topology == NV2A_GPU_TOPOLOGY_TRIANGLES &&
+                              (state->vertex_program || state->fixed_transform || state->flat_shading || squeeze_2d) &&
+                              !front_offset && !back_offset &&
+                              (!depth_clamp || depth_clip_max >= (state->depth_format == 1 ? 65535.0f : 16777215.0f));
+    ID3D11PixelShader *program = uncombined ? uncombined_shader.Get()
+                                            : get_pixel_shader(*state, constants.window_clip_control[0], conservative_depth);
     if (!program) return 0;
     bool vertex_pending = false;
     VertexVariant *guest_vertex = state->vertex_program ? get_vertex_shader(*state, &vertex_pending) : nullptr;
