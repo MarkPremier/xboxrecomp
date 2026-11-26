@@ -51,6 +51,10 @@ void nv2a_gpu_set_heat_haze(int mode);
 /* Antialiased alpha-test edges with MSAA (grass, leaves): 1 on, 0 off. Any
  * thread; the next draw sees it. */
 void nv2a_gpu_set_alpha_coverage(int on);
+/* Per-pixel lighting of vertex programs (nv2a_gpu_d3d11.cpp): 0 per vertex,
+ * as the console; 1 characters (programs that skin). Any thread; the next
+ * draw sees it. RECOMP_PIXEL_LIGHTING overrides. */
+void nv2a_gpu_set_pixel_lighting(int mode);
 /* Temporal anti-aliasing of the 3D scene (nv2a_gpu_d3d11.cpp): 0 off, 1 the
  * renderer's own, 2 NVIDIA DLSS as DLAA through dlss_bridge.dll beside the
  * program (the renderer's own when that cannot run). Any thread; from the

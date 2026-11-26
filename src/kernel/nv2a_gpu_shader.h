@@ -82,6 +82,11 @@ struct Pixel {
  float depthClip:TEXCOORD8;
  /* Clip positions now (before jitter) and a frame ago: the motion target. */
  float4 motionNow:TEXCOORD9; float4 motionBefore:TEXCOORD10;
+#ifdef NV_PIXEL_LIGHTING
+ /* Per-pixel lighting: the vertex program's registers where the pixel
+    shader takes over from it (pixel_lighting, nv2a_gpu_d3d11.cpp). */
+ centroid float4 lightCut[8]:TEXCOORD11;
+#endif
 };
 float fog_factor(float distance) {
  if(textureControl.z==0)return 1;
@@ -131,6 +136,43 @@ float2 balcony_shadow_gap(float3 projected) {
  float2 distance=min(float2(3.1,3.65)/down,float2(3.9,4.5));
  if(!(lightDepth>distance.y+0.01))return 0;
  return b*distance/(lightDepth*(lightDepth-distance));
+}
+/* Enhanced+ again: whether the caster shadowing this point reaches down to
+   near the floor it is on -- a creature standing there, however tall (one
+   taller than a guard had its upper body's shadow faded, see-through) --
+   rather than standing on a floor above. From the shadowing texel (light
+   depth casterDepth) walk down the caster in the map, a unit at a time to
+   12 below and a unit to each side: any part of it within nearGap of the
+   receiver's depth is standing here. The shadow map holds only casters, so
+   a step that finds none of it has walked off the caster's bottom: a
+   caster on a floor above, faded (and the walk ends early). */
+#ifndef NV_SHADOW_GROUNDED
+#define NV_SHADOW_GROUNDED 1
+#endif
+bool shadow_caster_grounded(float3 projected,float casterDepth,float nearGap,float maxDepth,float2 scale) {
+ float4 s=vertexConstants[144],t=vertexConstants[145],r=vertexConstants[146],q=vertexConstants[147];
+ float a=dot(r.xyz,q.xyz)/dot(q.xyz,q.xyz);
+ float b=a*q.w-r.w;
+ float qHead=b/(a-casterDepth);
+ if(!(qHead>0) || !isfinite(qHead))return false;
+ float3 head=float3(projected.xy*qHead,qHead);   /* s, t and q where the caster is */
+ float2 size; image3.GetDimensions(size.x,size.y);
+ [loop]for(uint step=1;step<=12;step++) {
+  bool caster=false;
+  [loop]for(uint side=0;side<5;side++) {
+   float3 offset=float3(side==1?-1:side==2?1:0,-1.0*step,side==3?-1:side==4?1:0);
+   float3 spot=head+float3(dot(s.xyz,offset),dot(t.xyz,offset),dot(q.xyz,offset));
+   if(!(spot.z>0))continue;
+   float2 uv=spot.xy/spot.z*scale;
+   if(any(uv<0) || any(uv>=1))continue;
+   float depth=image3.Load(int3(uv*size,0)).r*maxDepth;
+   if(!(depth<maxDepth-0.5))continue;
+   if(abs(projected.z-depth)<nearGap)return true;
+   caster=true;
+  }
+  if(!caster)return false;
+ }
+ return false;
 }
 float guest_clip_w(float value) {
  if(!isfinite(value))return value;
@@ -210,6 +252,9 @@ float4 fixed_texcoord(float4 coordinate,uint stage,float4 objectPosition,float4 
    constants (vs_guest), or this one's; fixed function finds its own. */
 Pixel vs_core(Vertex input,float4 previous) {
  Pixel output;
+#ifdef NV_PIXEL_LIGHTING
+ [unroll]for(uint cut=0;cut<8;cut++)output.lightCut[cut]=0;
+#endif
  float distance=fogControl.x==6?input.fogCoordinate:saturate(input.specular.a);
  if(NV_FIXED_TRANSFORM!=0) {
   if(taa.z!=0)previous=fixed_previous_position(input);
@@ -645,7 +690,13 @@ float2 gamecube_heat_offset(uint stage,float2 uv) {
  float2 c=heat_block(stage,(base+float2(0.5,1.5))/coarse),d=heat_block(stage,(base+float2(1.5,1.5))/coarse);
  return lerp(lerp(a,b,blend.x),lerp(c,d,blend.x),blend.y);
 }
+#ifdef NV_PIXEL_LIGHTING
+void pixel_lighting(inout Pixel pixel);
+#endif
 PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
+#ifdef NV_PIXEL_LIGHTING
+ pixel_lighting(input);
+#endif
  float4 registers[16]; [unroll]for(uint index=0;index<16;index++)registers[index]=0;
  registers[4]=input.diffuse; registers[5]=input.specular; registers[3]=float4(fogColor.rgb,saturate(input.fog));
  float4 coordinates[4]={input.tex0,input.tex1,input.tex2,input.tex3};
@@ -796,6 +847,11 @@ PixelOutput ps_main(Pixel input,bool frontFacing:SV_IsFrontFace) {
    float2 gap=0;
    if((textureFlags&32768) && (func==4 || func==6) && coordinate.w>0)
     gap=balcony_shadow_gap(uvw);
+   if(gap.y>gap.x) {
+    float nearest=min(min(stored.x,stored.y),min(stored.z,stored.w));
+    if(NV_SHADOW_GROUNDED && nearest<maxDepth-0.5 && uvw.z-nearest>gap.x &&
+       shadow_caster_grounded(uvw,nearest,gap.x,maxDepth,textureInfo[stage].z!=0?1/textureInfo[stage].xy:float2(1,1)))gap=0;
+   }
    [unroll]for(uint tap=0;tap<4;tap++) {
     float depth=stored[tap];
     lit[tap]=(func==1?depth<reference:func==2?depth==reference:func==3?depth<=reference:

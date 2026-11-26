@@ -16,6 +16,7 @@
 #include <chrono>
 #include <algorithm>
 #include <set>
+#include <map>
 #include <atomic>
 #include <unordered_map>
 #include <deque>
@@ -543,6 +544,8 @@ static void report_gpu_samples()
 static ComPtr<ID3D11VertexShader> vertex_shader;
 static ComPtr<ID3D11GeometryShader> geometry_shader;
 static ComPtr<ID3D11GeometryShader> line_geometry_shader, point_geometry_shader;
+/* gs_main for a draw lit per pixel: its vertices carry pixel_lighting's registers. */
+static ComPtr<ID3D11GeometryShader> lit_geometry_shader;
 static ComPtr<ID3D11PixelShader> uncombined_shader;
 static ComPtr<ID3DBlob> vertex_code;
 
@@ -966,7 +969,7 @@ struct SamplerVariant {
 static std::vector<SamplerVariant> sampler_cache;
 
 struct ShaderVariant {
-    std::array<uint32_t,44> key;
+    std::array<uint32_t,45> key;
     ComPtr<ID3D11PixelShader> shader;
     uint64_t last_used, bytecode_bytes;
     bool noted;   /* in this run's notes (the preload list) */
@@ -1077,36 +1080,25 @@ static bool vertex_program_key(const Nv2aGpuDraw &state, std::vector<uint32_t> &
     return true;
 }
 
-static std::string vertex_program_source(const std::vector<uint32_t> &key, bool state_program)
+/* A program's instructions in HLSL, one block each; false when it has one
+ * the translation cannot take. */
+static bool vertex_program_blocks(const std::vector<uint32_t> &key, bool state_program, std::vector<std::string> &blocks)
 {
-    std::string source = state_program ? "" : "#define NV_FIXED_TRANSFORM 0\n";
-    source += nv2a_gpu_shader_source;
-    source += "\nstruct GuestVertex {\n";
-    for (uint32_t attribute = 0; attribute < 16; attribute++)
-        source += "float4 attribute" + std::to_string(attribute) + ":TEXCOORD" + std::to_string(attribute) + ";\n";
-    source += "};\n";
-    if (state_program) {
-        source += "RWStructuredBuffer<float4> stateConstants:register(u0); cbuffer Attributes:register(b1) {float4 stateAttributes[16];};\n#define vertexConstants stateConstants\n[numthreads(1,1,1)]void cs_guest(uint3 dispatch:SV_DispatchThreadID) { GuestVertex input;\n";
-        for (uint32_t attribute = 0; attribute < 16; attribute++)
-            source += "input.attribute" + std::to_string(attribute) + "=stateAttributes[" + std::to_string(attribute) + "];\n";
-    } else source += "Pixel vs_guest(GuestVertex input) {\n";
-    source += "float4 temporary[13]; float4 outputs[16]; int address=0;\n";
-    const std::string reset = "[unroll]for(uint index=0;index<13;index++)temporary[index]=0; [unroll]for(uint index=0;index<16;index++)outputs[index]=float4(0,0,0,1);\n";
-    source += reset;
-    const size_t body_start = source.size();
+    blocks.clear();
     for (size_t instruction = 0; instruction < key.size(); instruction += 4) {
+        std::string source;
         const uint32_t *words = key.data() + instruction;
         uint32_t mac = (words[1] >> 21) & 15, ilu = (words[1] >> 25) & 7;
         uint32_t input = (words[1] >> 9) & 15, constant = (words[1] >> 13) & 255;
         uint32_t destination = (words[3] >> 20) & 15, output = (words[3] >> 3) & 255;
         uint32_t mac_mask = (words[3] >> 24) & 15, ilu_mask = (words[3] >> 16) & 15, output_mask = (words[3] >> 12) & 15;
         bool relative = (words[3] & 2) != 0;
-        if (mac > 13) return {};
+        if (mac > 13) return false;
         uint32_t usage = nv_cpu_vp_operand_usage(mac, ilu);
         std::string operand_a = usage & 1u ? vertex_source((words[2] >> 26) & 3, words[2] >> 28, words[1] & 255, (words[1] >> 8) & 1, input, constant, relative) : "float4(0,0,0,0)";
         std::string operand_b = usage & 2u ? vertex_source((words[2] >> 11) & 3, (words[2] >> 13) & 15, (words[2] >> 17) & 255, (words[2] >> 25) & 1, input, constant, relative) : "float4(0,0,0,0)";
         std::string operand_c = usage & 4u ? vertex_source((words[3] >> 28) & 3, ((words[2] & 3) << 2) | (words[3] >> 30), (words[2] >> 2) & 255, (words[2] >> 10) & 1, input, constant, relative) : "float4(0,0,0,0)";
-        if (operand_a.empty() || operand_b.empty() || operand_c.empty()) return {};
+        if (operand_a.empty() || operand_b.empty() || operand_c.empty()) return false;
         source += "{ float4 aa=" + operand_a + ",bb=" + operand_b + ",cc=" + operand_c + "; precise float4 macResult=0; float4 iluResult=0;\n";
         switch (mac) {
         case 0: case 13: break;
@@ -1142,7 +1134,7 @@ static std::string vertex_program_source(const std::vector<uint32_t> &key, bool 
         if (output_mask && (selected_ilu ? ilu : mac)) {
             std::string result = selected_ilu ? "iluResult" : "macResult";
             if (!(words[3] & 0x800)) {
-                if (!state_program || output >= 192) return {};
+                if (!state_program || output >= 192) return false;
                 write("vertexConstants[" + std::to_string(output) + "]", result, output_mask);
             }
             else if ((output & 15) == 15) source += "address=(int)floor(" + result + ".x);\n";
@@ -1151,20 +1143,293 @@ static std::string vertex_program_source(const std::vector<uint32_t> &key, bool 
         }
         if (mac == 13) source += "address=(int)floor(aa.x);\n";
         else if (mac && mac_mask && !(ilu && destination == 1)) {
-            if (destination > 12) return {};
+            if (destination > 12) return false;
             write(destination == 12 ? "outputs[0]" : "temporary[" + std::to_string(destination) + "]", "macResult", mac_mask);
         }
         if (ilu && ilu_mask) {
             uint32_t ilu_destination = mac ? 1 : destination;
-            if (ilu_destination > 12) return {};
+            if (ilu_destination > 12) return false;
             write(ilu_destination == 12 ? "outputs[0]" : "temporary[" + std::to_string(ilu_destination) + "]", "iluResult", ilu_mask);
         }
         source += "}\n";
+        blocks.push_back(std::move(source));
+    }
+    return true;
+}
+
+/* Per-pixel lighting (nv2a_gpu_set_pixel_lighting). A vertex program lights
+ * its vertices -- Turok's run up to four point lights, distance falloff and
+ * a specular term through `lit` -- and the colour is interpolated across the
+ * triangle: on a low-polygon character large areas share three values,
+ * which jump together as it moves or a light comes into range. Here the
+ * pixel shader runs the program again for each pixel and takes the colours
+ * it ends with. The rest of the program -- position, texture coordinates,
+ * fog -- stays per vertex, as does whatever the colours need that cannot be
+ * interpolated: a skinning program picks its bone matrices with a0 from the
+ * vertex's indices, so the pixel shader takes over after the last
+ * instruction those colours depend on that uses a0, from the registers the
+ * vertices hold at that point (the blended position and normal),
+ * interpolated. A program that does not reach that point, or whose colours
+ * follow its inputs linearly (plain vertex colour: interpolation is exact
+ * already), stays as it is. */
+namespace pixel_lighting {
+
+enum : uint32_t { kOutputs = 32, kAddress = 48, kRegisters = 49, kCarried = 8 };
+
+/* One half of an instruction: the MAC or the ILU operation. Registers: 0-12
+ * temporaries (12 the position output, as the program reads it), 16+n the
+ * inputs, 32+n the outputs, 48 a0; reads are register*4+component. */
+struct Part {
+    uint32_t op = 0;
+    bool ilu = false, varying_product = false;
+    std::vector<uint32_t> reads;
+    std::vector<uint32_t> operands;   /* the registers it reads */
+    std::vector<uint32_t> factors;    /* of those, a's and b's: what a product multiplies */
+    std::vector<std::pair<uint32_t, uint32_t>> writes;   /* register, lanes (bit n: component n) */
+};
+
+static uint32_t lanes(uint32_t nv_mask)   /* the NV2A's x is bit 3 */
+{
+    return ((nv_mask >> 3) & 1) | ((nv_mask >> 1) & 2) | ((nv_mask << 1) & 4) | ((nv_mask << 3) & 8);
+}
+
+/* The components of operand `which` (0 a, 1 b, 2 c) an operation uses. */
+static uint32_t operand_lanes(uint32_t op, bool ilu, uint32_t which, uint32_t written)
+{
+    if (ilu) return op == 7 ? 0xBu : op == 1 ? written : 1u;
+    switch (op) {
+    case 5: return 7;
+    case 6: return which == 0 ? 7u : 15u;
+    case 7: return 15;
+    case 8: return which == 0 ? 6u : 10u;
+    case 13: return 1;
+    default: return written;
+    }
+}
+
+static void decode(const uint32_t *words, Part &mac_part, Part &ilu_part)
+{
+    uint32_t mac = (words[1] >> 21) & 15, ilu = (words[1] >> 25) & 7;
+    uint32_t input = (words[1] >> 9) & 15;
+    uint32_t destination = (words[3] >> 20) & 15, output = (words[3] >> 3) & 255;
+    uint32_t mac_mask = (words[3] >> 24) & 15, ilu_mask = (words[3] >> 16) & 15, output_mask = (words[3] >> 12) & 15;
+    bool relative = (words[3] & 2) != 0, selected_ilu = (words[3] & 4) != 0;
+    uint32_t usage = nv_cpu_vp_operand_usage(mac, ilu);
+    struct Operand { bool used; uint32_t mux, temporary, swizzle; } operands[3] = {
+        {(usage & 1u) != 0, (words[2] >> 26) & 3, words[2] >> 28, words[1] & 255},
+        {(usage & 2u) != 0, (words[2] >> 11) & 3, (words[2] >> 13) & 15, (words[2] >> 17) & 255},
+        {(usage & 4u) != 0, (words[3] >> 28) & 3, ((words[2] & 3) << 2) | (words[3] >> 30), (words[2] >> 2) & 255},
+    };
+    mac_part = Part(); ilu_part = Part();
+    mac_part.op = mac; ilu_part.op = ilu; ilu_part.ilu = true;
+    if (output_mask && (selected_ilu ? ilu : mac) && (words[3] & 0x800)) {
+        uint32_t index = output & 15;
+        uint32_t reg = index == 15 ? (uint32_t)kAddress : index == 0 ? 12u : kOutputs + index;
+        (selected_ilu ? ilu_part : mac_part).writes.emplace_back(reg, index == 15 || index == 5 ? 1u : lanes(output_mask));
+    }
+    if (mac == 13) mac_part.writes.emplace_back(kAddress, 1u);
+    else if (mac && mac_mask && !(ilu && destination == 1)) mac_part.writes.emplace_back(destination, lanes(mac_mask));
+    if (ilu && ilu_mask) ilu_part.writes.emplace_back(mac ? 1u : destination, lanes(ilu_mask));
+    auto written = [](const Part &part) {
+        uint32_t all = 0;
+        for (const auto &write : part.writes) all |= write.second;
+        return all;
+    };
+    auto read = [&](Part &part, uint32_t which) {
+        const Operand &operand = operands[which];
+        uint32_t reg = operand.mux == 1 ? operand.temporary : operand.mux == 2 ? 16 + input : (uint32_t)kRegisters;
+        if (operand.mux == 3 && relative) part.reads.push_back(kAddress * 4);
+        if (reg >= kRegisters) return;
+        part.operands.push_back(reg);
+        if (which < 2) part.factors.push_back(reg);
+        uint32_t use = operand_lanes(part.op, part.ilu, which, written(part));
+        for (uint32_t lane = 0; lane < 4; lane++)
+            if (use & (1u << lane)) part.reads.push_back(reg * 4 + ((operand.swizzle >> (6 - lane * 2)) & 3));
+    };
+    if (mac) {
+        if (operands[0].used) read(mac_part, 0);
+        if (operands[1].used) read(mac_part, 1);
+        if (mac == 3 || mac == 4) read(mac_part, 2);
+    }
+    if (ilu) read(ilu_part, 2);
+}
+
+struct Cut {
+    bool skinned = false;             /* picks its matrices with a0: a character's */
+    uint32_t at = 0;                  /* the instruction the pixel shader starts at */
+    std::vector<uint32_t> carried;    /* the registers it takes from the vertices */
+    bool diffuse = false, specular = false;
+};
+
+/* Where a program's colours can be taken over per pixel, if anywhere. */
+static bool analyse(const std::vector<uint32_t> &key, Cut &cut)
+{
+    size_t count = key.size() / 4;
+    if (!count) return false;
+    std::vector<std::array<Part, 2>> parts(count);
+    for (size_t index = 0; index < count; index++) decode(key.data() + index * 4, parts[index][0], parts[index][1]);
+    cut.skinned = false;
+    for (const auto &instruction : parts)
+        for (const auto &write : instruction[0].writes) if (write.first == kAddress) cut.skinned = true;
+    /* Forward: which registers vary from vertex to vertex, and which do so
+     * other than linearly -- a product of two varying values, a minimum,
+     * maximum, comparison or any ILU function of one. */
+    std::array<bool, kRegisters> varies{}, curved{};
+    for (uint32_t input = 16; input < 32; input++) varies[input] = true;
+    for (auto &instruction : parts) for (Part &part : instruction) {
+        if (!part.op || part.writes.empty()) continue;
+        bool varying = false, bent = false;
+        uint32_t varying_factors = 0;
+        for (uint32_t reg : part.operands) if (varies[reg]) varying = true;
+        for (uint32_t reg : part.factors) if (varies[reg]) varying_factors++;
+        for (uint32_t reg : part.operands) if (curved[reg]) bent = true;
+        if (varying) {
+            if (part.ilu) part.varying_product = part.op != 1;
+            else if (part.op >= 9 && part.op <= 12) part.varying_product = true;
+            else if (part.op == 2 || part.op == 4 || (part.op >= 5 && part.op <= 8)) part.varying_product = varying_factors > 1;
+            bent = bent || part.varying_product;
+        }
+        for (const auto &write : part.writes) {
+            if (varying) varies[write.first] = true;
+            if (bent) curved[write.first] = true;
+        }
+    }
+    cut.diffuse = curved[kOutputs + 3];
+    cut.specular = curved[kOutputs + 4];
+    if (!cut.diffuse && !cut.specular) return false;
+    /* Backward, component by component: what the colours depend on from
+     * instruction `from` on. */
+    auto slice = [&](size_t from, std::vector<bool> &used) {
+        std::vector<bool> live(kRegisters * 4, false);
+        for (uint32_t lane = 0; lane < 4; lane++) {
+            if (cut.diffuse) live[(kOutputs + 3) * 4 + lane] = true;
+            if (cut.specular) live[(kOutputs + 4) * 4 + lane] = true;
+        }
+        used.assign(count, false);
+        for (size_t index = count; index-- > from;) {
+            /* Both halves read before either writes. */
+            bool needed[2] = {};
+            for (int half = 0; half < 2; half++) {
+                const Part &part = parts[index][half];
+                if (!part.op) continue;
+                for (const auto &write : part.writes)
+                    for (uint32_t lane = 0; lane < 4; lane++)
+                        if ((write.second & (1u << lane)) && live[write.first * 4 + lane]) needed[half] = true;
+            }
+            for (int half = 0; half < 2; half++) {
+                if (!needed[half]) continue;
+                used[index] = true;
+                for (const auto &write : parts[index][half].writes)
+                    for (uint32_t lane = 0; lane < 4; lane++)
+                        if (write.second & (1u << lane)) live[write.first * 4 + lane] = false;
+            }
+            for (int half = 0; half < 2; half++)
+                if (needed[half]) for (uint32_t component : parts[index][half].reads) live[component] = true;
+        }
+        return live;
+    };
+    std::vector<bool> used;
+    slice(0, used);
+    cut.at = 0;
+    for (size_t index = 0; index < count; index++) {
+        if (!used[index]) continue;
+        for (const Part &part : parts[index]) {
+            bool address = false;
+            for (uint32_t component : part.reads) if (component / 4 == kAddress) address = true;
+            for (const auto &write : part.writes) if (write.first == kAddress) address = true;
+            if (part.op && address) cut.at = (uint32_t)index + 1;
+        }
+    }
+    std::vector<bool> live = slice(cut.at, used);
+    /* It must still bend there: otherwise the vertices' colours are as good. */
+    bool bends = false;
+    for (size_t index = cut.at; index < count; index++)
+        if (used[index] && (parts[index][0].varying_product || parts[index][1].varying_product)) bends = true;
+    if (!bends) return false;
+    /* What the registers hold at the cut: a register not written before it
+     * holds what the program starts with, as it will in the pixel shader. */
+    std::array<bool, kRegisters> written{};
+    for (size_t index = 0; index < cut.at; index++)
+        for (const Part &part : parts[index]) for (const auto &write : part.writes) written[write.first] = true;
+    cut.carried.clear();
+    for (uint32_t reg = 0; reg < kRegisters; reg++) {
+        bool needed = false;
+        for (uint32_t lane = 0; lane < 4; lane++) if (live[reg * 4 + lane]) needed = true;
+        if (!needed || (reg < 16 || reg >= kOutputs ? !written[reg] : false)) continue;
+        if (reg == kAddress || (reg > 12 && reg < 16)) return false;
+        cut.carried.push_back(reg);
+    }
+    return cut.carried.size() <= kCarried;
+}
+
+static std::string register_name(uint32_t reg)
+{
+    if (reg < 12) return "temporary[" + std::to_string(reg) + "]";
+    if (reg == 12) return "outputs[0]";
+    if (reg < kOutputs) return "input.attribute" + std::to_string(reg - 16);
+    return "outputs[" + std::to_string(reg - kOutputs) + "]";
+}
+
+}   /* namespace pixel_lighting */
+
+static const char vertex_program_reset[] =
+    "[unroll]for(uint index=0;index<13;index++)temporary[index]=0; [unroll]for(uint index=0;index<16;index++)outputs[index]=float4(0,0,0,1);\n";
+
+/* The pixel shader's half of a program lit per pixel: its instructions from
+ * the cut on, from the registers carried to it, ending with the colours. */
+static std::string pixel_lighting_function(const std::vector<uint32_t> &key)
+{
+    pixel_lighting::Cut cut;
+    std::vector<std::string> blocks;
+    if (!vertex_program_blocks(key, false, blocks) || !pixel_lighting::analyse(key, cut)) return {};
+    std::string source = "\nstruct GuestVertex {";
+    for (uint32_t attribute = 0; attribute < 16; attribute++) source += "float4 attribute" + std::to_string(attribute) + ";";
+    source += "};\nvoid pixel_lighting(inout Pixel pixel) {\nGuestVertex input=(GuestVertex)0; float4 temporary[13]; float4 outputs[16]; int address=0;\n";
+    source += vertex_program_reset;
+    for (size_t index = 0; index < cut.carried.size(); index++)
+        source += pixel_lighting::register_name(cut.carried[index]) + "=pixel.lightCut[" + std::to_string(index) + "];\n";
+    for (size_t index = cut.at; index < blocks.size(); index++) source += blocks[index];
+    if (cut.diffuse) source += "pixel.diffuse=saturate(outputs[3]);\n";
+    if (cut.specular) source += "pixel.specular=saturate(outputs[4]);\n";
+    source += "}\n";
+    return source;
+}
+
+/* lit: the program's vertex half for per-pixel lighting, which also hands
+ * the pixel shader the registers it carries (pixel_lighting::analyse). */
+static std::string vertex_program_source(const std::vector<uint32_t> &key, bool state_program, bool lit = false)
+{
+    std::vector<std::string> blocks;
+    if (!vertex_program_blocks(key, state_program, blocks)) return {};
+    pixel_lighting::Cut cut;
+    if (lit && (state_program || !pixel_lighting::analyse(key, cut))) return {};
+    std::string source = state_program ? "" : "#define NV_FIXED_TRANSFORM 0\n";
+    if (lit) source += "#define NV_PIXEL_LIGHTING 1\n";
+    source += nv2a_gpu_shader_source;
+    source += "\nstruct GuestVertex {\n";
+    for (uint32_t attribute = 0; attribute < 16; attribute++)
+        source += "float4 attribute" + std::to_string(attribute) + ":TEXCOORD" + std::to_string(attribute) + ";\n";
+    source += "};\n";
+    if (state_program) {
+        source += "RWStructuredBuffer<float4> stateConstants:register(u0); cbuffer Attributes:register(b1) {float4 stateAttributes[16];};\n#define vertexConstants stateConstants\n[numthreads(1,1,1)]void cs_guest(uint3 dispatch:SV_DispatchThreadID) { GuestVertex input;\n";
+        for (uint32_t attribute = 0; attribute < 16; attribute++)
+            source += "input.attribute" + std::to_string(attribute) + "=stateAttributes[" + std::to_string(attribute) + "];\n";
+    } else source += "Pixel vs_guest(GuestVertex input) {\n";
+    source += "float4 temporary[13]; float4 outputs[16]; int address=0;\n";
+    if (lit) source += "float4 lightCut[8]; [unroll]for(uint cut=0;cut<8;cut++)lightCut[cut]=0;\n";
+    const std::string reset = vertex_program_reset;
+    source += reset;
+    std::string body;
+    for (size_t index = 0; index <= blocks.size(); index++) {
+        if (lit && index == cut.at)
+            for (size_t carried = 0; carried < cut.carried.size(); carried++)
+                source += "lightCut[" + std::to_string(carried) + "]=" + pixel_lighting::register_name(cut.carried[carried]) + ";\n";
+        if (index < blocks.size()) { source += blocks[index]; body += blocks[index]; }
     }
     if (state_program) { source += "}\n"; return source; }
     /* Temporal AA: the program again with the frame before's constants, for
      * where this vertex was then (vs_core's previous). */
-    std::string body = source.substr(body_start), previous_body;
+    std::string previous_body;
     previous_body.reserve(body.size() + body.size() / 8);
     for (size_t at = 0;;) {
         size_t found = body.find("vertexConstants[", at);
@@ -1176,7 +1441,9 @@ static std::string vertex_program_source(const std::vector<uint32_t> &key, bool 
     source += "Vertex bridge=(Vertex)0; bridge.position=outputs[0]; bridge.diffuse=saturate(outputs[3]); bridge.specular=saturate(outputs[4]); bridge.tex0=outputs[9]; bridge.tex1=outputs[10]; bridge.tex2=outputs[11]; bridge.tex3=outputs[12]; bridge.fogCoordinate=outputs[5].x;\n";
     source += "float fogCoordinate=outputs[5].x; float4 previous=outputs[0];\n";
     source += "[branch]if(taa.z!=0) { address=0;\n" + reset + previous_body + "previous=outputs[0]; }\n";
-    source += "Pixel result=vs_core(bridge,previous); result.fog=fog_factor(fogCoordinate); return result; }\n";
+    source += "Pixel result=vs_core(bridge,previous); result.fog=fog_factor(fogCoordinate);\n";
+    if (lit) source += "[unroll]for(uint carried=0;carried<8;carried++)result.lightCut[carried]=lightCut[carried];\n";
+    source += "return result; }\n";
     return source;
 }
 
@@ -1415,7 +1682,7 @@ extern "C" int nv2a_gpu_execute_state(const uint32_t program[136][4], const uint
  * frames a compile takes, but it never stalls the frame. RECOMP_SHADER_ASYNC=0
  * compiles in the draw instead, as before. */
 struct PixelCompileJob {
-    std::array<uint32_t,44> key;
+    std::array<uint32_t,45> key;
     std::array<std::string,8> values;
     ComPtr<ID3DBlob> code, errors;
     ComPtr<ID3D11PixelShader> shader;
@@ -1428,6 +1695,8 @@ struct PixelCompileJob {
     ComPtr<ID3D11InputLayout> vertex_layout;
     uint32_t vertex_mask = 0;
     bool preload = false;   /* from the preload list, not a draw's (see preload_shader_variants) */
+    /* key[44] set: per-pixel lighting, this the program's pixel half (pixel_lighting_function). */
+    std::string light_source;
 };
 static std::mutex pixel_jobs_lock;
 static std::condition_variable pixel_jobs_signal;
@@ -1435,14 +1704,14 @@ static std::deque<std::shared_ptr<PixelCompileJob>> pixel_jobs_queued;
 /* Preloads: taken only when no draw's compile is queued. */
 static std::deque<std::shared_ptr<PixelCompileJob>> pixel_jobs_preload;
 static std::vector<std::shared_ptr<PixelCompileJob>> pixel_jobs_done;
-static std::vector<std::array<uint32_t,44>> pixel_jobs_pending;
+static std::vector<std::array<uint32_t,45>> pixel_jobs_pending;
 /* The same program can read differently packed attributes on another draw. */
 using VertexCompileKey = std::pair<std::vector<uint32_t>, uint32_t>;
 static std::vector<VertexCompileKey> vertex_jobs_pending;
 /* A deterministic compiler/device failure is remembered for this run. Without
  * this, every draw of an unsupported shader can start the same failed job. */
 static std::set<VertexCompileKey> vertex_jobs_failed;
-static std::set<std::array<uint32_t,44>> pixel_jobs_failed;
+static std::set<std::array<uint32_t,45>> pixel_jobs_failed;
 static std::atomic<int> pixel_jobs_finished{0};
 static ComPtr<ID3D11PixelShader> generic_pixel_shader;
 static bool generic_pixel_requested;
@@ -1473,10 +1742,24 @@ static const char *shadow_tolerance()
     return value.c_str();
 }
 
+/* RECOMP_SHADOW_GROUNDED=0: Enhanced+ fades every shadow from more than a
+ * guard's height above, as before its grounded-caster check (a diagnostic,
+ * to weigh that check's cost; NV_SHADOW_GROUNDED in the shader). */
+static const char *shadow_grounded()
+{
+    static const char *value = []() {
+        const char *setting = std::getenv("RECOMP_SHADOW_GROUNDED");
+        bool off = setting && *setting == '0';
+        if (off) std::fprintf(stderr, "[GPU-D3D11] Enhanced+ grounded-caster check off\n");
+        return off ? "0" : "1";
+    }();
+    return value;
+}
+
 static HRESULT compile_pixel_variant(const PixelCompileJob &job, ComPtr<ID3DBlob> &code, ComPtr<ID3DBlob> &errors,
                                      bool compile = true)
 {
-    const D3D_SHADER_MACRO generic_definitions[] = {{"NV_SHADOW_TOLERANCE", shadow_tolerance()}, {nullptr, nullptr}};
+    const D3D_SHADER_MACRO generic_definitions[] = {{"NV_SHADOW_TOLERANCE", shadow_tolerance()}, {"NV_SHADOW_GROUNDED", shadow_grounded()}, {nullptr, nullptr}};
     if (job.generic)
         return compile_shader_cached(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A-generic", generic_definitions,
                                      "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS,
@@ -1490,12 +1773,24 @@ static HRESULT compile_pixel_variant(const PixelCompileJob &job, ComPtr<ID3DBlob
         {"NV_WINDOW_CLIP_MODE",values[7].c_str()},
         {"NV_DEPTH_ENABLED",job.key[37] ? "1" : "0"},
         {"NV_DEPTH_SEMANTIC",job.key[36] || job.key[43] ? "SV_DepthGreaterEqual" : "SV_DEPTH"},
-        {"NV_SHADOW_TOLERANCE",shadow_tolerance()}, {nullptr,nullptr}
+        {"NV_SHADOW_TOLERANCE",shadow_tolerance()}, {"NV_SHADOW_GROUNDED",shadow_grounded()}, {nullptr,nullptr}
     };
+    if (job.key[44]) {
+        if (job.light_source.empty()) return E_FAIL;
+        std::string source = std::string("#define NV_PIXEL_LIGHTING 1\n") + nv2a_gpu_shader_source + job.light_source;
+        return compile_shader_cached(source.data(), source.size(), "NV2A-guest-lit", definitions,
+                                     "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS,
+                                     code, errors, compile);
+    }
     return compile_shader_cached(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A-guest", definitions,
                                  "ps_main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS,
                                  code, errors, compile);
 }
+
+/* A vertex variant's input mask has this bit when it is a program's half for
+ * per-pixel lighting (vertex_program_source's lit): the bit goes wherever the
+ * mask does -- the variant cache, the compile queue, the preload notes. */
+static constexpr uint32_t kLitVertexMask = 0x80000000u;
 
 static HRESULT compile_vertex_variant(const PixelCompileJob &job, ComPtr<ID3DBlob> &code, ComPtr<ID3DBlob> &errors,
                                       bool compile = true)
@@ -1625,6 +1920,7 @@ static void note_pixel_variant(ShaderVariant &variant)
 {
     if (variant.noted) return;
     variant.noted = true;
+    if (variant.key[44]) return;
     manifest_note(MANIFEST_PIXEL, std::vector<uint32_t>(variant.key.begin(), variant.key.end()));
 }
 
@@ -1723,7 +2019,8 @@ static void preload_shader_variants()
         auto job = std::make_shared<PixelCompileJob>();
         job->preload = true;
         if (note.tag == MANIFEST_PIXEL) {
-            if (pixels >= preload_limit || note.words.size() != job->key.size()) continue;
+            if (pixels >= preload_limit || (note.words.size() != job->key.size() && note.words.size() != 44)) continue;
+            job->key.fill(0);
             std::copy(note.words.begin(), note.words.end(), job->key.begin());
             pixel_job_values(*job);
             pixels++;
@@ -1732,7 +2029,7 @@ static void preload_shader_variants()
             job->vertex = true;
             job->vertex_mask = note.words[0];
             job->vertex_key.assign(note.words.begin() + 1, note.words.end());
-            job->vertex_source = vertex_program_source(job->vertex_key, false);
+            job->vertex_source = vertex_program_source(job->vertex_key, false, (job->vertex_mask & kLitVertexMask) != 0);
             if (job->vertex_source.empty()) continue;
             vertices++;
         }
@@ -1859,20 +2156,89 @@ static void install_compiled_pixel_shaders()
     }
 }
 
+/* Per-pixel lighting's programs: slot n (a pixel variant's key[44]) is
+ * lighting_programs[n - 1]; lighting_slots remembers every program asked
+ * about, 0 for one that stays per vertex. Draw thread only. */
+struct LightingProgram {
+    std::vector<uint32_t> words;
+    std::string function;
+    bool skinned;
+};
+static std::vector<LightingProgram> lighting_programs;
+static std::map<std::vector<uint32_t>, uint32_t> lighting_slots;
+static std::atomic<int> pixel_lighting_mode{0};
+
+/* 0 per vertex (the console), 1 characters: programs that skin (Turok's
+ * creatures and people). Any thread; the next draw sees it.
+ * RECOMP_PIXEL_LIGHTING=0/1 overrides, and =2 (a diagnostic) lights the
+ * scenery too: its lights were placed for per-vertex lighting across large
+ * polygons, so per pixel a light's pool ends partway across a wall, unlike
+ * the game, and in the Chapter 1 jungle the 2160p frame rate fell from 180
+ * to 97. */
+extern "C" void nv2a_gpu_set_pixel_lighting(int mode)
+{
+    pixel_lighting_mode.store(mode <= 0 ? 0 : 1);
+}
+
+/* The draw's lighting slot: 0 to light it per vertex, as the program does. */
+static uint32_t lighting_slot(const Nv2aGpuDraw &state)
+{
+    static const int forced = [] {
+        const char *value = std::getenv("RECOMP_PIXEL_LIGHTING");
+        return value && *value ? std::atoi(value) : -1;
+    }();
+    int mode = forced >= 0 ? forced : pixel_lighting_mode.load(std::memory_order_relaxed);
+    if (mode <= 0 || !state.vertex_program || !state.vertex_serial || !state.vertex_constants) return 0;
+    auto chosen = [mode](uint32_t slot) { return slot && (mode >= 2 || lighting_programs[slot - 1].skinned) ? slot : 0u; };
+    static const void *cached_program;
+    static uint64_t cached_serial;
+    static uint32_t cached_start, cached_slot;
+    if (state.vertex_serial == cached_serial && state.vertex_start == cached_start &&
+            (const void *)state.vertex_program == cached_program)
+        return chosen(cached_slot);
+    std::vector<uint32_t> key;
+    uint32_t slot = 0;
+    if (vertex_program_key(state, key)) {
+        auto found = lighting_slots.find(key);
+        if (found != lighting_slots.end()) slot = found->second;
+        else {
+            std::string function = pixel_lighting_function(key);
+            pixel_lighting::Cut cut;
+            bool lit = pixel_lighting::analyse(key, cut);
+            if (!function.empty()) {
+                lighting_programs.push_back({key, std::move(function), cut.skinned});
+                slot = (uint32_t)lighting_programs.size();
+            }
+            std::fprintf(stderr, "[GPU-D3D11] per-pixel lighting: %s program of %zu instructions %s",
+                         cut.skinned ? "skinning" : "unskinned", key.size() / 4,
+                         slot ? "can be lit per pixel" : "stays per vertex");
+            if (lit) std::fprintf(stderr, " from instruction %u, %zu registers carried", cut.at, cut.carried.size());
+            std::fprintf(stderr, "\n");
+            lighting_slots.emplace(std::move(key), slot);
+        }
+    }
+    cached_program = state.vertex_program;
+    cached_serial = state.vertex_serial;
+    cached_start = state.vertex_start;
+    cached_slot = slot;
+    return chosen(slot);
+}
+
 /* A vertex program not in memory or on disk compiles on the workers too.
  * There is no generic vertex shader to stand in, so its draws are skipped
  * (*pending) until it is ready: an object missing for a few frames the
  * first time this machine ever sees it, instead of a frame frozen for the
  * compile. */
-static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
+static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending, bool lit = false)
 {
+    const uint32_t mask = state.attribute_mask | (lit ? kLitVertexMask : 0u);
     *pending = false;
     start_shader_preload();
     uint32_t words = vertex_program_word_count(state);
     if (!words) return nullptr;
     /* Finished compiles are installed by get_pixel_shader, which runs first:
      * installing here could evict the pixel shader this draw just took. */
-    for (auto &cached : vertex_variants) if (cached.input_mask == state.attribute_mask && cached.key.size() == words &&
+    for (auto &cached : vertex_variants) if (cached.input_mask == mask && cached.key.size() == words &&
         !std::memcmp(cached.key.data(), state.vertex_program + state.vertex_start, words * sizeof(uint32_t))) {
         cached.last_used = ++shader_use_serial;
         gpu_timing.vertex_shader_hits++;
@@ -1880,13 +2246,13 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
         return &cached;
     }
     std::vector<uint32_t> key(state.vertex_program[state.vertex_start], state.vertex_program[state.vertex_start] + words);
-    VertexCompileKey compile_key{key, state.attribute_mask};
+    VertexCompileKey compile_key{key, mask};
     if (vertex_jobs_failed.count(compile_key)) return nullptr;
     bool async = pixel_compiles_async();
     if (async) {
         std::lock_guard<std::mutex> hold(pixel_jobs_lock);
         if (std::any_of(vertex_jobs_pending.begin(), vertex_jobs_pending.end(), [&](const VertexCompileKey &pending_key) {
-                return pending_key.second == state.attribute_mask && pending_key.first == key;
+                return pending_key.second == mask && pending_key.first == key;
             })) {
             gpu_timing.vertex_skipped_draws++;
             *pending = true;
@@ -1897,13 +2263,13 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
     GpuTimer compile_timer(gpu_timing.vertex_compile);
     auto job = std::make_shared<PixelCompileJob>();
     job->vertex = true;
-    job->vertex_source = vertex_program_source(key, false);
+    job->vertex_source = vertex_program_source(key, false, lit);
     if (job->vertex_source.empty()) {
         vertex_jobs_failed.insert(std::move(compile_key));
         return nullptr;
     }
     job->vertex_key = std::move(key);
-    job->vertex_mask = state.attribute_mask;
+    job->vertex_mask = mask;
     ComPtr<ID3DBlob> code, errors;
     if (FAILED(compile_vertex_variant(*job, code, errors, !async))) {
         if (async && !errors) {
@@ -1919,11 +2285,11 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
     }
     VertexVariant variant;
     variant.key = std::move(job->vertex_key);
-    if (!create_vertex_objects(code.Get(), variant.shader, variant.layout, state.attribute_mask)) {
+    if (!create_vertex_objects(code.Get(), variant.shader, variant.layout, mask)) {
         vertex_jobs_failed.insert(std::move(compile_key));
         return nullptr;
     }
-    variant.input_mask = state.attribute_mask;
+    variant.input_mask = mask;
     variant.bytecode_bytes = code->GetBufferSize();
     auto *cached = cache_shader_variant(vertex_variants, std::move(variant));
     if (!cached) vertex_jobs_failed.insert(std::move(compile_key));
@@ -1931,7 +2297,8 @@ static VertexVariant *get_vertex_shader(const Nv2aGpuDraw &state, bool *pending)
     return cached;
 }
 
-static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t window_clip_mode, bool conservative_depth)
+static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t window_clip_mode, bool conservative_depth,
+                                           uint32_t light_slot = 0)
 {
     ShaderVariant variant = {};
     variant.key[0] = state.combiners.control; variant.key[1] = state.stage_program;
@@ -1940,6 +2307,7 @@ static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t wi
     variant.key[37] = state.depth_enable != 0;
     variant.key[42] = window_clip_mode;
     variant.key[43] = conservative_depth;
+    variant.key[44] = light_slot;
     for (uint32_t stage = 0; stage < 4; stage++)
         if (nv2a_gpu_texture_mode_samples((state.stage_program >> (stage * 5)) & 31u))
             variant.key[38 + stage] = state.textures[stage].filter >> 28;
@@ -1972,6 +2340,7 @@ static ID3D11PixelShader *get_pixel_shader(const Nv2aGpuDraw &state, uint32_t wi
     GpuTimer compile_timer(gpu_timing.pixel_compile);
     auto job = std::make_shared<PixelCompileJob>();
     job->key = variant.key;
+    if (light_slot) job->light_source = lighting_programs[light_slot - 1].function;
     pixel_job_values(*job);
     if (async && !generic_pixel_requested) {
         /* The generic shader itself, first in the workers' queue (from disk
@@ -6889,14 +7258,35 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
                               (state->vertex_program || state->fixed_transform || state->flat_shading || squeeze_2d) &&
                               !front_offset && !back_offset &&
                               (!depth_clamp || depth_clip_max >= (state->depth_format == 1 ? 65535.0f : 16777215.0f));
+    /* Per-pixel lighting (pixel_lighting): triangles through the combiners,
+     * and not flat shaded (the geometry shader takes a vertex's colours).
+     * Until the program's lit vertex half exists (it compiles on the
+     * workers), lit per vertex. */
+    uint32_t light_slot = !uncombined && !state->flat_shading && lit_geometry_shader &&
+                          state->topology == NV2A_GPU_TOPOLOGY_TRIANGLES ? lighting_slot(*state) : 0;
+    if (light_slot) {
+        bool lit_pending = false;
+        if (!get_vertex_shader(*state, &lit_pending, true) || lit_pending) light_slot = 0;
+    }
+    if (light_slot) {
+        static std::vector<bool> drawn;
+        if (drawn.size() < light_slot) drawn.resize(light_slot);
+        if (!drawn[light_slot - 1]) {
+            drawn[light_slot - 1] = true;
+            std::fprintf(stderr, "[GPU-D3D11] per-pixel lighting: first draw of a %s program of %zu instructions\n",
+                         lighting_programs[light_slot - 1].skinned ? "skinning" : "unskinned",
+                         lighting_programs[light_slot - 1].words.size() / 4);
+        }
+    }
     ID3D11PixelShader *program = uncombined ? uncombined_shader.Get()
-                                            : get_pixel_shader(*state, constants.window_clip_control[0], conservative_depth);
+                                            : get_pixel_shader(*state, constants.window_clip_control[0], conservative_depth,
+                                                               light_slot);
     if (!program) return 0;
     bool vertex_pending = false;
-    VertexVariant *guest_vertex = state->vertex_program ? get_vertex_shader(*state, &vertex_pending) : nullptr;
+    VertexVariant *guest_vertex = state->vertex_program ? get_vertex_shader(*state, &vertex_pending, light_slot != 0) : nullptr;
     if (vertex_pending) return 1;   /* its shader is compiling: drawn once it exists */
     if (state->vertex_program && !guest_vertex) return reject("unsupported vertex program");
-    if (guest_vertex && guest_vertex->input_mask != state->attribute_mask) {
+    if (guest_vertex && (guest_vertex->input_mask & ~kLitVertexMask) != state->attribute_mask) {
         static unsigned shown;
         if (shown++ < 8)
             std::fprintf(stderr, "[GPU-D3D11] vertex layout mask %04X != draw's %04X; draw skipped\n",
@@ -6929,6 +7319,7 @@ extern "C" int nv2a_gpu_draw(const Nv2aGpuDraw *state, Nv2aGpuVertex *vertices, 
     context->VSSetShader(guest_vertex ? guest_vertex->shader.Get() : vertex_shader.Get(), nullptr, 0);
     ID3D11GeometryShader *geometry = state->topology == NV2A_GPU_TOPOLOGY_LINES ? line_geometry_shader.Get() :
         state->topology == NV2A_GPU_TOPOLOGY_POINTS ? point_geometry_shader.Get() :
+        light_slot ? lit_geometry_shader.Get() :
         guest_vertex || state->fixed_transform || state->flat_shading || squeeze_2d ? geometry_shader.Get() : nullptr;
     context->GSSetShader(geometry, nullptr, 0);
     context->PSSetShader(program, nullptr, 0);
@@ -7026,6 +7417,18 @@ extern "C" int nv2a_gpu_compile(void)
     const struct { const char *entry; ComPtr<ID3D11GeometryShader> *shader; } geometries[] = {
         {"gs_main", &geometry_shader}, {"gs_lines_main", &line_geometry_shader}, {"gs_points_main", &point_geometry_shader}
     };
+    {
+        const D3D_SHADER_MACRO lit[] = {{"NV_PIXEL_LIGHTING", "1"}, {nullptr, nullptr}};
+        pixel_code.Reset(); errors.Reset();
+        if (FAILED(compile_shader_cached(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A-lit", lit,
+                                         "gs_main", "gs_5_0", D3DCOMPILE_IEEE_STRICTNESS, pixel_code, errors)) ||
+            FAILED(device->CreateGeometryShader(pixel_code->GetBufferPointer(), pixel_code->GetBufferSize(), nullptr,
+                                                lit_geometry_shader.ReleaseAndGetAddressOf()))) {
+            lit_geometry_shader.Reset();
+            std::fprintf(stderr, "[GPU-D3D11] per-pixel lighting unavailable: %s\n",
+                         errors ? (const char *)errors->GetBufferPointer() : "geometry shader creation failed");
+        }
+    }
     for (const auto &geometry : geometries) {
         pixel_code.Reset(); errors.Reset();
         result = compile_shader_cached(nv2a_gpu_shader_source, sizeof nv2a_gpu_shader_source - 1, "NV2A", nullptr,
