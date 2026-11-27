@@ -69,9 +69,11 @@ int main(void)
     }
     g_xbox_mem_offset = (ptrdiff_t)mem;
 
-    /* One import, in the form an XBE stores it: 0x80000000 | ordinal. */
-    *(uint32_t *)(mem + THUNK_VA) = 0x80000000u | 173u;
-    xbox_kernel_set_thunk_address(THUNK_VA, 1);
+    const uint32_t ordinals[] = {173, 189, 197, 187, 225};
+    uint32_t *thunks = (uint32_t *)(mem + THUNK_VA);
+    for (size_t i = 0; i < sizeof ordinals / sizeof ordinals[0]; i++)
+        thunks[i] = 0x80000000u | ordinals[i];
+    xbox_kernel_set_thunk_address(THUNK_VA, sizeof ordinals / sizeof ordinals[0]);
     xbox_kernel_bridge_init();
 
     /* bridge_init rewrites the entry in place to a synthetic VA. */
@@ -101,6 +103,52 @@ int main(void)
                  g_esp, STACK_VA + 8);
         check(g_esp == STACK_VA + 8,
               "ordinal 173 pops its stdcall argument", detail);
+    }
+
+    if (recomp_lookup_kernel(thunks[1]) && recomp_lookup_kernel(thunks[2]) &&
+        recomp_lookup_kernel(thunks[3]) && recomp_lookup_kernel(thunks[4])) {
+        uint32_t *sp = (uint32_t *)(mem + STACK_VA);
+        const uint32_t original_va = STACK_VA + 0x100;
+        const uint32_t duplicate_va = original_va + 4;
+        for (uint32_t options = 2; options <= 3; options++) {
+            sp[1] = original_va;
+            sp[2] = sp[3] = sp[4] = 0;
+            g_esp = STACK_VA;
+            recomp_lookup_kernel(thunks[1])();
+            uint32_t original = *(uint32_t *)(mem + original_va);
+            check(g_eax == 0 && original != 0, "event created", NULL);
+            if (g_eax || !original)
+                continue;
+
+            sp[1] = original;
+            sp[2] = duplicate_va;
+            sp[3] = options;
+            g_esp = STACK_VA;
+            recomp_lookup_kernel(thunks[2])();
+            uint32_t copy = *(uint32_t *)(mem + duplicate_va);
+            check(g_eax == 0 && copy != 0, "duplicate created", NULL);
+            if (g_eax || !copy)
+                continue;
+
+            if (!(options & 1)) {
+                check(copy != original, "open duplicate has its own token", NULL);
+                sp[1] = original;
+                g_esp = STACK_VA;
+                recomp_lookup_kernel(thunks[3])();
+                check(g_eax == 0, "original closes independently", NULL);
+            }
+            sp[1] = copy;
+            sp[2] = 0;
+            g_esp = STACK_VA;
+            recomp_lookup_kernel(thunks[4])();
+            check(g_eax == 0, "duplicate still signals after source closes", NULL);
+            sp[1] = copy;
+            g_esp = STACK_VA;
+            recomp_lookup_kernel(thunks[3])();
+            check(g_eax == 0, "duplicate can be closed", NULL);
+        }
+    } else {
+        check(0, "event, duplicate and close ordinals resolve", NULL);
     }
 
     VirtualFree(mem, 0, MEM_RELEASE);

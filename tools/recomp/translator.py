@@ -2178,9 +2178,8 @@ class FunctionTranslator:
                 and end not in self.owned_function_starts):
             fallthrough_target = end
 
-        # Ensure ebp tracked if function has tail jumps (lifter emits
-        # g_seh_ebp = ebp before external jmp, external jcc, and indirect jmp,
-        # and translate_function emits it before a fallthrough tail call).
+        # Calls and tail jumps publish the current EBP for their callees.
+        # Track it even when this function has no frame of its own.
         has_tail_jump = any(
             (insn.mnemonic == "jmp" and (
                 (insn.jump_target and not (start <= insn.jump_target < end))
@@ -2190,7 +2189,8 @@ class FunctionTranslator:
                 and not (start <= insn.jump_target < end))
             for insn in instructions
         )
-        if has_tail_jump or fallthrough_target is not None:
+        if (has_tail_jump or fallthrough_target is not None
+                or any(insn.mnemonic == "call" for insn in instructions)):
             used_regs.add("ebp")
 
 
@@ -2386,7 +2386,8 @@ class FunctionTranslator:
         # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
         # idiom MSVC emits for odd trailing elements.
         self.lifter.needs_cf = has_carry
-        self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
+        # Frame-pointer-omitted code also uses EBP as a preserved general register.
+        self.lifter.publishes_ebp = "ebp" in used_regs
 
         # SSE and MMX are architectural state, declared globally by the
         # runtime exactly like the GPRs and the x87 stack. Declaring either

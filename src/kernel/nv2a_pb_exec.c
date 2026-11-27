@@ -31,6 +31,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifndef _WIN32
+#include <errno.h>
+#endif
 #include <xmmintrin.h>   /* _mm_prefetch */
 #include <nmmintrin.h>   /* _mm_crc32_u64 (geometry cache keys) */
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
@@ -39,13 +42,13 @@
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
 #include "../d3d/nv2a_shader_cpu.h"
-#ifdef _WIN32
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
 #include "nv2a_gpu.h"
 #endif
 
 void nv2a_pb_exec_flush(void)
 {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
     nv2a_gpu_flush();
 #endif
 }
@@ -72,7 +75,7 @@ static int pb_sync_light(void)
 
 static void pb_flush_ordering(void)
 {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
     if (pb_sync_light()) { nv2a_gpu_wait(); return; }
 #endif
     nv2a_pb_exec_flush();
@@ -207,7 +210,26 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
  * contiguous-block scan it drives is. Printed by nv2a_pb_exec_report. */
 static double s_dma_seconds;
 static unsigned long long s_dma_calls;
-static double gpu_clock_seconds(void);
+/* Only for the timings the report prints (RECOMP_PB_REPORT_MS, or
+ * RECOMP_GPU_TIMING); otherwise every call reads 0 and costs no clock read --
+ * it is called around every batch and every DMA lookup. */
+static double gpu_clock_seconds(void)
+{
+    static LARGE_INTEGER frequency;
+    static int wanted = -1;
+    LARGE_INTEGER counter;
+    if (wanted < 0)
+        wanted = getenv("RECOMP_PB_REPORT_MS") || getenv("RECOMP_GPU_TIMING") || getenv("RECOMP_HITCH_MS");
+    if (!wanted)
+        return 0.0;
+    if ((!frequency.QuadPart && (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)) ||
+        !QueryPerformanceCounter(&counter)) {
+        fprintf(stderr, "[GPU] performance clock failed (%lu)\n", (unsigned long)GetLastError());
+        fflush(stderr);
+        _Exit(EXIT_FAILURE);
+    }
+    return (double)counter.QuadPart / (double)frequency.QuadPart;
+}
 
 static uint32_t dma_resolve_impl(uint32_t offset)
 {
@@ -985,7 +1007,9 @@ static void image_blit_run(void)
     /* The source is guest RAM: if the renderer still holds it in a D3D11
      * surface (published only on flip), pull it back before reading, or a
      * mid-frame CopyRects reads a stale/black image (loading-screen bg). */
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
     nv2a_gpu_surface_publish(src, (size_t)s_blit.height * s_surf2d.source_pitch);
+#endif
 
     if (s_blit_shown++ < 8)
         fprintf(stderr, "[BLIT] op=%u fmt=0x%X src=0x%08X+0x%X p%u dst=0x%08X+0x%X p%u"
@@ -1016,7 +1040,9 @@ static void image_blit_run(void)
         return;
     }
     /* The destination is guest RAM: refresh any cached surface it mirrors. */
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
     nv2a_gpu_surface_modified(dst, (size_t)s_blit.height * s_surf2d.dest_pitch);
+#endif
     s_blit_runs++;
     if (s_blit.width >= 1920u) s_blit_big++;
 }
@@ -1259,7 +1285,6 @@ static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2], const Nv2aCpuVertex varying[3]);
 
-#ifdef _WIN32
 /* The surface's anti-aliasing factor, from SET_SURFACE_FORMAT bits 12-15
  * (0 = 1x1, 1 = 2x1 "center corner 2", 2 = 2x2 "square offset 4"), as the
  * upstream executor reads it. SET_SURFACE_CLIP and every vertex position are
@@ -1271,6 +1296,18 @@ static void surface_aa_scale(uint32_t *sx, uint32_t *sy)
     uint32_t aa = (s_gpu.format >> 12) & 0xFu;
     *sx = aa ? 2u : 1u;
     *sy = aa == 2u ? 2u : 1u;
+}
+
+/* The CPU fallback shades once per logical pixel and replicates its samples
+ * into the AA surface. Render-to-texture passes and scanout still see the
+ * physical layout the title allocated, without multiplying shader work. */
+static void cpu_surface_scale(uint32_t *sx, uint32_t *sy)
+{
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
+    *sx = *sy = 1u;
+#else
+    surface_aa_scale(sx, sy);
+#endif
 }
 
 /* A packed window-clip edge pair (min | max << 16, 12 bits each, max
@@ -1410,7 +1447,59 @@ static void flip_fps_cap(void)
     deadline += period;
 }
 #else
-static void flip_fps_cap(void) {}
+static void flip_fps_cap(void)
+{
+    extern int xbox_Nv2aVblankSchedule(long long *epoch, long long *period);
+    extern void xbox_Nv2aVblankAtFlip(void);
+    static int hz, initialized;
+    static long long last, deadline;
+    LARGE_INTEGER now, frequency;
+    long long period, target;
+
+    if (!initialized) {
+        const char *setting = getenv("RECOMP_FPS_CAP");
+        if (setting && !strcmp(setting, "vblank")) {
+            hz = -1;
+        } else if (setting) {
+            int requested = atoi(setting);
+            if (requested > 0 && requested <= 1000)
+                hz = requested;
+        }
+        initialized = 1;
+    }
+    if (!hz || !QueryPerformanceCounter(&now) ||
+        !QueryPerformanceFrequency(&frequency))
+        return;
+
+    if (hz == -1) {
+        long long epoch;
+        if (!xbox_Nv2aVblankSchedule(&epoch, &period) || !last || last < epoch) {
+            last = now.QuadPart;
+            return;
+        }
+        target = epoch + ((last - epoch) / period + 1) * period;
+    } else {
+        period = frequency.QuadPart / hz;
+        if (!deadline || now.QuadPart > deadline + period) {
+            deadline = now.QuadPart + period;
+            return;
+        }
+        target = deadline;
+        deadline += period;
+    }
+
+    if (target > now.QuadPart) {
+        long long ns = (long long)((target - now.QuadPart) * 1e9 / frequency.QuadPart);
+        struct timespec delay = {ns / 1000000000LL, ns % 1000000000LL};
+        while (nanosleep(&delay, &delay) == -1 && errno == EINTR)
+            ;
+    }
+    if (hz == -1) {
+        QueryPerformanceCounter(&now);
+        last = now.QuadPart;
+        xbox_Nv2aVblankAtFlip();
+    }
+}
 #endif
 
 /* Remember the surface just drawn into, with its own geometry (see
@@ -1424,6 +1513,7 @@ static void note_drawn_surface(void)
     s_gpu.drawn_height = (s_gpu.clip_y + s_gpu.clip_h) * sy;
 }
 
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
 static int gpu_clear_surface(uint32_t param)
 {
     static int enabled = -1;
@@ -1497,9 +1587,14 @@ static void clear_surface(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x, width;
+    uint32_t sx, sy, clip_x, clip_y, clip_w, clip_h;
     int native_clear = 0;
 
-#ifdef _WIN32
+    cpu_surface_scale(&sx, &sy);
+    clip_x = s_gpu.clip_x * sx; clip_w = s_gpu.clip_w * sx;
+    clip_y = s_gpu.clip_y * sy; clip_h = s_gpu.clip_h * sy;
+
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
     native_clear = gpu_clear_surface(param);
 #endif
     if (native_clear == 2) {
@@ -1514,11 +1609,11 @@ static void clear_surface(uint32_t param)
         uint32_t depth_bpp = format == 1 ? 2u : format == 2 ? 4u : 0u;
         uint32_t base = dma_resolve(s_gpu.depth_offset);
         if (depth_bpp && !(s_gpu.control0 & 0x1000u) &&
-            s_gpu.depth_pitch >= (s_gpu.clip_x + s_gpu.clip_w) * depth_bpp &&
-            !surface_write_refused(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.depth_pitch, "depth clear")) {
-            for (y = s_gpu.clip_y; y < s_gpu.clip_y + s_gpu.clip_h; y++) {
+            s_gpu.depth_pitch >= (clip_x + clip_w) * depth_bpp &&
+            !surface_write_refused(base, (clip_y + clip_h) * s_gpu.depth_pitch, "depth clear")) {
+            for (y = clip_y; y < clip_y + clip_h; y++) {
                 uint8_t *row = mem + base + (size_t)y * s_gpu.depth_pitch;
-                for (x = s_gpu.clip_x; x < s_gpu.clip_x + s_gpu.clip_w; x++) {
+                for (x = clip_x; x < clip_x + clip_w; x++) {
                     if (depth_bpp == 2) {
                         if (param & 1u) ((uint16_t *)row)[x] = (uint16_t)s_gpu.depth_clear;
                     } else {
@@ -1532,24 +1627,24 @@ static void clear_surface(uint32_t param)
     }
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
-    if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0 || s_gpu.clip_x >= s_gpu.pitch / bpp)
+    if (!s_gpu.color_offset || !s_gpu.pitch || !clip_h || bpp == 0 || clip_x >= s_gpu.pitch / bpp)
         return;
-    width = s_gpu.clip_w;
-    if (width > s_gpu.pitch / bpp - s_gpu.clip_x) width = s_gpu.pitch / bpp - s_gpu.clip_x;
+    width = clip_w;
+    if (width > s_gpu.pitch / bpp - clip_x) width = s_gpu.pitch / bpp - clip_x;
     {
         uint32_t base = dma_resolve(s_gpu.color_offset);
         if (surface_write_refused(base,
-                                  (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch,
+                                  (clip_y + clip_h) * s_gpu.pitch,
                                   "clear"))
             return;
         s_gpu.color_base = base;
     }
 
-    for (y = 0; !native_clear && y < s_gpu.clip_h; y++) {
+    for (y = 0; !native_clear && y < clip_h; y++) {
         uint8_t *row = mem + s_gpu.color_base
-                     + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
+                     + (size_t)(clip_y + y) * s_gpu.pitch;
         if (bpp == 4) {
-            uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
+            uint32_t *p = (uint32_t *)row + clip_x;
             for (x = 0; x < width; x++)
                 p[x] = s_gpu.clear_color;
         } else if (bpp == 2) {
@@ -1558,7 +1653,7 @@ static void clear_surface(uint32_t param)
             uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
                                   | ((s_gpu.clear_color >> 5) & 0x07E0)
                                   | ((s_gpu.clear_color >> 3) & 0x001F));
-            uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
+            uint16_t *p = (uint16_t *)row + clip_x;
             for (x = 0; x < width; x++)
                 p[x] = v;
         }
@@ -2005,12 +2100,15 @@ static void dump_texture_bmp(uint32_t seq)
  * playback rate. */
 static uint8_t *s_surface;          /* host address of surface row 0 */
 static uint8_t *s_depth_surface;
+static uint32_t s_cpu_sx = 1, s_cpu_sy = 1;
 
 static int surface_begin_batch(const uint8_t *mem)
 {
     uint32_t base = dma_resolve(s_gpu.color_offset);
 
-    if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
+    cpu_surface_scale(&s_cpu_sx, &s_cpu_sy);
+    if (!surface_bpp() || s_gpu.pitch / surface_bpp() < (s_gpu.clip_x + s_gpu.clip_w) * s_cpu_sx ||
+        surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_cpu_sy * s_gpu.pitch))
         return 0;
     s_surface = (uint8_t *)mem + base;
     return 1;
@@ -2028,6 +2126,8 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     s_gpu.pixels++;
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
+    x *= s_cpu_sx;
+    y *= s_cpu_sy;
     row = s_surface + (size_t)y * s_gpu.pitch;
 
     if (s_gpu.blend_enable || s_gpu.color_mask != 0x01010101u) {
@@ -2058,12 +2158,16 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         }
     }
 
-    if (bpp == 4) {
-        ((uint32_t *)row)[x] = argb;
-    } else if (bpp == 2) {
-        ((uint16_t *)row)[x] = (uint16_t)(((argb >> 8) & 0xF800)
-                                        | ((argb >> 5) & 0x07E0)
-                                        | ((argb >> 3) & 0x001F));
+    for (uint32_t dy = 0; dy < s_cpu_sy; dy++, row += s_gpu.pitch) {
+        for (uint32_t dx = 0; dx < s_cpu_sx; dx++) {
+            if (bpp == 4) {
+                ((uint32_t *)row)[x + dx] = argb;
+            } else if (bpp == 2) {
+                ((uint16_t *)row)[x + dx] = (uint16_t)(((argb >> 8) & 0xF800)
+                                                | ((argb >> 5) & 0x07E0)
+                                                | ((argb >> 3) & 0x001F));
+            }
+        }
     }
 }
 
@@ -2241,15 +2345,21 @@ static int depth_pass(uint8_t *mem, int x, int y, const Nv2aCpuVertex vertices[3
     if (!nv_cpu_finite(depth)) return 0;
     incoming = (uint32_t)nv_cpu_clamp(depth, 0.0f, (float)maximum);
     (void)mem;
-    pixel = s_depth_surface + (size_t)y * s_gpu.depth_pitch + (size_t)x * (format == 1 ? 2 : 4);
+    pixel = s_depth_surface + (size_t)y * s_cpu_sy * s_gpu.depth_pitch
+          + (size_t)x * s_cpu_sx * (format == 1 ? 2 : 4);
     stored = format == 1 ? *(uint16_t *)pixel : *(uint32_t *)pixel >> 8;
     if (!nv_cpu_compare(s_gpu.depth_func, incoming, stored)) {
         s_gpu.depth_rejected++;
         return 0;
     }
     if (s_gpu.depth_mask && write_depth) {
-        if (format == 1) *(uint16_t *)pixel = (uint16_t)incoming;
-        else *(uint32_t *)pixel = (incoming << 8) | (*(uint32_t *)pixel & 255u);
+        for (uint32_t dy = 0; dy < s_cpu_sy; dy++) {
+            uint8_t *row = pixel + (size_t)dy * s_gpu.depth_pitch;
+            for (uint32_t dx = 0; dx < s_cpu_sx; dx++) {
+                if (format == 1) ((uint16_t *)row)[dx] = (uint16_t)incoming;
+                else ((uint32_t *)row)[dx] = (incoming << 8) | (((uint32_t *)row)[dx] & 255u);
+            }
+        }
         s_gpu.depth_written++;
     }
     return 1;
@@ -2326,9 +2436,9 @@ static void raster_triangle(const float a[2], const float b[2],
         uint32_t format = (s_gpu.format >> 4) & 15u;
         uint32_t bytes = format == 1 ? 2u : format == 2 ? 4u : 0u;
         uint32_t base = dma_resolve(s_gpu.depth_offset);
-        if (!bytes || s_gpu.depth_pitch < (s_gpu.clip_x + s_gpu.clip_w) * bytes ||
+        if (!bytes || s_gpu.depth_pitch < (s_gpu.clip_x + s_gpu.clip_w) * s_cpu_sx * bytes ||
             surface_write_refused(base,
-                                  (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.depth_pitch, "depth draw")) {
+                                  (s_gpu.clip_y + s_gpu.clip_h) * s_cpu_sy * s_gpu.depth_pitch, "depth draw")) {
             s_gpu.shader_failures++;
             return;
         }
@@ -2730,7 +2840,7 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
                     textured ? (const float (*)[2])uv : NULL, vertices);
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
 static int gpu_decode_texture(void *context, uint32_t horizontal, uint32_t vertical, uint32_t *color)
 {
     return sample_texture_bound((const Texture *)context, horizontal, vertical, color);
@@ -2935,27 +3045,6 @@ static void gpu_begin_chunk(void)
 }
 
 static int gpu_submit_chunk(Nv2aGpuDraw *state, uint32_t *count);
-
-/* Only for the timings the report prints (RECOMP_PB_REPORT_MS, or
- * RECOMP_GPU_TIMING); otherwise every call reads 0 and costs no clock read --
- * it is called around every batch and every DMA lookup. */
-static double gpu_clock_seconds(void)
-{
-    static LARGE_INTEGER frequency;
-    static int wanted = -1;
-    LARGE_INTEGER counter;
-    if (wanted < 0)
-        wanted = getenv("RECOMP_PB_REPORT_MS") || getenv("RECOMP_GPU_TIMING") || getenv("RECOMP_HITCH_MS");
-    if (!wanted)
-        return 0.0;
-    if ((!frequency.QuadPart && (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)) ||
-        !QueryPerformanceCounter(&counter)) {
-        fprintf(stderr, "[GPU-D3D11] native performance clock failed (win32 %lu)\n", GetLastError());
-        fflush(stderr);
-        _Exit(EXIT_FAILURE);
-    }
-    return (double)counter.QuadPart / (double)frequency.QuadPart;
-}
 
 /* The batch's per-attribute fetch plans (see FastAttr), for the program's
  * attributes. */
@@ -3647,7 +3736,7 @@ extern volatile LONG g_nv2a_capture_active;   /* nv2a_gpu_d3d11.cpp: the capture
 
 static void raster_batch(void)
 {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(RECOMP_GPU_NATIVE)
     uint32_t i;
 #endif
 
@@ -3679,7 +3768,7 @@ static void raster_batch(void)
         }
     }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
     { /* DIAG RECOMP_DRAW_ONLY=<first>[-<last>]: draw only those batches of each
        * frame (numbered from 1 after FLIP_INCREMENT_WRITE), plus anything aimed
        * at the display buffer so the frame still reaches the window. */
@@ -3721,7 +3810,11 @@ static void raster_batch(void)
             /* F11 in the window: the whole next frame, to a file beside the exe. */
             if (info_state != 1 && InterlockedExchange(&g_nv2a_capture_request, 0)) {
                 char path[MAX_PATH];
+#ifdef _WIN32
                 DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+#else
+                DWORD n = 0; /* native captures are relative to the working directory */
+#endif
                 while (n && path[n - 1] != '\\' && path[n - 1] != '/') n--;
                 snprintf(path + n, sizeof path - n, "capture_%u.txt", ++capture_seq);
                 FILE *f = fopen(path, "w");
@@ -5056,7 +5149,7 @@ texture_stages:
         float attributes[16][4] = {{0}};
         memcpy(attributes[0], s_gpu.transform_data, sizeof s_gpu.transform_data);
         s_gpu.state_shader_runs++;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
         if (!nv2a_gpu_execute_state(s_gpu.vp_program, s_gpu.vp_valid, param, attributes, s_gpu.vp_constants)) {
             s_gpu.state_shader_failures++;
             fprintf(stderr, "[GPU-D3D11] unsupported state program: start %u; hardware rendering required\n", param);
@@ -5339,12 +5432,17 @@ state_switch:
                     pitch = scan_pitch;
                 }
             }
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
             void *window = present_window();
             int shown_direct = 0;
             /* Straight from the GPU surface into the window's swap chain:
              * no publish, no GPU wait, no CPU conversion. Not for a frame
              * the movie overlay paints into guest RAM, or one a capture or
              * dump wants converted on the CPU. */
+#ifdef RECOMP_GPU_NATIVE
+            extern void xbox_FramebufferWindowFrameStats(uint32_t draws);
+            xbox_FramebufferWindowFrameStats(s_gpu.draws);
+#endif
             if (done && window && !xbox_FramebufferWantsPixels() && !pvideo_overlay_active()) {
                 uint32_t h = present_h ? present_h : s_gpu.clip_y + s_gpu.clip_h;
                 uint32_t frame_w, frame_h;
@@ -5397,6 +5495,20 @@ state_switch:
             } else {
                 nv2a_pb_exec_flush();
             }
+#else
+            if (done) {
+                extern void xbox_FramebufferWindowSetAA(uint32_t sy);
+                extern void xbox_FramebufferWindowFrameStats(uint32_t draws);
+                uint32_t sx, sy;
+                surface_aa_scale(&sx, &sy);
+                xbox_FramebufferWindowSetAA(present_h >= 960u ? sy : 1u);
+                if (pitch == s_gpu.pitch)
+                    present_pvideo_overlay(done);
+                xbox_FramebufferWindowFrameStats(s_gpu.draws);
+                xbox_FramebufferWindowSet(dma_resolve(done), pitch);
+                xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
+            }
+#endif
         } else {
             nv2a_pb_exec_flush();
         }
@@ -5703,10 +5815,12 @@ void nv2a_pb_exec_report(void)
                 xbox_ContigBlockCount(), g_cba_calls, g_cba_iters, s_dma_seconds,
                 100.0 * s_dma_seconds / (s_gpu.gpu_prepare_seconds + s_gpu.gpu_submit_seconds + 1e-9));
     }
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
     nv2a_gpu_report();
+#endif
     xbox_Nv2aSoftwareMethodReport();
     xbox_Nv2aFlipPacingReport();
-#ifdef _WIN32
+#if defined(_WIN32) || defined(RECOMP_GPU_NATIVE)
     static clock_t previous_time;
     static uint32_t previous_flips;
     static double previous_raster_seconds;

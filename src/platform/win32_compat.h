@@ -90,6 +90,25 @@ LONG InterlockedDecrement(volatile LONG *Addend);
 LONG InterlockedExchange(volatile LONG *Target, LONG Value);
 LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
+static inline LONGLONG InterlockedOr64(volatile LONGLONG *dest, LONGLONG value)
+{
+    return __atomic_fetch_or(dest, value, __ATOMIC_SEQ_CST);
+}
+
+static inline LONGLONG InterlockedAnd64(volatile LONGLONG *dest, LONGLONG value)
+{
+    return __atomic_fetch_and(dest, value, __ATOMIC_SEQ_CST);
+}
+
+static inline void YieldProcessor(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ volatile("yield" ::: "memory");
+#endif
+}
+
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
 
@@ -305,6 +324,10 @@ int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
 #define VK_DOWN      0x28
 #define VK_INSERT    0x2D
 #define VK_DELETE    0x2E
+#define VK_NUMPAD2   0x62
+#define VK_NUMPAD4   0x64
+#define VK_NUMPAD6   0x66
+#define VK_NUMPAD8   0x68
 #define VK_MULTIPLY  0x6A
 #define VK_ADD       0x6B
 #define VK_SUBTRACT  0x6D

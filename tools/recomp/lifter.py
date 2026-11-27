@@ -97,6 +97,8 @@ _FUNC_RESERVED_IDENT = frozenset({
     "atoll", "llabs", "lldiv", "strtof", "strtold", "strtoll", "strtoull",
     # <setjmp.h>
     "longjmp", "setjmp",
+    # POSIX libc
+    "isatty",
     # Host Win32 API export names (data/win32_api_names.txt) so a guest
     # function named like a linked import does not collide at link time.
 }) | _WIN32_EXPORTS
@@ -1381,7 +1383,7 @@ class Lifter:
         # sibling `cmp word ptr [..], imm` instead of falling back to _flags.
         # Reset at each block boundary; a register write drops its entry.
         self._narrow = {}
-        self.publishes_ebp = False  # Set per-function: has a real frame
+        self.publishes_ebp = False  # Set per-function: tracks architectural EBP
         self.trace_exit_name = None  # Set per-function when traced
         self.force_return_value = None   # Set per-function by --force-return
         # Every direct call target we emit a name for, as {addr: name}. The
@@ -2609,7 +2611,8 @@ class Lifter:
             # callback invoked through a stack argument -- is read four bytes
             # low and dispatches through the wrong slot.
             site = insn.address
-            head = (f"{{ uint32_t _icall_target = {target}; "
+            publish = "g_ebp = ebp; g_seh_ebp = ebp; " if self.publishes_ebp else ""
+            head = (publish + f"{{ uint32_t _icall_target = {target}; "
                     f"PUSH32(esp, 0x{ret_va:08X}u); ")
             fallback = (f"{safe_at_macro}(_icall_target, _icall_esp, "
                         f"0x{site:08X}u); }}")
@@ -2630,10 +2633,12 @@ class Lifter:
     def _lift_ret(self, insn, ops):
         # x86 'ret' pops return address from stack.
         # 'ret N' also pops N extra bytes (stdcall cleanup).
-        # If this function IS __SEH_prolog or __SEH_epilog, bridge ebp
-        # so the caller can read back the frame pointer.
+        # Publish the restored architectural EBP, including general-register
+        # uses in frame-pointer-omitted code and the SEH helper bridge.
         prefix = ""
-        if self.func_start in self.SEH_HELPERS:
+        if self.publishes_ebp:
+            prefix = "g_ebp = ebp; g_seh_ebp = ebp; "
+        elif self.func_start in self.SEH_HELPERS:
             prefix = "g_seh_ebp = ebp; "
         # Exit trace, for functions that return with a register the caller
         # relied on holding something else. Entry tracing alone cannot show

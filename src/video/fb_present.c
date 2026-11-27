@@ -14,6 +14,7 @@
  *
  * Off unless RECOMP_FB_WINDOW is set.
  */
+#include <stddef.h>
 #include <stdint.h>
 
 #if defined(_WIN32)
@@ -1552,18 +1553,16 @@ void xbox_FramebufferWindowStart(void)
 }
 
 #else
-void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
-void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
-void xbox_FramebufferWindowStart(void) {}
-int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 int xbox_FramebufferMouseDelta(int *dx, int *dy) { if (dx) *dx = 0; if (dy) *dy = 0; return 0; }
 int xbox_FramebufferMouseButton(int which) { (void)which; return 0; }
 int xbox_FramebufferMouseClicks(int which) { (void)which; return 0; }
 int xbox_FramebufferMouseWheel(void) { return 0; }
 void xbox_FramebufferMouseCapture(int on) { (void)on; }
-void *xbox_FramebufferWindowHandle(void) { return NULL; }
 void xbox_FramebufferSize(uint32_t *width, uint32_t *height) { *width = 640; *height = 480; }
+#ifndef RECOMP_GPU_NATIVE
+void *xbox_FramebufferWindowHandle(void) { return NULL; }
 const uint32_t *xbox_FramebufferPixels(uint32_t *width, uint32_t *height) { *width = *height = 0; return NULL; }
+#endif
 int xbox_FramebufferWantsPixels(void) { return 0; }
 void xbox_FramebufferSetDirectPresent(void) {}
 void xbox_FramebufferFrameShown(void) {}

@@ -21,6 +21,7 @@
 #include <setjmp.h>
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
+#include <time.h>
 #endif
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
@@ -407,13 +408,12 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
  *
  * Only RR. Bit 0 is RPBM, run/pause bus master, which software owns.
  */
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
 #define AC97_NABM_OFFSET  0x400000u   /* 0xFEC00000 within the MCPX aperture */
 #define AC97_TRAP_BYTES   0x1000u
 #define AC97_RR           0x02u
 
 static void *g_ac97_page = NULL;      /* host address of the trapped page */
-static void *g_ac97_veh  = NULL;
-static RECOMP_TLS int s_ac97_stepping = 0;
 
 static void ac97_clear_reset_bits(void)
 {
@@ -434,6 +434,10 @@ static void ac97_clear_reset_bits(void)
             *r = (uint8_t)(*r & ~AC97_RR);
     }
 }
+
+#if defined(_WIN32)
+static void *g_ac97_veh = NULL;
+static RECOMP_TLS int s_ac97_stepping;
 
 static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 {
@@ -502,6 +506,97 @@ static void ac97_arm_write_trap(void)
                     " (channel reset completes on write)\n",
             XBOX_MCPX_BASE + AC97_NABM_OFFSET);
 }
+
+#else
+#include "platform/mmio_decode_x86_64.h"
+#include <sys/mman.h>
+
+static uint64_t ac97_posix_rd(void *dev, uint32_t off, int size)
+{
+    uint64_t v = 0;
+    memcpy(&v, (char *)dev + off, size > 8 ? 8 : size);
+    return v;
+}
+
+static void ac97_posix_wr(void *dev, uint32_t off, uint64_t v, int size)
+{
+    memcpy((char *)dev + off, &v, size > 8 ? 8 : size);
+}
+
+/* Linux half of the AC'97 write trap: the page is PROT_READ, so a
+ * write arrives as SIGBUS/SIGSEGV; the title's fault handler reaches this
+ * through xbox_PosixMmioFault before reporting. The store is emulated onto
+ * the page (open for the moment), the controller's reaction applied, and the
+ * page closed again. Returns 1 when the fault was this trap and the access
+ * was serviced. */
+static volatile int g_ac97_posix_lock;
+
+static int ac97_posix_fault(void *ucv, uintptr_t fault)
+{
+    int ok;
+
+    if (!g_ac97_page || fault < (uintptr_t)g_ac97_page
+            || fault >= (uintptr_t)g_ac97_page + AC97_TRAP_BYTES)
+        return 0;
+    /* One trap at a time. The page is open process-wide while the store is
+     * emulated, so a second thread trapping in that window would have its
+     * page closed under it by the first thread's mprotect and fault inside
+     * the emulation. Spin: the window is a few hundred instructions, and a
+     * plain store from another thread while the page is open is still
+     * caught by the sweep below if it lands before it; one landing between
+     * the sweep and the close keeps its RR bit until the next trap. That
+     * residual needs two threads resetting channels at once, which
+     * DirectSound's single-threaded init never does. */
+    while (__atomic_exchange_n(&g_ac97_posix_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    /* Not opened: the emulated store would fault again on this thread,
+     * which holds the lock it would then spin on. Let it be reported. */
+    if (mprotect(g_ac97_page, AC97_TRAP_BYTES, PROT_READ | PROT_WRITE) != 0) {
+        __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
+        return 0;
+    }
+    ok = mmio_emulate_x86_64(ucv, (uint32_t)(fault - (uintptr_t)g_ac97_page),
+                             g_ac97_page, ac97_posix_rd, ac97_posix_wr);
+    if (ok)
+        ac97_clear_reset_bits();
+    mprotect(g_ac97_page, AC97_TRAP_BYTES, PROT_READ);
+    __atomic_store_n(&g_ac97_posix_lock, 0, __ATOMIC_RELEASE);
+    return ok;
+}
+
+static void ac97_arm_write_trap(void)
+{
+    void *page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
+    if (mprotect(page, AC97_TRAP_BYTES, PROT_READ) == 0)
+        g_ac97_page = page;
+    else
+        perror("AC97: mprotect");
+}
+#endif
+#endif
+
+#if !defined(_WIN32)
+int xbox_PosixMmioFault(void *context, uintptr_t fault)
+{
+#if defined(__linux__) && defined(__x86_64__)
+    extern int apu_hook_handle_mmio_posix(void *ctx, uint32_t va);
+    extern int xbox_OhciOwnsAddress(uint32_t va);
+    extern int xbox_OhciHandleMmio(void *ctx, uint32_t va);
+
+    uintptr_t va = fault - (uintptr_t)xbox_GetMemoryOffset();
+    if (va >= 0xFE800000u && va < 0xFE880000u)
+        return apu_hook_handle_mmio_posix(context, (uint32_t)va);
+    if (ac97_posix_fault(context, fault))
+        return 1;
+    if (va <= UINT32_MAX && xbox_OhciOwnsAddress((uint32_t)va))
+        return xbox_OhciHandleMmio(context, (uint32_t)va);
+#else
+    (void)context;
+    (void)fault;
+#endif
+    return 0;
+}
+#endif
 
 /*
  * Command words the DSP stub completes instantly. A bring-up probe, not a
@@ -1323,8 +1418,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                              * the walk's wall includes SwitchToThread yields
                              * while it waits for the GPU, which burn no CPU.
                              * cpu% near 100 = CPU-bound; low = waiting. */
-                            FILETIME ft_c, ft_e, ft_k, ft_u;
                             ULONGLONG k = 0, u = 0;
+#ifdef _WIN32
+                            FILETIME ft_c, ft_e, ft_k, ft_u;
                             if (GetThreadTimes(GetCurrentThread(), &ft_c, &ft_e,
                                                &ft_k, &ft_u)) {
                                 k = ((ULONGLONG)ft_k.dwHighDateTime << 32)
@@ -1332,6 +1428,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                                 u = ((ULONGLONG)ft_u.dwHighDateTime << 32)
                                     | ft_u.dwLowDateTime;
                             }
+#else
+                            struct timespec cpu;
+                            if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu) == 0)
+                                u = (ULONGLONG)cpu.tv_sec * 10000000u + cpu.tv_nsec / 100u;
+#endif
                             double cpu_s = ((double)(k - kick_cpu_k)
                                             + (double)(u - kick_cpu_u)) / 1e7;
                             kick_cpu_k = k;
@@ -2307,7 +2408,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
         /* RECOMP_RAM_BASE=<hex>: that base first (a layout question to test). */
         const char *asked_text = getenv("RECOMP_RAM_BASE");
-        uintptr_t asked = asked_text ? (uintptr_t)_strtoui64(asked_text, NULL, 16) : 0;
+        uintptr_t asked = asked_text ? (uintptr_t)strtoull(asked_text, NULL, 16) : 0;
         for (size_t i = asked ? (size_t)-1 : 0; !g_memory_base && (i == (size_t)-1 || i < n_bases); i++) {
             uintptr_t want = i == (size_t)-1 ? asked : try_bases[i];
             LPVOID hint = want ? (LPVOID)want : NULL;
@@ -2797,6 +2898,18 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
+#ifndef _WIN32
+        /* This fixed window takes the place of the overlapping RAM mirror. */
+        if (g_span_base) {
+            const uintptr_t span_end = (uintptr_t)g_span_base + g_span_size;
+            if (contig_native < span_end) {
+                size_t available = span_end - contig_native;
+                VirtualFree((LPVOID)contig_native,
+                            available < XBOX_CONTIG_SIZE ? available : XBOX_CONTIG_SIZE,
+                            MEM_RELEASE);
+            }
+        }
+#endif
         g_contig_mapping = CreateFileMappingW(
             INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
             0, (DWORD)XBOX_CONTIG_SIZE, NULL);
@@ -2931,6 +3044,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * init. Until the DSP handshake is answered, the honest default is
              * the failure that gets further, with the correct behaviour one
              * variable away. */
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
             if (getenv("RECOMP_AC97_READY")) {
                 /* The APU's registers have to fault so they can be routed to
                  * the emulated APU, which is the half that answers the DSP
@@ -2986,6 +3100,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                                 " (DirectSound will initialise)\n",
                         XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
             }
+#endif
             fprintf(stderr, "  MCPX device aperture: %u MB at Xbox VA "
                     "0x%08X (APU/AC97/USB/NIC, zeroed)\n",
                     XBOX_MCPX_SIZE / (1024 * 1024), XBOX_MCPX_BASE);
@@ -3327,6 +3442,10 @@ void xbox_MemoryLayoutShutdown(void)
     if (g_mcpx_memory) {
         VirtualFree(g_mcpx_memory, 0, MEM_RELEASE);
         g_mcpx_memory = NULL;
+#if defined(__linux__) && defined(__x86_64__)
+        g_ac97_page = NULL;
+        g_apu_mmio_trapped = 0;
+#endif
     }
     if (g_flash_memory) {
         VirtualFree(g_flash_memory, 0, MEM_RELEASE);
@@ -3941,9 +4060,9 @@ int xbox_ContigOwnsOffset(uint64_t physical)
      * them. The generation is read before the table, so a change in between
      * only leaves the entry already stale. */
     enum { OWN_CACHE = 16 };
-    static __declspec(thread) LONG cached_generation = -1;
-    static __declspec(thread) struct { uint32_t lo, hi; int owned; } cached[OWN_CACHE];
-    static __declspec(thread) unsigned cached_count, cached_next;
+    static RECOMP_TLS LONG cached_generation = -1;
+    static RECOMP_TLS struct { uint32_t lo, hi; int owned; } cached[OWN_CACHE];
+    static RECOMP_TLS unsigned cached_count, cached_next;
     uint32_t off = (uint32_t)physical, lo, hi;
     unsigned k;
     LONG generation;

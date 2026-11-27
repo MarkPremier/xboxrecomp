@@ -51,6 +51,7 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
  * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
+#define XBOX_FILE_OPEN_FOR_FREE_SPACE_QUERY 0x00800000u
 
 /* The utility drive is the exception to 16 KB. XAPI formats the cache
  * partition it mounts as Z: with the cluster size the XBE asks for in
@@ -67,6 +68,43 @@ static ULONG xbox_utility_sectors_per_cluster(void)
     uint32_t flags = *(const uint32_t *)((uintptr_t)XBOX_XBE_INIT_FLAGS_VA + g_xbox_mem_offset);
     return XBOX_SECTORS_PER_CLUSTER << (flags >> 30);
 }
+
+/* Volume handles on a cache partition (3-5), the ones whose cluster size
+ * comes from InitFlags (see xbox_utility_sectors_per_cluster). A volume open
+ * is redirected to the directory holding the image, and every partition's
+ * image lives in the same directory, so the host path cannot tell Partition5
+ * from Partition1 afterwards. NtCreateFile marks the handle while it still
+ * knows; NtClose drops the mark. */
+#define UTILITY_VOLUME_MAX 16
+static HANDLE s_utility_volume[UTILITY_VOLUME_MAX];
+static SRWLOCK s_utility_volume_lock = SRWLOCK_INIT;
+
+static void utility_volume_mark(HANDLE h)
+{
+    int i;
+    AcquireSRWLockExclusive(&s_utility_volume_lock);
+    for (i = 0; i < UTILITY_VOLUME_MAX; i++)
+        if (!s_utility_volume[i]) { s_utility_volume[i] = h; break; }
+    ReleaseSRWLockExclusive(&s_utility_volume_lock);
+}
+
+/* Returns 1 if h was marked; drop also clears it. */
+static int utility_volume_find(HANDLE h, int drop)
+{
+    int i, was = 0;
+    if (!h || h == INVALID_HANDLE_VALUE)
+        return 0;
+    AcquireSRWLockExclusive(&s_utility_volume_lock);
+    for (i = 0; i < UTILITY_VOLUME_MAX; i++)
+        if (s_utility_volume[i] == h) {
+            if (drop) s_utility_volume[i] = NULL;
+            was = 1;
+            break;
+        }
+    ReleaseSRWLockExclusive(&s_utility_volume_lock);
+    return was;
+}
+
 
 /* ======================================================================== */
 /* Shared by both backends. kernel_bridge.c calls xbox_LastFileError()
@@ -130,16 +168,6 @@ static DWORD xbox_share_to_win32(ULONG Share)
     return result;
 }
 
-/* Volume handles on a cache partition (3-5), the ones whose cluster size
- * comes from InitFlags (see xbox_utility_sectors_per_cluster). A volume open
- * is redirected to the directory holding the image, and every partition's
- * image lives in the same directory, so the host path cannot tell Partition5
- * from Partition1 afterwards. NtCreateFile marks the handle while it still
- * knows; NtClose drops the mark. */
-#define UTILITY_VOLUME_MAX 16
-static HANDLE s_utility_volume[UTILITY_VOLUME_MAX];
-static SRWLOCK s_utility_volume_lock = SRWLOCK_INIT;
-
 static int is_cache_partition_image(const WCHAR *leaf)
 {
     return _wcsicmp(leaf, L"Partition3.img") == 0
@@ -147,31 +175,6 @@ static int is_cache_partition_image(const WCHAR *leaf)
         || _wcsicmp(leaf, L"Partition5.img") == 0;
 }
 
-static void utility_volume_mark(HANDLE h)
-{
-    int i;
-    AcquireSRWLockExclusive(&s_utility_volume_lock);
-    for (i = 0; i < UTILITY_VOLUME_MAX; i++)
-        if (!s_utility_volume[i]) { s_utility_volume[i] = h; break; }
-    ReleaseSRWLockExclusive(&s_utility_volume_lock);
-}
-
-/* Returns 1 if h was marked; drop also clears it. */
-static int utility_volume_find(HANDLE h, int drop)
-{
-    int i, was = 0;
-    if (!h || h == INVALID_HANDLE_VALUE)
-        return 0;
-    AcquireSRWLockExclusive(&s_utility_volume_lock);
-    for (i = 0; i < UTILITY_VOLUME_MAX; i++)
-        if (s_utility_volume[i] == h) {
-            if (drop) s_utility_volume[i] = NULL;
-            was = 1;
-            break;
-        }
-    ReleaseSRWLockExclusive(&s_utility_volume_lock);
-    return was;
-}
 
 /* Translate an Xbox OBJECT_ATTRIBUTES path to a Win32 wide path */
 static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
@@ -904,8 +907,20 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
-    int fd;
+    int fd, utility_volume = 0;
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
+        /* The utility-drive mount queries the device's volume by opening its
+         * partition image as a directory. Use the image's containing volume. */
+        char *base = strrchr(host_path, '/');
+        if ((CreateOptions & XBOX_FILE_OPEN_FOR_FREE_SPACE_QUERY) && base && base != host_path &&
+            !strncmp(base + 1, "Partition", 9) && strlen(base + 1) == 14 &&
+            base[10] >= '0' && base[10] <= '9' && !strcmp(base + 11, ".img")) {
+            struct stat image;
+            if (stat(host_path, &image) == 0 && S_ISREG(image.st_mode)) {
+                utility_volume = base[10] >= '3' && base[10] <= '5';
+                *base = '\0';
+            }
+        }
         if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
             mkdir(host_path, 0755);   /* EEXIST is fine */
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
@@ -928,6 +943,9 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
     }
+    utility_volume_find(*FileHandle, 1);
+    if (utility_volume)
+        utility_volume_mark(*FileHandle);
     XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %s -> handle=%p", host_path, *FileHandle);
     return STATUS_SUCCESS;
 }
@@ -1002,6 +1020,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
+    utility_volume_find(Handle, 1);
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         CloseHandle(Handle);
@@ -1163,7 +1182,8 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             /* Xbox geometry, not the host's -- see the note on
              * XBOX_SECTORS_PER_CLUSTER above. */
             info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
-            info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+            info->SectorsPerAllocationUnit = utility_volume_find(FileHandle, 0)
+                ? xbox_utility_sectors_per_cluster() : XBOX_SECTORS_PER_CLUSTER;
             if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;

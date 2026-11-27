@@ -2,7 +2,11 @@
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <dxgi1_6.h>
+#ifdef _WIN32
 #include <wrl/client.h>
+#else
+#include "nv2a_gpu_native.h"
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <d3dcompiler.h>
@@ -43,6 +47,9 @@ static HRESULT shader_compile(LPCVOID source, SIZE_T size, LPCSTR name, const D3
                               ID3DInclude *include, LPCSTR entry, LPCSTR profile, UINT flags1, UINT flags2,
                               ID3DBlob **code, ID3DBlob **errors)
 {
+#ifndef _WIN32
+    return nv2a_native_compile(source, size, name, defines, include, entry, profile, flags1, flags2, code, errors);
+#else
     static ShaderCompiler bundled;
     static std::once_flag once;
     std::call_once(once, []() {
@@ -59,6 +66,7 @@ static HRESULT shader_compile(LPCVOID source, SIZE_T size, LPCSTR name, const D3
     });
     return bundled ? bundled(source, size, name, defines, include, entry, profile, flags1, flags2, code, errors)
                    : D3DCompile(source, size, name, defines, include, entry, profile, flags1, flags2, code, errors);
+#endif
 }
 
 /* Clear the NV2A WC-flush/idle handshake bits the guest spins on (KickOff).
@@ -647,7 +655,7 @@ static float automatic_render_scale()
     float automatic = mode.dmPelsHeight > 1920 ? std::min(mode.dmPelsHeight / 480.0f, 8.0f)
                                                 : (float)((mode.dmPelsHeight + 479) / 480);
     std::fprintf(stderr, "[GPU-D3D11] render scale %gx (monitor %lux%lu)\n", automatic,
-                 mode.dmPelsWidth, mode.dmPelsHeight);
+                 (unsigned long)mode.dmPelsWidth, (unsigned long)mode.dmPelsHeight);
     return automatic;
 }
 
@@ -1568,6 +1576,10 @@ static HRESULT compile_shader_cached(const char *source, size_t size, const char
     if (!directory.empty()) {
         uint64_t key[2] = {0xCBF29CE484222325ull, 0x84222325CBF29CE4ull};
         shader_key_mix(key, source, size);
+#ifdef RECOMP_GPU_NATIVE
+        static const char compiler_key[] = "vkd3d-1.19-native-combiners-v2";
+        shader_key_mix(key, compiler_key, sizeof compiler_key);
+#endif
         shader_key_mix(key, entry, std::strlen(entry));
         shader_key_mix(key, profile, std::strlen(profile));
         shader_key_mix(key, &flags, sizeof flags);
@@ -1597,7 +1609,7 @@ static HRESULT compile_shader_cached(const char *source, size_t size, const char
         /* Written under a unique name and renamed into place, so a reader
          * (or a second compile of the same shader) never sees half a file. */
         wchar_t suffix[32];
-        swprintf(suffix, 32, L".%lu.%lu.tmp", GetCurrentProcessId(), GetCurrentThreadId());
+        swprintf(suffix, 32, L".%lu.%lu.tmp", (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId());
         std::wstring temporary = path + suffix;
         HANDLE handle = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
         if (handle != INVALID_HANDLE_VALUE) {
@@ -4887,7 +4899,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
                 char path[MAX_PATH + 64];
                 DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
                 while (length && path[length - 1] != '\\' && path[length - 1] != '/') length--;
-                std::snprintf(path + length, sizeof path - length, "capture_%ld_shadow_%u_%ux%u.pgm", capture,
+                std::snprintf(path + length, sizeof path - length, "capture_%ld_shadow_%u_%ux%u.pgm", (long)capture,
                               (unsigned)dumped.size(), shadow->width, shadow->height);
                 write_depth_pgm(*shadow, path, true);
             }
@@ -5063,7 +5075,7 @@ static ID3D11ShaderResourceView *get_texture(const Nv2aGpuTexture &binding, cons
             if (listed.insert(direct->memory).second)
                 std::fprintf(stderr, "[GPU-D3D11] capture %ld: texture %p %ux%u format %X read from its target "
                              "(texture %ux%u, dirty %u snapshot %u, last drawn %llu frames ago)\n",
-                             capture, (const void *)direct->memory, direct->width, direct->height, binding.format,
+                             (long)capture, (const void *)direct->memory, direct->width, direct->height, binding.format,
                              direct->texture_width, direct->texture_height, (unsigned)direct->dirty,
                              (unsigned)direct->snapshot_valid,
                              (unsigned long long)(surface_frame_serial - direct->used_frame));
@@ -7415,7 +7427,7 @@ extern "C" int nv2a_gpu_compile(void)
     if (FAILED(result)) return 0;
     if (FAILED(device->CreatePixelShader(pixel_code->GetBufferPointer(), pixel_code->GetBufferSize(), nullptr, &uncombined_shader))) return 0;
     const struct { const char *entry; ComPtr<ID3D11GeometryShader> *shader; } geometries[] = {
-        {"gs_main", &geometry_shader}, {"gs_lines_main", &line_geometry_shader}, {"gs_points_main", &point_geometry_shader}
+        {"gs_main", std::addressof(geometry_shader)}, {"gs_lines_main", std::addressof(line_geometry_shader)}, {"gs_points_main", std::addressof(point_geometry_shader)}
     };
     {
         const D3D_SHADER_MACRO lit[] = {{"NV_PIXEL_LIGHTING", "1"}, {nullptr, nullptr}};
@@ -7451,8 +7463,10 @@ extern "C" int nv2a_gpu_compile(void)
  * dllexport still reaches the program's export table) and start it on the
  * discrete GPU; DXGI is asked for the high-performance adapter as well. */
 extern "C" {
+#ifdef _WIN32
 __declspec(dllexport) unsigned long NvOptimusEnablement = 1;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+#endif
 }
 
 static ComPtr<IDXGIAdapter1> high_performance_adapter()

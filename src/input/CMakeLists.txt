@@ -11,6 +11,7 @@ if(WIN32)
     target_link_libraries(xbox_input PUBLIC platform xinput hid setupapi)
 else()
     find_package(SDL2 REQUIRED)
+    target_sources(xbox_input PRIVATE input_sdl.c)
     target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2)
 endif()
 

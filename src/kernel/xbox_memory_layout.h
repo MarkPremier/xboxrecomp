@@ -258,6 +258,11 @@ void *xbox_GetMemoryBase(void);
  * Returns 0 if memory is mapped at original Xbox addresses (ideal case).
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
+
+#if !defined(_WIN32)
+/* Forward SIGSEGV/SIGBUS context and si_addr before reporting a guest fault. */
+int xbox_PosixMmioFault(void *context, uintptr_t fault);
+#endif
 /* DbgHelp is process-global and not thread-safe; serialize all symbol calls. */
 extern SRWLOCK g_xbox_debug_symbols_lock;
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer

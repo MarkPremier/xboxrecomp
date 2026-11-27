@@ -21,6 +21,7 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+#include "../kernel/xbox_memory_layout.h"
 
 /* #define DEBUG_MCPX */
 
@@ -502,7 +503,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             static int trace = -1;
             if (trace < 0) trace = getenv("RECOMP_APU_VOL_TRACE") != NULL;
             if (trace && d->regs[NV_PAPU_FECV] >= MCPX_HW_MAX_3D_VOICES) {
-                extern __declspec(thread) uint32_t g_esp;
+                extern RECOMP_TLS uint32_t g_esp;
                 extern ptrdiff_t g_xbox_mem_offset;
                 char callers[256];
                 int n = 0, i;

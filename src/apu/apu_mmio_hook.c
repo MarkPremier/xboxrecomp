@@ -88,4 +88,23 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     return ok;
 }
 
-#endif /* _WIN32 */
+#elif defined(__linux__) && defined(__x86_64__)
+#include "platform/mmio_decode_x86_64.h"
+
+static uint64_t apu_posix_read(void *dev, uint32_t offset, int size)
+{
+    return mcpx_apu_mmio_read(dev, offset, (unsigned)size);
+}
+
+static void apu_posix_write(void *dev, uint32_t offset, uint64_t value, int size)
+{
+    mcpx_apu_mmio_write(dev, offset, value, (unsigned)size);
+}
+
+int apu_hook_handle_mmio_posix(void *ctx, uint32_t va)
+{
+    return g_apu_state &&
+        mmio_emulate_x86_64(ctx, va - 0xFE800000u, g_apu_state,
+                            apu_posix_read, apu_posix_write);
+}
+#endif

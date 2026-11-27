@@ -438,9 +438,14 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 
     /* Try XAudio2 first (lower latency) */
     if (xa2_init()) {
+#ifdef _WIN32
         fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
+#endif
         return;
     }
+#ifndef _WIN32
+    return;
+#endif
     fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
 
     WAVEFORMATEX wfx = { 0 };
@@ -747,6 +752,7 @@ static void throttle(MCPXAPUState *d)
 
 static double g_apu_yield_s;     /* RECOMP_APU_DIAG: time given away to the title */
 
+#if defined(_MSC_VER)
 /* Containment. The emulated APU walks voice lists, SGE tables and DSP code
  * that the title is rewriting as it goes, with no lock between them (on
  * hardware a half-written value only plays a wrong sample); each crash so
@@ -783,28 +789,38 @@ static void apu_fault_report(const char *where, unsigned long code)
             n == 64 ? ": audio emulation stopped, the game goes on" : "");
 }
 
+#endif
+
 static void se_stage(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], bool dsp)
 {
+#if defined(_MSC_VER)
     unsigned long code = 0;
     if (apu_fault_limit()) return;
     __try {
-        if (dsp) mcpx_apu_dsp_frame(d, mixbins);
-        else mcpx_apu_vp_frame(d, mixbins);
+#endif
+    if (dsp) mcpx_apu_dsp_frame(d, mixbins);
+    else mcpx_apu_vp_frame(d, mixbins);
+#if defined(_MSC_VER)
     } __except (apu_fault_filter(code = GetExceptionCode())) {
         memset(mixbins, 0, sizeof(float) * NUM_MIXBINS * NUM_SAMPLES_PER_FRAME);
         apu_fault_report(dsp ? "the DSP frame" : "the voice processor", code);
     }
+#endif
 }
 
 static void apu_write_guarded(void (*write)(void *, hwaddr, uint64_t, unsigned int),
                               MCPXAPUState *d, hwaddr addr, uint64_t val, unsigned int size)
 {
+#if defined(_MSC_VER)
     unsigned long code = 0;
     __try {   /* not skipped past the limit: DirectSound waits on its writes */
         write(d, addr, val, size);
     } __except (apu_fault_filter(code = GetExceptionCode())) {
         apu_fault_report("a register write", code);
     }
+#else
+    write(d, addr, val, size);
+#endif
 }
 
 static void se_frame(MCPXAPUState *d)

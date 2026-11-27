@@ -382,12 +382,16 @@ static BOOL CALLBACK kernel_audio_guard_init(PINIT_ONCE once, PVOID parameter,
                                              PVOID *context)
 {
     (void)once; (void)parameter; (void)context;
+#ifdef _WIN32
     if (!InitializeCriticalSectionEx(&g_audio_guard, 0, 0)) {
         fprintf(stderr, "  [AUDIO] Cannot initialize guest audio guard: error %lu\n",
                 GetLastError());
         fflush(stderr);
         return FALSE;
     }
+#else
+    InitializeCriticalSection(&g_audio_guard);
+#endif
     return TRUE;
 }
 
@@ -3330,20 +3334,61 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
 #define BRIDGE_HANDLE_MASK 0x00FFFFFFu
 #define BRIDGE_HANDLE_MAX  16384
 static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
+static SRWLOCK s_handle_table_lock = SRWLOCK_INIT;
+
+static uint32_t bridge_register_handle(HANDLE h, bool fresh)
+{
+    if (!h || h == INVALID_HANDLE_VALUE)
+        return 0;
+    uint32_t token = 0;
+    int free_slot = 0;
+
+    AcquireSRWLockExclusive(&s_handle_table_lock);
+    for (int i = 1; i < BRIDGE_HANDLE_MAX; i++) {
+        if (!fresh && s_handle_table[i] == h) {
+            token = BRIDGE_HANDLE_TAG | (uint32_t)i;
+            break;
+        }
+        if (!s_handle_table[i] && !free_slot) {
+            free_slot = i;
+            if (fresh)
+                break;
+        }
+    }
+    if (!token && free_slot) {
+        s_handle_table[free_slot] = h;
+        token = BRIDGE_HANDLE_TAG | (uint32_t)free_slot;
+    }
+    ReleaseSRWLockExclusive(&s_handle_table_lock);
+
+    if (!token)
+        fprintf(stderr, "  [BRIDGE] handle table full\n");
+    return token;
+}
 
 static uint32_t bridge_handle_token(HANDLE h)
 {
-    int i;
-    if (!h || h == INVALID_HANDLE_VALUE) return 0;
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == NULL) {
-            s_handle_table[i] = h;
-            return BRIDGE_HANDLE_TAG | (uint32_t)i;
-        }
-    fprintf(stderr, "  [BRIDGE] handle table full\n");
-    return 0;
+    return bridge_register_handle(h, false);
+}
+
+static HANDLE bridge_table_handle(uint32_t token, bool take)
+{
+    uint32_t index = token & BRIDGE_HANDLE_MASK;
+    if (index == 0 || index >= BRIDGE_HANDLE_MAX)
+        return NULL;
+
+    HANDLE handle;
+    if (take) {
+        AcquireSRWLockExclusive(&s_handle_table_lock);
+        handle = s_handle_table[index];
+        s_handle_table[index] = NULL;
+        ReleaseSRWLockExclusive(&s_handle_table_lock);
+    } else {
+        AcquireSRWLockShared(&s_handle_table_lock);
+        handle = s_handle_table[index];
+        ReleaseSRWLockShared(&s_handle_table_lock);
+    }
+    return handle;
 }
 
 /* Store a native HANDLE into a 32-bit Xbox memory slot (as a token). */
@@ -3357,10 +3402,8 @@ static void bridge_write_handle(uint32_t handle_va, HANDLE h)
 static HANDLE bridge_read_handle(uint32_t va)
 {
     uint32_t token = BRIDGE_MEM32(va);
-    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
-        uint32_t i = token & BRIDGE_HANDLE_MASK;
-        return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
-    }
+    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG)
+        return bridge_table_handle(token, false);
     /* Untagged value: synthetic/dummy handle -- pass through unchanged. */
     return (HANDLE)(uintptr_t)token;
 }
@@ -3380,10 +3423,8 @@ static HANDLE bridge_read_handle(uint32_t va)
  * which surfaced as "couldn't open or create saved game file". */
 static HANDLE bridge_resolve_handle(uint32_t token)
 {
-    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
-        uint32_t i = token & BRIDGE_HANDLE_MASK;
-        return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
-    }
+    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG)
+        return bridge_table_handle(token, false);
     /* Pseudo-handles (NtCurrentProcess() = -1, NtCurrentThread() = -2) are
      * negative. Zero-extending them on a 64-bit host yields 0x00000000FFFFFFFE,
      * which Win32 rejects: X-Men Legends' CRT duplicates NtCurrentThread()
@@ -3396,14 +3437,8 @@ static HANDLE bridge_resolve_handle(uint32_t token)
 
 static HANDLE bridge_take_handle(uint32_t token)
 {
-    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
-        uint32_t i = token & BRIDGE_HANDLE_MASK;
-        if (i > 0 && i < BRIDGE_HANDLE_MAX) {
-            HANDLE h = s_handle_table[i];
-            s_handle_table[i] = NULL;
-            return h;
-        }
-    }
+    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG)
+        return bridge_table_handle(token, true);
     return NULL;   /* untagged -> not a table handle, do not close */
 }
 
@@ -3976,8 +4011,10 @@ static void bridge_NtReadFile(void)
         LARGE_INTEGER start, end;
         /* The hitch log's sources, set here (every title reads early) since
          * the GPU backend is also linked into tools without the video side. */
+#ifdef _WIN32
         g_xbox_hitch_io = bridge_read_summary;
         g_xbox_hitch_gpu = nv2a_gpu_frame_summary;
+#endif
         QueryPerformanceCounter(&start);
         g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                     XBOX_TO_NATIVE(buffer_va), length, poff);
@@ -5667,19 +5704,24 @@ static void bridge_RtlUnicodeStringToAnsiString(void)
  * Xbox NtDuplicateObject has one process, and the handle table is ours: a
  * by-value source token in, a 4-byte guest slot for the duplicated target.
  * The source resolves through the table, DuplicateHandle produces a real
- * native handle, and the target lands via bridge_write_handle as a fresh
- * token -- same shape as NtCreateEvent. DUPLICATE_CLOSE_SOURCE also closes
- * the native handle behind the source token, which is why the source token is
- * NOT consumed here (the OS handle it wraps is gone after this call). */
+ * native handle, and the target receives a fresh token. On POSIX,
+ * DuplicateHandle retains and returns the same host object.
+ * Interning that pointer would make closing either guest handle invalidate
+ * both. DUPLICATE_CLOSE_SOURCE consumes the source's token as well. */
 static void bridge_NtDuplicateObject(void)
 {
     uint32_t target_va = STACK_ARG(1);
-    HANDLE src = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t source_token = STACK_ARG(0);
+    HANDLE src = bridge_resolve_handle(source_token);
     HANDLE dup = NULL;
     DWORD opts = 0;
 
     if (!target_va) {
         g_eax = 0xC000000Du;   /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    if (!src || (src == INVALID_HANDLE_VALUE && source_token != UINT32_MAX)) {
+        g_eax = (uint32_t)STATUS_INVALID_HANDLE;
         return;
     }
     if (STACK_ARG(2) & 0x1) opts |= DUPLICATE_CLOSE_SOURCE;
@@ -5697,7 +5739,23 @@ static void bridge_NtDuplicateObject(void)
         g_eax = 0xC0000001u;   /* STATUS_UNSUCCESSFUL */
         return;
     }
-    bridge_write_handle(target_va, dup);
+    if (opts & DUPLICATE_CLOSE_SOURCE)
+        bridge_take_handle(source_token);
+#ifndef _WIN32
+    /* POSIX represents the process itself by its pseudo-handle. */
+    if (dup == GetCurrentProcess()) {
+        BRIDGE_MEM32(target_va) = UINT32_MAX;
+        g_eax = 0;
+        return;
+    }
+#endif
+    uint32_t token = bridge_register_handle(dup, true);
+    if (!token) {
+        CloseHandle(dup);
+        g_eax = (uint32_t)STATUS_INSUFFICIENT_RESOURCES;
+        return;
+    }
+    BRIDGE_MEM32(target_va) = token;
     g_eax = 0;
 }
 

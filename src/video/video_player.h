@@ -72,6 +72,9 @@ int xbox_FramebufferMouseButton(int which);
 int xbox_FramebufferMouseWheel(void);
 void xbox_FramebufferMouseCapture(int on);
 
+#ifndef _WIN32
+int xbox_HostWindowMain(int (*guest_main)(void));
+#endif
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 int  xbox_FramebufferDumpBmp(const char *path);

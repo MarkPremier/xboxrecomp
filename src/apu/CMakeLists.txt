@@ -22,7 +22,6 @@ add_library(xbox_apu STATIC
     dsp/dsp_cpu.c
     dsp/dsp_dma.c
     apu_mmio_hook.c
-    apu_xaudio2.c
     ${SAMPLERATE_SOURCES}
 )
 
@@ -47,6 +46,7 @@ if(MSVC)
 endif()
 
 if(WIN32)
+    target_sources(xbox_apu PRIVATE apu_xaudio2.c)
     # xaudio2_8 for XAudio2Create, which apu_xaudio2.c calls directly.
     # It was missing: nothing had ever referenced this library from a linked
     # target, so the archive was built and never pulled in, and the first
@@ -56,5 +56,6 @@ if(WIN32)
 else()
     # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
     find_package(SDL2 REQUIRED)
+    target_sources(xbox_apu PRIVATE apu_sdl2.c)
     target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
 endif()

@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(xboxrecomp VERSION 0.9.0 LANGUAGES C)
 
-if(WIN32)
+option(XBOXRECOMP_GPU_NATIVE "Build the NV2A D3D11 renderer with DXVK-native on Linux" OFF)
+if(WIN32 OR XBOXRECOMP_GPU_NATIVE)
     enable_language(CXX)
 endif()
 

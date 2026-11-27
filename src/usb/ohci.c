@@ -8,6 +8,9 @@
  */
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
+#if defined(__linux__) && defined(__x86_64__)
+#include "../platform/mmio_decode_x86_64.h"
+#endif
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
@@ -1325,7 +1328,7 @@ void xbox_OhciInit(void)
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
 
-#if defined(_WIN32)
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
     /* The registers have to fault to be answered. The MCPX aperture is mapped
      * as plain committed memory, so both blocks are made inaccessible here and
      * the title's VEH routes the faults back to xbox_OhciHandleMmio.
@@ -1361,7 +1364,7 @@ void xbox_OhciInit(void)
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
     fflush(stderr);
 
-#if defined(_WIN32)
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
     {
         HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
         if (th)
@@ -1406,6 +1409,14 @@ int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
         fflush(stderr);
     }
     return ok;
+#elif defined(__linux__) && defined(__x86_64__)
+    OhciController *hc = hc_for(xbox_va);
+    if (!hc)
+        return 0;
+    if (mmio_emulate_x86_64(ctx, xbox_va - hc->base, hc, ohci_read, ohci_write))
+        return 1;
+    hc->decode_fail++;
+    return 0;
 #else
     (void)ctx; (void)xbox_va;
     return 0;

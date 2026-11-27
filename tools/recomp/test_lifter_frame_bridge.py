@@ -31,6 +31,23 @@ class FrameBridgeLifterTest(unittest.TestCase):
         self.assertIn(
             "RECOMP_ICALL_SAFE_AT(_icall_target, _icall_esp, ", lifted[0])
 
+    def test_indirect_call_publishes_current_general_ebp(self):
+        instruction = Instruction(0, 2, "call", "eax", "ffd0")
+        instruction.operands = [Operand(type="reg", reg="eax")]
+        lifter = Lifter()
+        lifter.publishes_ebp = True
+
+        lifted = lifter.lift_instruction(instruction)
+
+        self.assertTrue(lifted[0].startswith("g_ebp = ebp; g_seh_ebp = ebp; "))
+        self.assertIn("uint32_t _icall_target = eax", lifted[0])
+
+    def test_return_publishes_restored_ebp(self):
+        lifter = Lifter()
+        lifter.publishes_ebp = True
+        lifted = lifter.lift_instruction(Instruction(0, 1, "ret", "", "c3"))
+        self.assertTrue(lifted[0].startswith("g_ebp = ebp; g_seh_ebp = ebp; "))
+
     def test_call_without_local_ebp_keeps_existing_bridge(self):
         instruction = Instruction(0, 5, "call", "0x123456", "e800000000")
         instruction.call_target = 0x00123456
