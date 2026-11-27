@@ -1447,6 +1447,18 @@ static void flip_fps_cap(void)
     deadline += period;
 }
 #else
+/* While the cap holds a flip: when (CLOCK_MONOTONIC ns) the hold ends, 0
+ * otherwise. A title waiting in a spin for the GPU to pass that flip (Turok's
+ * D3D BlockOnTime) can sleep until then instead -- the GPU cannot move before
+ * it. In the Chapter 1 jungle at the 60 fps cap the game thread spent ~70% of
+ * a core in that spin, power an integrated GPU shares. */
+static long long s_flip_pace_until;
+
+long long xbox_Nv2aFlipPaceUntil(void)
+{
+    return __atomic_load_n(&s_flip_pace_until, __ATOMIC_ACQUIRE);
+}
+
 static void flip_fps_cap(void)
 {
     extern int xbox_Nv2aVblankSchedule(long long *epoch, long long *period);
@@ -1490,9 +1502,13 @@ static void flip_fps_cap(void)
 
     if (target > now.QuadPart) {
         long long ns = (long long)((target - now.QuadPart) * 1e9 / frequency.QuadPart);
-        struct timespec delay = {ns / 1000000000LL, ns % 1000000000LL};
+        struct timespec delay = {ns / 1000000000LL, ns % 1000000000LL}, wake;
+        clock_gettime(CLOCK_MONOTONIC, &wake);
+        __atomic_store_n(&s_flip_pace_until,
+                         (long long)wake.tv_sec * 1000000000LL + wake.tv_nsec + ns, __ATOMIC_RELEASE);
         while (nanosleep(&delay, &delay) == -1 && errno == EINTR)
             ;
+        __atomic_store_n(&s_flip_pace_until, 0, __ATOMIC_RELEASE);
     }
     if (hz == -1) {
         QueryPerformanceCounter(&now);
@@ -4051,11 +4067,22 @@ static void draw_primitive(void)
         }
     }
 
+#ifdef _WIN32
     {
         clock_t started = clock();
         raster_batch();
         s_gpu.raster_seconds += (double)(clock() - started) / CLOCKS_PER_SEC;
     }
+#else
+    /* glibc's clock() is process CPU time, a system call on every machine:
+     * two a batch were a seventh of this thread in the Chapter 1 jungle. The
+     * report's wall clock, read only while a report is wanted. */
+    {
+        double started = gpu_clock_seconds();
+        raster_batch();
+        s_gpu.raster_seconds += gpu_clock_seconds() - started;
+    }
+#endif
 
     if (pb_verbose_trace()) {
         static int shown;
@@ -5824,7 +5851,20 @@ void nv2a_pb_exec_report(void)
     static clock_t previous_time;
     static uint32_t previous_flips;
     static double previous_raster_seconds;
+#ifdef _WIN32
     clock_t current_time = clock();
+#else
+    /* Wall time in clock ticks: glibc's clock() is the process's CPU time
+     * (all threads), so the rate below came out as flips per CPU second --
+     * about half the real frame rate with two busy threads. */
+    clock_t current_time;
+    {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        current_time = (clock_t)((double)now.tv_sec * CLOCKS_PER_SEC +
+                                 (double)now.tv_nsec * (CLOCKS_PER_SEC / 1e9));
+    }
+#endif
     if (current_time > previous_time)
         fprintf(stderr, "[GPU] presentation: %u flips, %.2f FPS over %.2f seconds\n", s_gpu.flips,
                 (double)(s_gpu.flips - previous_flips) * CLOCKS_PER_SEC / (current_time - previous_time),

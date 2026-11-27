@@ -236,10 +236,42 @@ void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
     }
 }
 
+/* RECOMP_FPS_LOG=<seconds>: one line per period with the flip rate and the
+ * worst frame, as fb_present.c logs it. One clock read a flip, so it can stay
+ * on while measuring (RECOMP_PB_REPORT_MS times every draw and phase, which
+ * is a system call each on a machine whose kernel fell back to HPET). */
+static void fps_log(void)
+{
+    static double period = -1.0, start, last, worst;
+    static long long frames;
+    struct timespec ts;
+    double now;
+    if (period < 0.0) {
+        const char *e = getenv("RECOMP_FPS_LOG");
+        period = e ? atof(e) : 0.0;
+    }
+    if (period <= 0.0)
+        return;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    if (!start) start = now;
+    if (last && (now - last) * 1000.0 > worst) worst = (now - last) * 1000.0;
+    last = now;
+    frames++;
+    if (now - start >= period) {
+        fprintf(stderr, "[FPS] %.1f fps (%lld frames in %.2f s), worst %.1f ms\n",
+                frames / (now - start), frames, now - start, worst);
+        start = now;
+        frames = 0;
+        worst = 0.0;
+    }
+}
+
 void xbox_FramebufferWindowFrameStats(uint32_t draws)
 {
     __atomic_add_fetch(&s_flips, 1, __ATOMIC_RELAXED);
     __atomic_store_n(&s_frame_draws, draws, __ATOMIC_RELAXED);
+    fps_log();
 }
 
 /* ── The guest thread ─────────────────────────────────────────────────── */
