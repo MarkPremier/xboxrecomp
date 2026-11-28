@@ -1553,11 +1553,8 @@ void xbox_FramebufferWindowStart(void)
 }
 
 #else
-int xbox_FramebufferMouseDelta(int *dx, int *dy) { if (dx) *dx = 0; if (dy) *dy = 0; return 0; }
-int xbox_FramebufferMouseButton(int which) { (void)which; return 0; }
-int xbox_FramebufferMouseClicks(int which) { (void)which; return 0; }
-int xbox_FramebufferMouseWheel(void) { return 0; }
-void xbox_FramebufferMouseCapture(int on) { (void)on; }
+/* The mouse (xbox_FramebufferMouseDelta, ...Button, ...Clicks, ...Wheel,
+ * ...Capture) is the SDL window's: src/input/input_sdl.c. */
 void xbox_FramebufferSize(uint32_t *width, uint32_t *height) { *width = 640; *height = 480; }
 #ifndef RECOMP_GPU_NATIVE
 void *xbox_FramebufferWindowHandle(void) { return NULL; }

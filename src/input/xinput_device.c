@@ -134,6 +134,11 @@ static void map_stick(SHORT x, SHORT y, unsigned stick, SHORT *out_x, SHORT *out
     *out_y = mapped_axis(y, 4u << (stick * 2));
 }
 
+#endif /* _WIN32 */
+
+/* The keyboard-and-mouse scheme below is shared by both backends: the
+ * XInput one and the SDL2 one merge it onto port 0 the same way. */
+
 /* ---- keyboard + mouse (RECOMP_KBM) ---------------------------------------
  *
  * A playing control scheme rather than the RECOMP_KEYBOARD bring-up probe:
@@ -781,6 +786,8 @@ static void kbm_state(XBOX_INPUT_STATE *pState)
     pState->dwPacketNumber = ++packet;
 }
 
+#if defined(_WIN32)
+
 /* The `nth` HID pad as Xbox port `port`, if there is one. */
 static int hid_pad_port(DWORD port, int nth, XINPUT_STATE *state, DWORD *host_slot)
 {
@@ -1128,8 +1135,9 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     SDL_GameController *c = controller_for_port_locked(dwPort);
     if (!c) {
         SDL_UnlockJoysticks();
-        if (dwPort == 0 && keyboard_enabled()) {
-            keyboard_state(pState);
+        if (dwPort == 0 && overlay_enabled()) {
+            if (kbm_enabled()) kbm_state(pState);
+            else               keyboard_state(pState);
             return ERROR_SUCCESS;
         }
         return ERROR_DEVICE_NOT_CONNECTED;
@@ -1178,9 +1186,10 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
     SDL_UnlockJoysticks();
 
-    if (dwPort == 0 && keyboard_enabled()) {
+    if (dwPort == 0 && overlay_enabled()) {
         XBOX_INPUT_STATE kb;
-        keyboard_state(&kb);
+        if (kbm_enabled()) kbm_state(&kb);
+        else               keyboard_state(&kb);
         pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
         for (int i = 0; i < 8; i++)
             if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
@@ -1225,7 +1234,7 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
     SDL_LockJoysticks();
     connected = controller_for_port_locked(dwPort) != NULL;
     SDL_UnlockJoysticks();
-    return connected || (dwPort == 0 && keyboard_enabled());
+    return connected || (dwPort == 0 && overlay_enabled());
 }
 
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
@@ -1236,7 +1245,7 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 
     update_controllers();
     SDL_LockJoysticks();
-    if (!controller_for_port_locked(dwPort) && !(dwPort == 0 && keyboard_enabled())) {
+    if (!controller_for_port_locked(dwPort) && !(dwPort == 0 && overlay_enabled())) {
         SDL_UnlockJoysticks();
         return ERROR_DEVICE_NOT_CONNECTED;
     }

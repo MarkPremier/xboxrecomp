@@ -3,6 +3,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
+
+/* The game provides these; the keyboard-and-mouse scheme only reads them. */
+int xbox_FramebufferMenuPointer(void) { return 0; }
+ptrdiff_t xbox_GetMemoryOffset(void) { return 0; }
 
 static int failures;
 static void check(int ok, const char *name)
@@ -21,6 +26,31 @@ static void key(SDL_Keycode code, int down)
 int main(int argc, char **argv)
 {
     int keyboard = !(argc > 1 && !strcmp(argv[1], "--no-keyboard"));
+    if (argc > 1 && !strcmp(argv[1], "--kbm")) {
+        /* The game's playing scheme: WASD moves, Space jumps. Direct camera
+         * look writes guest memory, which this test has none of. */
+        XBOX_INPUT_STATE state;
+        setenv("RECOMP_KBM", "1", 1);
+        setenv("RECOMP_KBM_LOOK_DIRECT", "0", 1);
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
+            fprintf(stderr, "SDL init: %s\n", SDL_GetError());
+            return 1;
+        }
+        xbox_InputInit();
+        xbox_InputSetMainPump(1);
+        key(SDLK_w, 1); key(SDLK_d, 1); key(SDLK_SPACE, 1); key(SDLK_s, 1);
+        check(xbox_InputGetState(0, &state) == ERROR_SUCCESS &&
+              state.Gamepad.sThumbLX == 32767 && state.Gamepad.sThumbLY == 0 &&
+              state.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255 &&
+              state.Gamepad.bAnalogButtons[XBOX_BUTTON_Y] == 0,
+              "WASD drives the left stick (W+S cancel), Space is A, S is not Y");
+        key(SDLK_s, 0);
+        xbox_InputGetState(0, &state);
+        check(state.Gamepad.sThumbLY == 32767, "W alone pushes the stick forward");
+        xbox_InputSetMainPump(0);
+        SDL_Quit();
+        return failures ? 1 : 0;
+    }
     setenv("RECOMP_KEYBOARD", keyboard ? "1" : "0", 1);
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
         fprintf(stderr, "SDL init: %s\n", SDL_GetError());
